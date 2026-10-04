@@ -1,11 +1,10 @@
 Teletext Rescue — recovers teletext, NABTS and other data hidden in VBI recordings
 
 Author: AssunaYuuki
-Teletext Rescue — Copyright (c) 2026 AssunaYuuki. All rights reserved.
-This program may not be copied, modified, distributed or published, in whole or in part,
-without the written permission of the author.
-Exception: the NABTS / NAPLPS part (pages\nabts.py, naplps_font.py and the NABTS line
-reader) is a port of decode-orc and stays under the decode-orc licence.
+Teletext Rescue — Copyright (c) 2026 AssunaYuuki.
+Licensed under the GNU General Public License v3.0 (see LICENSE).
+The NABTS / NAPLPS part (pages\nabts.py, naplps_font.py and the NABTS line reader) is a
+port of decode-orc by Simon Inns (GPL-3.0): https://github.com/simoninns/decode-orc
 
 Start: double-click Start.bat (or run: python teletext_gui.py).
 Interface (gui_parts.py): dark theme, start screen with recent files (also File > Recent),
