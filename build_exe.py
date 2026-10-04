@@ -1,7 +1,8 @@
 """Сборка «Teletext Rescue.exe» (PyInstaller, папка с программой — без установки Python).
 
-  python build_exe.py
-Результат: dist/Teletext Rescue/Teletext Rescue.exe (+ папка _internal) и dist/Teletext Rescue.zip.
+  python build_exe.py [--setup]
+Результат: dist/Teletext Rescue/Teletext Rescue.exe (+ папка _internal) и dist/Teletext Rescue.zip;
+с --setup ещё установщик dist/TeletextRescue-Setup-<версия>.exe (Inno Setup 6, setup.iss).
 Скрипты из pages/ кладутся рядом с данными (_internal): программа запускает их через сам .exe
 (teletext_gui.run_script), а шаблоны и .npy ищутся рядом с модулями.
 """
@@ -44,6 +45,13 @@ def main():
     z = shutil.make_archive(os.path.join(HERE, 'dist', NAME), 'zip', os.path.join(HERE, 'dist'), NAME)
     print('built:', os.path.join(out, NAME + '.exe'))
     print('zip:  ', z)
+    if '--setup' in sys.argv:                          # установщик (Inno Setup 6)
+        iscc = [p for p in (os.path.expandvars(r'%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe'),
+                            r'C:\Program Files (x86)\Inno Setup 6\ISCC.exe', r'C:\Program Files\Inno Setup 6\ISCC.exe')
+                if os.path.exists(p)]
+        if not iscc:
+            sys.exit('Inno Setup 6 (ISCC.exe) not found')
+        subprocess.run([iscc[0], os.path.join(HERE, 'setup.iss')], check=True, cwd=HERE)
 
 
 if __name__ == '__main__':

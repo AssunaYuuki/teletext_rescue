@@ -13,7 +13,20 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pages'))
 import tt_export as X
 import gui_parts as GP
-GUI_STATE = os.path.join(X.PG, 'gui_state.json')       # последний открытый проект
+def _state_path():
+    """Настройки программы (последний проект, недавние файлы) — в %APPDATA%\\Teletext Rescue:
+    папка установленной программы может быть недоступна для записи. Старый файл из pages/ переносится."""
+    d = os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~'), 'Teletext Rescue')
+    p = os.path.join(d, 'gui_state.json')
+    try:
+        os.makedirs(d, exist_ok=True)
+        old = os.path.join(X.PG, 'gui_state.json')
+        if not os.path.exists(p) and os.path.exists(old):
+            import shutil; shutil.copy(old, p)
+    except OSError:
+        return os.path.join(X.PG, 'gui_state.json')
+    return p
+GUI_STATE = _state_path()                              # последний открытый проект, недавние файлы
 
 # ------------------------------------------------------------------ отрисовка
 COL = [(0, 0, 0), (255, 0, 0), (0, 255, 0), (255, 255, 0), (0, 0, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255)]
