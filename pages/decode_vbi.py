@@ -86,8 +86,9 @@ def _mlse(chunk):
 def cri_template(spb, blur=0.4, lead=1):
     """Run-in + framing code 0x27 в отсчётах записи, размытые гауссом (decode-orc
     vbi_cri_template.cpp: blur 0,4 бита, 1 бит нуля перед run-in); среднее 0, норма 1."""
-    from scipy.special import erf
-    bits = [(b >> i) & 1 for b in (0x55, 0x55, 0x27) for i in range(8)]
+    import math
+    erf = np.vectorize(math.erf)                      # вместо scipy.special.erf: шаблон небольшой
+    bits =[(b >> i) & 1 for b in (0x55, 0x55, 0x27) for i in range(8)]
     n = int(np.ceil((lead + len(bits)) * spb)); x = np.arange(n); v = np.full(n, -0.5); prev = 0
     for i, b in enumerate(bits):
         if b != prev: v += (1 if b else -1) * 0.5 * (1 + erf((x - (lead + i) * spb) / (blur * spb * np.sqrt(2))))

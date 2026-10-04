@@ -66,6 +66,10 @@ class App(tk.Tk):
         super().__init__()
         self.geometry('1320x920'); self.minsize(1000, 760)
         GP.apply_theme(self)
+        ico = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icon.ico')
+        if not os.path.exists(ico): ico = os.path.join(X.PG, 'icon.ico')     # в собранной версии — рядом с данными
+        try: self.iconbitmap(default=ico)              # значок всех окон программы
+        except tk.TclError: pass
         self.pages = {}; self.ids = []; self.cur = None; self.dirty = False; self.edited = set(); self.undo = []
         self.start = None
         self.build_ui()
@@ -951,7 +955,25 @@ class NabtsWindow(tk.Toplevel):
         self.status('saved {0} pages to {1}'.format(n, d))
         os.startfile(d)
 
+def run_script():
+    """«teletext_gui скрипт.py аргументы» — выполнить инструмент из pages/. Так окно хода работы и
+    vbi_auto запускают декодеры; в собранном Teletext Rescue.exe отдельного python нет —
+    sys.executable указывает на сам .exe, и он выполняет скрипт здесь."""
+    import runpy
+    script = os.path.abspath(sys.argv[1])
+    sys.argv = sys.argv[1:]
+    sys.path.insert(0, os.path.dirname(script))
+    if sys.stdout is None:                             # оконная сборка без консоли: вывод — в канал родителя
+        try: sys.stdout = sys.stderr = open(1, 'w', encoding='utf-8', errors='replace', closefd=False)
+        except OSError: sys.stdout = sys.stderr = open(os.devnull, 'w')
+    runpy.run_path(script, run_name='__main__')
+
+
 if __name__ == '__main__':
+    import multiprocessing
+    multiprocessing.freeze_support()                   # рабочие процессы datacast в собранной версии
+    if len(sys.argv) > 1 and sys.argv[1].lower().endswith('.py'):
+        run_script(); sys.exit(0)
     if sys.platform == 'win32':
         try:                                           # чёткий вывод на экранах с масштабом 125–200%
             import ctypes; ctypes.windll.shcore.SetProcessDpiAwareness(1)

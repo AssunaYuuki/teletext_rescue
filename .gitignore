@@ -18,3 +18,8 @@ pages/gui_state.json
 *_silentradio/
 *_datacast/
 *_nabts_html/
+
+# сборка exe
+dist/
+build/
+*.spec
