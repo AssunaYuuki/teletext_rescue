@@ -43,6 +43,3 @@ Command-line tools live in `pages\` (e.g. `python pages\vbi_auto.py recording.vb
 
 Copyright (c) 2026 AssunaYuuki. Licensed under the GNU General Public License v3.0 — see
 [LICENSE](LICENSE).
-
-The NABTS / NAPLPS part is a port of [decode-orc](https://github.com/simoninns/decode-orc)
-by Simon Inns (GPL-3.0).
