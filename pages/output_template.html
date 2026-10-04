@@ -1,0 +1,67 @@
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root{--bg:#111;--fg:#ddd;--mut:#888;--acc:#3a9}
+@media (prefers-color-scheme: light){:root:not([data-theme="dark"]){--bg:#f4f4f4;--fg:#222;--mut:#666;--acc:#176}}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif;padding:16px}
+.wrap{max-width:820px;margin:auto}
+h1{font-size:18px;margin:0 0 4px}.sub{color:var(--mut);margin-bottom:12px}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}
+input{width:70px;font:inherit;padding:4px 6px}button{font:inherit;padding:4px 10px;cursor:pointer}
+canvas{width:100%;image-rendering:pixelated;background:#000;display:block;border-radius:4px;cursor:pointer}
+#list{margin-top:12px;display:flex;flex-wrap:wrap;gap:4px}
+#list a{color:var(--acc);text-decoration:none;font:12px monospace;padding:2px 4px;border:1px solid #4444;border-radius:3px}
+#list a.on{background:var(--acc);color:#fff}
+.keys{display:flex;gap:6px;margin-top:8px}.keys button{flex:1;padding:6px 0;border:0;border-radius:4px;color:#000;font-weight:600}.keys button:disabled{opacity:.25}
+.hint{color:var(--mut);font-size:12px;margin-top:6px}
+</style></head><body><div class="wrap">
+<h1>__TITLE__</h1>
+<div class="sub">__SUBTITLE__</div>
+<div class="bar"><button id="prev">◀</button><input id="pg" maxlength="3"><button id="go">Открыть</button><button id="next">▶</button>
+<button id="ver">Версия 1</button><label><input type="checkbox" id="reveal" style="width:auto"> Показать скрытое</label> <label><input type="checkbox" id="tv" style="width:auto"> Как на экране ТВ</label></div>
+<div id="note" style="color:#e0a030;min-height:18px;font-size:13px"></div>
+<canvas id="c" width="480" height="500"></canvas>
+<div class="keys" id="keys"></div>
+<div class="hint">Цифры — номер страницы, ←/→ — соседние страницы, V — следующая версия, R G Y B — цветные кнопки (переходы FLOF). Щелчок по номеру страницы на экране — переход.</div>
+<div id="list"></div></div>
+<script>__RENDER__</script>
+<script>
+const P=__DATA__;
+const ids=Object.keys(P).sort();
+const cv=document.getElementById('c'),g=cv.getContext('2d');
+let cur=ids.includes('100')?'100':ids[0],ver=0,links=[];
+function snap(){const v=P[cur].v;return v[Math.min(ver,v.length-1)]}
+function paint(on){
+  const s=snap(),rows={};for(const k in s.rows)rows[+k]=s.rows[k];
+  const l=TT.render(g,rows,{reveal:document.getElementById('reveal').checked,over:s.x,cs:P[cur].cs,cs2:P[cur].cs2,
+                            flashOn:on,tv:document.getElementById('tv').checked});
+  links=l.filter(l=>P[l.p]);
+  document.getElementById('pg').value=cur;document.getElementById('note').textContent=P[cur].note||'';
+  const mv=P[cur].v.length,vb=document.getElementById('ver');
+  vb.textContent=s.label||('Версия '+(Math.min(ver,mv-1)+1)+'/'+mv+(s.air?' · ≈'+s.air+' эфира':''));vb.disabled=mv<2;
+  const F=P[cur].f||[];document.querySelectorAll('#keys button').forEach((b,i)=>{const p=F[i];b.textContent=p||'—';b.disabled=!(p&&P[p]);b.dataset.p=p||''});
+  document.querySelectorAll('#list a').forEach(a=>a.classList.toggle('on',a.textContent==cur));
+  history.replaceState(null,'','#'+cur);
+  return l;
+}
+const draw=TT.animate(paint);
+function open(p){if(P[p]){cur=p;ver=0;draw()}}
+function step(d){let i=ids.indexOf(cur)+d;i=(i+ids.length)%ids.length;open(ids[i])}
+document.getElementById('go').onclick=()=>open(document.getElementById('pg').value);
+document.getElementById('pg').onkeydown=e=>{if(e.key=='Enter')open(e.target.value)};
+document.getElementById('prev').onclick=()=>step(-1);document.getElementById('next').onclick=()=>step(1);
+document.getElementById('ver').onclick=()=>{ver=(ver+1)%P[cur].v.length;draw()};
+document.getElementById('reveal').onchange=draw;document.getElementById('tv').onchange=draw;
+let typed='';
+document.onkeydown=e=>{if(e.target.tagName=='INPUT')return;
+ if(e.key=='ArrowLeft')step(-1);else if(e.key=='ArrowRight')step(1);else if(e.key=='v'||e.key=='V')document.getElementById('ver').click();
+ else if('rgyb'.includes(e.key.toLowerCase())&&e.key.length==1){const b=document.querySelectorAll('#keys button')['rgyb'.indexOf(e.key.toLowerCase())];if(!b.disabled)open(b.dataset.p)}
+ else if(/^\d$/.test(e.key)){typed+=e.key;if(typed.length==3){open(typed);typed=''}}};
+cv.onclick=e=>{const rc=cv.getBoundingClientRect();const c=Math.floor((e.clientX-rc.left)/rc.width*40),r=Math.floor((e.clientY-rc.top)/rc.height*25);
+ for(const l of links)if(l.r==r&&c>=l.c&&c<l.c+3)return open(l.p)};
+window.onhashchange=()=>{const h=location.hash.slice(1);if(h!=cur&&P[h])open(h)};
+TT.KEYS.forEach(([col,name])=>{const b=document.createElement('button');b.style.background=col;b.title=name+' кнопка';b.onclick=()=>open(b.dataset.p);document.getElementById('keys').appendChild(b)});
+const L=document.getElementById('list');for(const p of ids){const a=document.createElement('a');a.href='#'+p;a.textContent=p;a.onclick=e=>{e.preventDefault();open(p)};L.appendChild(a)}
+if(location.hash&&P[location.hash.slice(1)])cur=location.hash.slice(1);
+draw();
+</script></body></html>

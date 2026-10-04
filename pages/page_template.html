@@ -1,0 +1,50 @@
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Teletext __PID__</title>
+<style>
+:root{--bg:#111;--fg:#ddd;--mut:#888;--acc:#3a9}
+@media (prefers-color-scheme: light){:root:not([data-theme="dark"]){--bg:#f4f4f4;--fg:#222;--mut:#666;--acc:#176}}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif;padding:16px}
+.wrap{max-width:760px;margin:auto}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}
+a{color:var(--acc)}h1{font-size:18px;margin:0}
+button{font:inherit;padding:4px 10px;cursor:pointer}
+canvas{width:100%;image-rendering:pixelated;background:#000;display:block;border-radius:4px;cursor:pointer}
+.hint{color:var(--mut);font-size:12px;margin-top:6px}
+details{margin-top:10px}.note{color:#e0a030;margin:0 0 8px;font-size:13px}
+.keys{display:flex;gap:6px;margin-top:8px}.keys a{flex:1;text-align:center;padding:6px 0;border-radius:4px;color:#000;font-weight:600;text-decoration:none}.keys a.off{opacity:.25;pointer-events:none}.keys a.idx{background:#888;flex:.7}
+pre{font:13px monospace;white-space:pre;overflow:auto}
+</style></head><body><div class="wrap">
+<div class="bar"><a href="__PREV__.html">◀ __PREV__</a><h1>Страница __PID__</h1><a href="__NEXT__.html">__NEXT__ ▶</a>
+<a href="index.html">все страницы</a><button id="ver">Версия 1</button>
+<label><input type="checkbox" id="reveal"> скрытый текст</label></div>
+__NOTE__
+<canvas id="c" width="480" height="500"></canvas>
+<div class="keys" id="keys"></div>
+<div class="hint">__HINT_TITLE__. Щелчок по номеру страницы на экране — переход; цветные кнопки (клавиши R G Y B) — переходы, переданные каналом (FLOF); ←/→ — соседние страницы; V — следующая версия.</div>
+<details><summary>Текст страницы (для копирования)</summary><pre>__TEXT__</pre></details>
+</div>
+<script src="tt_render.js"></script>
+<script>
+const V=__DATA__, X=__EXTRA__, EXIST=new Set(__EXIST__);
+const cv=document.getElementById('c'),g=cv.getContext('2d');let ver=0,links=[];
+function paint(on){const s=V[ver],rows={};for(const k in s.rows)rows[+k]=s.rows[k];
+ const tv=document.getElementById('tv');
+ const l=TT.render(g,rows,{reveal:document.getElementById('reveal').checked,over:s.x,cs:X.cs,cs2:X.cs2,flashOn:on,tv:tv&&tv.checked});
+ links=l.filter(l=>EXIST.has(l.p));
+ const b=document.getElementById('ver');b.textContent=s.label||('Версия '+(ver+1)+'/'+V.length+(s.air?' · ≈'+s.air+' эфира':''));b.disabled=V.length<2;
+ return l}
+const draw=TT.animate(paint);
+const F=X.flof||[];const K=document.getElementById('keys');
+TT.KEYS.forEach(([col,name],i)=>{const a=document.createElement('a');const p=F[i];a.style.background=col;a.textContent=p||'—';a.title=name+' кнопка'+(p?' → '+p:'');
+ if(p&&EXIST.has(p))a.href=p+'.html';else a.className='off';K.appendChild(a)});
+if(F[4]&&EXIST.has(F[4])){const a=document.createElement('a');a.className='idx';a.href=F[4]+'.html';a.textContent='индекс '+F[4];K.appendChild(a)}
+document.getElementById('ver').onclick=()=>{ver=(ver+1)%V.length;draw()};
+document.getElementById('reveal').onchange=draw;
+{const r=document.getElementById('reveal').parentNode,lab=document.createElement('label');
+ lab.innerHTML=' <input type="checkbox" id="tv" style="width:auto"> как на экране ТВ';r.after(lab);document.getElementById('tv').onchange=draw;}
+document.onkeydown=e=>{if(e.key=='ArrowLeft')location.href='__PREV__.html';else if(e.key=='ArrowRight')location.href='__NEXT__.html';else if(e.key=='v'||e.key=='V')document.getElementById('ver').click();
+ else{const i='rgyb'.indexOf(e.key.toLowerCase());if(i>=0&&F[i]&&EXIST.has(F[i]))location.href=F[i]+'.html'}};
+cv.onclick=e=>{const rc=cv.getBoundingClientRect();const c=Math.floor((e.clientX-rc.left)/rc.width*40),r=Math.floor((e.clientY-rc.top)/rc.height*25);
+ for(const l of links)if(l.r==r&&c>=l.c&&c<l.c+3){location.href=l.p+'.html';return}};
+draw();
+</script></body></html>
