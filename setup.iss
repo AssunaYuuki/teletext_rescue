@@ -29,7 +29,15 @@ SetupIconFile=icon.ico
 UninstallDisplayIcon={app}\{#AppExe}
 Compression=lzma2/max
 SolidCompression=yes
-WizardStyle=modern
+; оформление как у программы: тёмный мастер, янтарное табло, значок TR (python installer_art.py)
+WizardStyle=modern dark includetitlebar hidebevels
+WizardBackColor=#1b1c1f
+WizardImageFile=installer\wizard_100.png,installer\wizard_150.png,installer\wizard_200.png
+WizardSmallImageFile=installer\small_100.png,installer\small_150.png,installer\small_200.png
+WizardImageBackColor=#1b1c1f
+WizardSmallImageBackColor=#1b1c1f
+WizardImageStretch=no
+DisableWelcomePage=no
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 
