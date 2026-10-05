@@ -1,5 +1,4 @@
 #include "teletext.h"
-#include <winnls.h>
 
 namespace {
 #include "gen_tables.inc"
