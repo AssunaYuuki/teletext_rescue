@@ -26,7 +26,10 @@ GEN=""
 command -v ninja >/dev/null 2>&1 && GEN="-G Ninja"
 if [ "$OS" = "darwin" ]; then JOBS=$(sysctl -n hw.ncpu); else JOBS=$(nproc 2>/dev/null || echo 4); fi
 
-cmake -S cpp -B "$BUILD" $GEN -DCMAKE_BUILD_TYPE=Release
+# macOS: один файл и для Apple Silicon, и для Intel
+ARCH=""
+[ "$OS" = "darwin" ] && ARCH="-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
+cmake -S cpp -B "$BUILD" $GEN -DCMAKE_BUILD_TYPE=Release $ARCH
 cmake --build "$BUILD" -j "$JOBS"
 
 echo

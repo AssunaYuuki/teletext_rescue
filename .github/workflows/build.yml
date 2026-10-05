@@ -42,7 +42,13 @@ jobs:
           EOF
           $B/trcli build t.t42 tproj
           test -f tproj/pages.json && grep -q '"100"' tproj/pages.json && echo "page 100 built"
+      - name: Package
+        run: |
+          B=cpp/build-$(uname -s | tr 'A-Z' 'a-z')
+          if [ "$(uname -s)" = "Darwin" ]; then N=trcli-macos-universal; lipo -info $B/trcli; else N=trcli-linux-x86_64; fi
+          mkdir -p pkg/$N && cp $B/trcli README.md LICENSE pkg/$N/ && chmod +x pkg/$N/trcli
+          tar -C pkg -czf $N.tar.gz $N
       - uses: actions/upload-artifact@v4
         with:
           name: trcli-${{ runner.os }}
-          path: cpp/build-*/trcli
+          path: trcli-*.tar.gz
