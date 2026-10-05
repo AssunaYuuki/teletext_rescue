@@ -11,6 +11,8 @@ HWND start_screen(HWND parent, const StartActions &a);       // дочернее
 void recording_window(HWND owner, const Json &report, std::function<void(const Json &)> opener);
 void sign_window(HWND owner, const std::string &folder);
 void amol_window(HWND owner, const std::string &json);      // AMOL: часы передачи, код источника, биты пакета
+void xds_window(HWND owner, const std::string &json);       // XDS: станция, часы эфира, передача
+void starsight_window(HWND owner, const std::string &json); // StarSight: пакеты программы передач
 void nabts_window(HWND owner, const std::string &t33);
 void set_button_style(HWND h, BtnStyle st);
 // столбчатая диаграмма (карта качества); hit — индекс столбика под точкой (или -1)

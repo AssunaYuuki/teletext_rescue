@@ -37,8 +37,16 @@ std::string hms(double s);                         // ЧЧ:ММ:СС
 std::string pct(double v, int digits = 0);         // 0.123 -> "12%"
 
 // ---------------------------------------------------------------- пути (UTF-8 <-> path)
+#ifdef _WIN32
 inline fs::path P(const std::string &u) { return fs::path(widen(u)); }
 inline std::string U(const fs::path &p) { return narrow(p.wstring()); }
+#else                                                // Linux, macOS: пути и так в UTF-8
+inline fs::path P(const std::string &u) { return fs::path(u); }
+inline std::string U(const fs::path &p) { return p.string(); }
+#endif
+// fopen по пути в UTF-8 и сдвиг больше 2 ГБ — на всех системах
+FILE *ufopen(const std::string &path, const char *mode);
+int fseek64(FILE *f, int64_t off, int whence);
 std::string path_join(const std::string &a, const std::string &b);
 std::string dirname(const std::string &p);
 std::string basename(const std::string &p);

@@ -705,7 +705,7 @@ void wst_to_bt8x8(const Rec &R, const std::string &out, Progress &pr) {
     // строка ТВ -> запись источника (у форматов «по полю» поле B пронумеровано как поле A)
     std::map<int, int> by_tv; for (auto &kv : R.tv) by_tv[kv.second] = kv.first;
     int frames = fld ? R.n / 2 : R.n;
-    FILE *f = _wfopen(P(out).c_str(), L"wb");
+    FILE *f = ufopen(out, "wb");
     if (!f) throw std::runtime_error("cannot write " + out);
     std::vector<u8> fr(65536);
     std::vector<float> y(R.ns);

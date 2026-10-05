@@ -19,7 +19,7 @@ std::string vbi_report_dir(const std::string &src) {
 }
 
 // пары байтов строки 21 с верной чётностью (без бита чётности); пакеты XDS в текст подписей не попадают
-static std::pair<std::string, int> cc_text(const Rec &R, int row, int parity, std::vector<std::array<int, 2>> *pairs = nullptr) {
+static std::pair<std::string, int> cc_text(const Rec &R, int row, int parity, std::vector<std::array<int, 3>> *pairs = nullptr) {
     std::string out; int good = 0; int last1 = -1, last2 = -1, b[2];
     bool xds = false;
     for (int u = parity >= 0 ? parity : 0; u < R.n; u += parity >= 0 ? 2 : 1) {
@@ -27,7 +27,7 @@ static std::pair<std::string, int> cc_text(const Rec &R, int row, int parity, st
         if (!odd_parity(b[0]) || !odd_parity(b[1])) continue;
         good++;
         int c1 = b[0] & 0x7F, c2 = b[1] & 0x7F;
-        if (pairs) pairs->push_back({c1, c2});
+        if (pairs) pairs->push_back({c1, c2, u});
         if (c1 == 0 && c2 == 0) continue;
         if (c1 >= 0x01 && c1 <= 0x0F) { xds = c1 != 0x0F; continue; }      // XDS: начало/продолжение, 0x0F — конец
         if (c1 >= 0x10 && c1 < 0x20) {
@@ -48,9 +48,10 @@ static std::pair<std::string, int> cc_text(const Rec &R, int row, int parity, st
 
 // XDS (расширенные данные во втором поле строки 21): станция, сеть, время, передача, рейтинг.
 // Пакет: класс+тип, данные, 0x0F + контрольная сумма (сумма всех байтов пакета по модулю 128 = 0)
-struct XdsInfo { std::string text, summary; int packets = 0; };
-static XdsInfo xds_decode(const std::vector<std::array<int, 2>> &pairs) {
+struct XdsInfo { std::string text, summary; int packets = 0; Json events = Json::array(), top = Json::object(); int tz = -1; bool dst = false; };
+static XdsInfo xds_decode(const std::vector<std::array<int, 3>> &pairs) {
     XdsInfo X;
+    int cur_u = 0;
     std::map<int, std::vector<int>> open;                // класс начала (нечётный) -> байты пакета
     int cur = -1;
     std::map<std::string, std::map<std::string, int>> seen;   // поле -> значение -> раз
@@ -99,11 +100,19 @@ static XdsInfo xds_decode(const std::vector<std::array<int, 2>> &pairs) {
         if (val.empty()) return;
         X.packets++;
         seen[key][val]++;
+        Json e = Json::array(); e.push((double)cur_u); e.push(key); e.push(val);
+        if (key == "time" && d.size() >= 6) {             // для часов окна: UTC по полям
+            Json t = Json::array();
+            for (int x : {(d[5] & 0x3F) + 1990, d[3] & 0x0F, d[2] & 0x1F, d[1] & 0x1F, d[0] & 0x3F, d[4] & 0x07}) t.push((double)x);
+            e.push(t);
+        }
+        if (key == "time zone" && d.size() >= 1) { X.tz = d[0] & 0x1F; X.dst = d[0] & 0x20; }
+        X.events.push(e);
         std::string line = key + ": " + val;
         if (line != last_line) { X.text += line + "\n"; last_line = line; }
     };
     for (auto &pc : pairs) {
-        int c1 = pc[0], c2 = pc[1];
+        int c1 = pc[0], c2 = pc[1]; cur_u = pc[2];
         if (c1 >= 0x01 && c1 <= 0x0E) {
             if (c1 & 1) { open[c1] = {c1, c2}; cur = c1; }                  // начало пакета
             else { cur = c1 - 1; if (!open.count(cur)) cur = -1; }           // продолжение
@@ -126,6 +135,7 @@ static XdsInfo xds_decode(const std::vector<std::array<int, 2>> &pairs) {
     for (const char *k : {"network", "station", "programme", "rating", "time zone"}) { std::string v = top(k); if (!v.empty()) parts.push_back(std::string(k) + " " + v); }
     if (!times.empty()) parts.push_back("time " + times.front() + (times.size() > 1 ? " \xE2\x80\x93 " + times.back().substr(11) : ""));
     for (auto &p : parts) X.summary += (X.summary.empty() ? "" : " \xC2\xB7 ") + p;
+    for (auto &kv : seen) X.top[kv.first] = top(kv.first);
     std::string head = "XDS (extended data services, line 21 field 2): " + std::to_string(X.packets) + " packets with a valid checksum\n";
     if (!X.summary.empty()) head += "Summary: " + X.summary + "\n";
     head += "\nAll values (times received):\n";
@@ -133,6 +143,43 @@ static XdsInfo xds_decode(const std::vector<std::array<int, 2>> &pairs) {
     head += "\nIn order of arrival (repeats folded):\n";
     X.text = head + X.text;
     return X;
+}
+
+
+// StarSight (электронная программа передач, разносилась станциями PBS): строка в формате подписей CC,
+// два байта на поле без бита чётности. Пакет: 2C 00 1F <тип> 1C …, номер пакета — 9-й байт, общий для обоих полей.
+// Содержимое сжато и зашифровано — показывается транспорт: пакеты, нумерация, потери, байты.
+static Json starsight_extract(const Rec &R, const std::vector<const Json *> &group, Progress &pr) {
+    Json pk = Json::array();
+    long fields = 0, read = 0;
+    std::map<int, int> types;
+    for (auto *L : group) {
+        int row = (*L)["row"].integer(), par = (*L)["parity"].is_null() ? -1 : (*L)["parity"].integer();
+        std::vector<u8> s; std::vector<int> us;
+        int b[2];
+        for (int u = par >= 0 ? par : 0; u < R.n; u += par >= 0 ? 2 : 1) {
+            fields++;
+            bool ok = cc_slice(R.line(u, row), R.fs, b);
+            if (ok) read++;
+            s.push_back(ok ? (u8)b[0] : 3); s.push_back(ok ? (u8)b[1] : 3); us.push_back(u); us.push_back(u);
+            if (u % 4000 < 2) pr.progress(u, R.n);
+        }
+        std::vector<size_t> hp;
+        for (size_t i = 0; i + 9 < s.size(); i++) if (s[i] == 0x2C && s[i + 1] == 0x00 && s[i + 2] == 0x1F && s[i + 4] == 0x1C) hp.push_back(i);
+        for (size_t k = 0; k < hp.size(); k++) {
+            size_t a = hp[k], e = k + 1 < hp.size() ? hp[k + 1] : s.size();
+            for (size_t i = a + 9; i + 3 < e; i++) if (s[i] == 3 && s[i + 1] == 3 && s[i + 2] == 3 && s[i + 3] == 3) { e = i; break; }   // потеряна связь
+            if (e - a > 400) e = a + 400;
+            std::string hx; for (size_t i = a; i < e; i++) hx += fmt("%02X", s[i]);
+            Json j = Json::array();
+            j.push((double)us[a]); j.push(std::string(1, par == 1 ? 'B' : 'A')); j.push((double)s[a + 8]); j.push((double)s[a + 3]); j.push(hx);
+            pk.push(j); types[s[a + 3]]++;
+        }
+    }
+    std::sort(pk.a.begin(), pk.a.end(), [](const Json &x, const Json &y) { return x[0].num() < y[0].num(); });
+    Json r = Json::object();
+    r["packets"] = pk; r["fields"] = (double)fields; r["read"] = (double)read;
+    return r;
 }
 
 Json vbi_auto(const std::string &src_in, bool again, Progress &pr) {
@@ -250,29 +297,68 @@ Json vbi_auto(const std::string &src_in, bool again, Progress &pr) {
         if (exists(path_join(out, "index.html"))) add("Encrypted datacast (packets, addresses, schedule)", "html", path_join(out, "index.html"));
         break;
     }
-    if (by.count("CC (line 21)"))
-        for (auto *L : by["CC (line 21)"]) {
-            int par = (*L)["parity"].is_null() ? -1 : (*L)["parity"].integer();
-            pr.step(fmt("Reading CC captions, line %d", (*L)["tv_line"].integer()));
-            std::vector<std::array<int, 2>> pairs;
-            auto t = cc_text(R, (*L)["row"].integer(), par, &pairs);
-            int tvl = (*L)["tv_line"].integer();
-            std::string tag = par < 0 ? "" : std::string(1, "AB"[par]);
-            std::string p = path_join(rep_dir, fmt("cc_line%d%s.txt", tvl, tag.c_str()));
-            write_text(p, t.first);
-            int fields = par >= 0 ? R.n / 2 : R.n;
-            std::string note = fmt("%d intact byte pairs", t.second);
-            if (t.second < fields / 2) note += " \xE2\x80\x94 mostly not caption text (other data in the caption format)";
-            XdsInfo X = xds_decode(pairs);
-            if (X.packets >= 3) {
-                std::string xp = path_join(rep_dir, fmt("xds_line%d%s.txt", tvl, tag.c_str()));
-                write_text(xp, X.text);
-                add(fmt("XDS station / time data (line %d)", tvl), "text", xp, X.summary.empty() ? fmt("%d packets", X.packets) : X.summary);
-                pr.log("XDS: " + X.summary);
-                if (t.first.find_first_not_of(" \n") == std::string::npos) continue;   // подписей нет — только XDS
+    if (by.count("CC (line 21)")) {
+        std::map<int, std::vector<const Json *>> cc_lines;                      // строка ТВ -> её поля
+        for (auto *L : by["CC (line 21)"]) cc_lines[(*L)["tv_line"].integer()].push_back(L);
+        for (auto &cl : cc_lines) {
+            int tvl = cl.first;
+            bool all_bad = true;
+            struct Res { std::string tag, p, note, text; XdsInfo X; };
+            std::vector<Res> rs;
+            for (auto *L : cl.second) {
+                int par = (*L)["parity"].is_null() ? -1 : (*L)["parity"].integer();
+                pr.step(fmt("Reading CC captions, line %d", tvl));
+                std::vector<std::array<int, 3>> pairs;
+                auto t = cc_text(R, (*L)["row"].integer(), par, &pairs);
+                Res r; r.tag = par < 0 ? "" : std::string(1, "AB"[par]);
+                r.p = path_join(rep_dir, fmt("cc_line%d%s.txt", tvl, r.tag.c_str()));
+                r.text = t.first;
+                int fields = par >= 0 ? R.n / 2 : R.n;
+                r.note = fmt("%d intact byte pairs", t.second);
+                if (t.second >= fields / 2) all_bad = false;
+                else r.note += " \xE2\x80\x94 mostly not caption text (other data in the caption format)";
+                r.X = xds_decode(pairs);
+                rs.push_back(r);
             }
-            add(fmt("CC captions (line %d)", tvl), "text", p, note);
+            // не подписи: может быть StarSight (пакеты «2C 00 1F ?? 1C»)
+            if (all_bad) {
+                pr.step(fmt("Looking for programme-guide data on line %d", tvl));
+                Json ss = starsight_extract(R, cl.second, pr);
+                if (ss["packets"].size() >= 3) {
+                    ss["source"] = basename(src); ss["line"] = (double)tvl;
+                    ss["rate"] = (R.ntsc() ? 30000.0 / 1001 : 25.0) * (R.unit == "field" ? 2 : 1); ss["units"] = (double)R.n; ss["unit"] = R.unit;
+                    std::string jp = path_join(rep_dir, fmt("starsight_line%d.json", tvl));
+                    save_json(jp, ss);
+                    // текстовый отчёт: пакеты по порядку
+                    std::string txt = fmt("StarSight programme guide data on line %d of %s\n", tvl, basename(src).c_str());
+                    txt += "Caption-format line, 2 bytes per field without parity. Packet: 2C 00 1F <type> 1C ..., byte 9 = packet number.\n";
+                    txt += "The guide itself is compressed and encrypted; listed here is the transport.\n\n";
+                    for (auto &q : ss["packets"].a) txt += fmt("%7.2f s  field %s  #%02X  type %02X  %3zu bytes  ", q[0].num() / ss["rate"].num(), q[1].str().c_str(), q[2].integer(), q[3].integer(), q[4].str().size() / 2) + q[4].str() + "\n";
+                    write_text(path_join(rep_dir, fmt("starsight_line%d.txt", tvl)), txt);
+                    add(fmt("StarSight programme guide (line %d)", tvl), "starsight", jp, fmt("%zu packets", ss["packets"].size()));
+                    pr.log(fmt("StarSight on line %d: %zu packets", tvl, ss["packets"].size()));
+                    continue;
+                }
+            }
+            for (auto &r : rs) {
+                write_text(r.p, r.text);
+                if (r.X.packets >= 3) {
+                    std::string xp = path_join(rep_dir, fmt("xds_line%d%s.txt", tvl, r.tag.c_str()));
+                    write_text(xp, r.X.text);
+                    Json xj = Json::object();
+                    xj["source"] = basename(src); xj["line"] = (double)tvl; xj["field"] = r.tag;
+                    xj["rate"] = (R.ntsc() ? 30000.0 / 1001 : 25.0) * (R.unit == "field" ? 2 : 1); xj["units"] = (double)R.n;
+                    xj["events"] = r.X.events; xj["top"] = r.X.top; xj["summary"] = r.X.summary; xj["report"] = xp;
+                    if (r.X.tz >= 0) { xj["tz"] = (double)r.X.tz; xj["dst"] = r.X.dst; }
+                    save_json(stem_path(xp) + ".json", xj);
+                    add(fmt("XDS station / time data (line %d)", tvl), "text", xp, r.X.summary.empty() ? fmt("%d packets", r.X.packets) : r.X.summary);
+                    pr.log("XDS: " + r.X.summary);
+                    if (r.text.find_first_not_of(" \n") == std::string::npos) continue;   // подписей нет — только XDS
+                }
+                add(fmt("CC captions (line %d)", tvl), "text", r.p, r.note);
+            }
         }
+    }
     for (auto &kv : by) {
         bool amol = kv.first.rfind("AMOL", 0) == 0, vitc = kv.first == "VITC timecode";
         if (!amol && !vitc) continue;

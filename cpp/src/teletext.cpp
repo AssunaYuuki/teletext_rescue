@@ -1,5 +1,4 @@
 #include "teletext.h"
-#include <windows.h>
 #include <winnls.h>
 
 namespace {
@@ -132,21 +131,16 @@ std::string guess_charset(const std::vector<const u8 *> &rows, int national) {
 char32_t g2_extract(int code) { return code >= 0x20 && code < 0x80 ? G2_EXTRACT[code - 0x20] : 0; }
 char32_t diacritic_mark(int mode) { return mode >= 0 && mode < 16 ? DIA_MARK[mode] : 0; }
 
+#include "gen_compose.inc"
+// буква + знак ударения <-> одна буква (таблица из Юникода: латиница, кириллица, греческий)
 std::string compose_nfc(char32_t base, char32_t mark) {
-    std::wstring in;
-    in += (wchar_t)base;
-    if (mark) in += (wchar_t)mark;
-    wchar_t out[16];
-    int n = NormalizeString(NormalizationC, in.c_str(), (int)in.size(), out, 16);
-    if (n <= 0) return from_u32(std::u32string(1, base)) + (mark ? from_cp(mark) : "");
-    return narrow(std::wstring(out, n));
+    if (mark) for (auto &c : COMPOSE) if (c[0] == base && c[1] == mark) return from_cp(c[2]);
+    return from_u32(std::u32string(1, base)) + (mark ? from_cp(mark) : "");
 }
 std::pair<char32_t, char32_t> nfd_split(const std::string &ch) {
-    std::wstring w = widen(ch);
-    wchar_t out[16];
-    int n = NormalizeString(NormalizationD, w.c_str(), (int)w.size(), out, 16);
-    std::u32string u = n > 0 ? to_u32(narrow(std::wstring(out, n))) : to_u32(ch);
+    std::u32string u = to_u32(ch);
     if (u.empty()) return {0, 0};
+    if (u.size() == 1) for (auto &c : COMPOSE) if (c[2] == u[0]) return {c[0], c[1]};
     return {u[0], u.size() > 1 ? u[1] : 0};
 }
 char32_t nfd_base(const std::string &ch) { return nfd_split(ch).first; }

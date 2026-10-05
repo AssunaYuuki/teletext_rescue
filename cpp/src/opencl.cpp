@@ -1,6 +1,12 @@
 #include "opencl.h"
+#ifdef _WIN32
 #include <windows.h>
 #include <dxgi.h>
+#define CL_API __stdcall
+#else
+#include <dlfcn.h>
+#define CL_API
+#endif
 #include <mutex>
 #include <stdexcept>
 #include <cstdint>
@@ -19,7 +25,7 @@ const cl_uint CL_DEVICE_VENDOR = 0x102C, CL_DEVICE_MAX_COMPUTE_UNITS = 0x1002, C
               CL_DEVICE_VENDOR_ID = 0x1001, CL_DEVICE_MAX_MEM_ALLOC_SIZE = 0x1010;
 const cl_bitfield CL_MEM_READ_WRITE = 1, CL_MEM_READ_ONLY = 4, CL_MEM_COPY_HOST_PTR = 32;
 
-#define FN(ret, name, args) typedef ret(__stdcall *name##_t) args; name##_t name;
+#define FN(ret, name, args) typedef ret(CL_API *name##_t) args; name##_t name;
 struct Api {
     FN(cl_int, clGetPlatformIDs, (cl_uint, cl_platform_id *, cl_uint *))
     FN(cl_int, clGetDeviceIDs, (cl_platform_id, cl_bitfield, cl_uint, cl_device_id *, cl_uint *))
@@ -54,6 +60,9 @@ std::mutex mu;   // одна очередь на программу
 
 // видеоадаптеры, как их называет Windows: «AMD Radeon RX 560 Series», «NVIDIA GeForce RTX 3080 Ti»…
 struct WinAdapter { unsigned vendor; size_t mem_mb; std::string name; };
+#ifndef _WIN32
+std::vector<WinAdapter> windows_adapters() { return {}; }
+#else
 std::vector<WinAdapter> windows_adapters() {
     std::vector<WinAdapter> out;
     HMODULE h = LoadLibraryA("dxgi.dll");
@@ -76,6 +85,7 @@ std::vector<WinAdapter> windows_adapters() {
     f->Release();
     return out;
 }
+#endif
 std::string clean_name(std::string s) {
     for (const char *junk : {"(R)", "(r)", "(TM)", "(tm)", "(C)"}) for (size_t k; (k = s.find(junk)) != std::string::npos;) s.erase(k, strlen(junk));
     std::string o; for (char c : s) { if (c == ' ' && (o.empty() || o.back() == ' ')) continue; o += c; }
@@ -85,9 +95,20 @@ std::string clean_name(std::string s) {
 
 // OpenCL.dll и список видеокарт всех производителей (NVIDIA, AMD, Intel)
 void load() {
+#ifdef _WIN32
     HMODULE h = LoadLibraryA("OpenCL.dll");
     if (!h) return;
 #define LOAD(n) api.n = (decltype(api.n))GetProcAddress(h, #n); if (!api.n) return;
+#else
+    void *h = nullptr;
+#ifdef __APPLE__
+    for (const char *nm : {"/System/Library/Frameworks/OpenCL.framework/OpenCL"}) if (!h) h = dlopen(nm, RTLD_NOW);
+#else
+    for (const char *nm : {"libOpenCL.so.1", "libOpenCL.so"}) if (!h) h = dlopen(nm, RTLD_NOW);
+#endif
+    if (!h) return;
+#define LOAD(n) api.n = (decltype(api.n))dlsym(h, #n); if (!api.n) return;
+#endif
     LOAD(clGetPlatformIDs) LOAD(clGetDeviceIDs) LOAD(clGetDeviceInfo) LOAD(clCreateContext) LOAD(clCreateCommandQueue)
     LOAD(clCreateProgramWithSource) LOAD(clBuildProgram) LOAD(clGetProgramBuildInfo) LOAD(clCreateKernel) LOAD(clCreateBuffer)
     LOAD(clSetKernelArg) LOAD(clEnqueueNDRangeKernel) LOAD(clEnqueueReadBuffer) LOAD(clEnqueueWriteBuffer) LOAD(clFinish)

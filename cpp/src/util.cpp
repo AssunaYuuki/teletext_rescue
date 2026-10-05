@@ -1,5 +1,13 @@
 #include "util.h"
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+#include <chrono>
 #include <complex>
 #include <cstdarg>
 #include <cstdio>
@@ -8,6 +16,7 @@
 #include <iostream>
 #include <numeric>
 
+#ifdef _WIN32
 std::wstring widen(const std::string &s) {
     if (s.empty()) return {};
     int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
@@ -23,6 +32,15 @@ std::string narrow(const std::wstring &w) {
     WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), s.data(), n, nullptr, nullptr);
     return s;
 }
+FILE *ufopen(const std::string &path, const char *mode) { return _wfopen(widen(path).c_str(), widen(mode).c_str()); }
+int fseek64(FILE *f, int64_t off, int whence) { return _fseeki64(f, off, whence); }
+#else
+// wchar_t здесь 32-битный: та же UTF-32
+std::wstring widen(const std::string &s) { std::u32string u = to_u32(s); return std::wstring(u.begin(), u.end()); }
+std::string narrow(const std::wstring &w) { return from_u32(std::u32string(w.begin(), w.end())); }
+FILE *ufopen(const std::string &path, const char *mode) { return fopen(path.c_str(), mode); }
+int fseek64(FILE *f, int64_t off, int whence) { return fseeko(f, (off_t)off, whence); }
+#endif
 
 std::u32string to_u32(const std::string &s) {
     std::u32string out;
@@ -155,6 +173,7 @@ void write_atomic(const std::string &p, const std::string &s) {
     if (ec) { fs::remove(P(p), ec); fs::rename(P(tmp), P(p), ec); }
 }
 
+#ifdef _WIN32
 MappedFile::MappedFile(const std::string &path) {
     HANDLE f = CreateFileW(widen(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -182,6 +201,29 @@ static Bytes res_raw(const char *name) {
     const u8 *p = (const u8 *)LockResource(g);
     return Bytes(p, p + SizeofResource(h, r));
 }
+#else
+MappedFile::MappedFile(const std::string &path) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) throw std::runtime_error("cannot open " + path);
+    struct stat st; fstat(fd, &st);
+    n_ = (uint64_t)st.st_size; file_ = (void *)(intptr_t)(fd + 1);
+    if (n_ == 0) return;
+    void *m = mmap(nullptr, (size_t)n_, PROT_READ, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) throw std::runtime_error("cannot map " + path);
+    p_ = (const u8 *)m; map_ = m;
+}
+MappedFile::~MappedFile() {
+    if (map_) munmap(map_, (size_t)n_);
+    if (file_) close((int)(intptr_t)file_ - 1);
+}
+// ресурсы встроены в программу при сборке (resources_gen.cpp из res/)
+struct EmbeddedRes { const char *name; const unsigned char *data; size_t size; };
+extern const EmbeddedRes EMBEDDED_RES[];
+static Bytes res_raw(const char *name) {
+    for (const EmbeddedRes *r = EMBEDDED_RES; r->name; r++) if (!strcmp(r->name, name)) return Bytes(r->data, r->data + r->size);
+    throw std::runtime_error(std::string("missing resource ") + name);
+}
+#endif
 std::string resource_text(const char *name) { Bytes b = res_raw(name); return std::string(b.begin(), b.end()); }
 Bytes resource_bytes(const char *name) { return res_raw(name); }
 
@@ -192,18 +234,17 @@ Progress &console_progress() {
         init = true;
         // TR_TIME=1 — секунды от запуска перед каждой строкой (где уходит время)
         static const bool tm = getenv("TR_TIME") != nullptr;
-        static const DWORD start = GetTickCount();
+        static const auto start = std::chrono::steady_clock::now();
         static auto stamp = []() {
             if (!tm) return std::string();
-            FILETIME a, b, k, u; GetProcessTimes(GetCurrentProcess(), &a, &b, &k, &u);
-            double cpu = ((((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime)) / 1e7;
-            return fmt("[%6.1f cpu %6.1f] ", (GetTickCount() - start) / 1000.0, cpu);
+            double cpu = (double)std::clock() / CLOCKS_PER_SEC;
+            return fmt("[%6.1f cpu %6.1f] ", std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), cpu);
         };
         p.on_step = [](const std::string &t) { std::cout << stamp() << "STEP " << t << std::endl; };
         p.on_log = [](const std::string &t) { std::cout << stamp() << t << std::endl; };
         p.on_progress = [](long long a, long long b, const std::string &s) {
-            static long long last = -1; static DWORD t0 = 0;
-            DWORD t = GetTickCount();
+            static long long last = -1; static long long t0 = 0;
+            long long t = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
             if (a == b || t - t0 > 1000 || last > a) { std::cout << stamp() << "PROGRESS " << a << " " << b << " " << s << std::endl; t0 = t; }
             last = a;
         };
@@ -328,7 +369,12 @@ std::vector<double> rfft_power(const std::vector<double> &x) {
 }
 
 std::string now_str(const char *f) {
-    time_t t = time(nullptr); tm lt; localtime_s(&lt, &t);
+    time_t t = time(nullptr); tm lt;
+#ifdef _WIN32
+    localtime_s(&lt, &t);
+#else
+    localtime_r(&t, &lt);
+#endif
     char buf[64]; strftime(buf, sizeof buf, f, &lt);
     return buf;
 }

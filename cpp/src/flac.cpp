@@ -170,7 +170,7 @@ size_t decode_frame(const u8 *d, size_t n, const Hdr &h, int bps, std::vector<in
 }
 
 bool is_flac(const std::string &path) {
-    FILE *f = _wfopen(widen(path).c_str(), L"rb");
+    FILE *f = ufopen(path, "rb");
     if (!f) return false;
     char m[4] = {0}; size_t k = fread(m, 1, 4, f); fclose(f);
     return k == 4 && !memcmp(m, "fLaC", 4);
@@ -210,9 +210,9 @@ uint64_t flac_to_raw(const std::string &in, const std::string &out, Progress &pr
     }
     uint64_t bytes = total * bpsmp;
     {
-        FILE *f = _wfopen(widen(out).c_str(), L"wb");
+        FILE *f = ufopen(out, "wb");
         if (!f) throw std::runtime_error("cannot write " + out);
-        if (bytes) { _fseeki64(f, (int64_t)bytes - 1, SEEK_SET); fputc(0, f); }
+        if (bytes) { fseek64(f, (int64_t)bytes - 1, SEEK_SET); fputc(0, f); }
         fclose(f);
     }
     std::atomic<uint64_t> done{0};
@@ -222,7 +222,7 @@ uint64_t flac_to_raw(const std::string &in, const std::string &out, Progress &pr
         if (first[i] == SIZE_MAX) return;
         size_t end = SIZE_MAX;                       // до начала следующего куска с кадром
         for (size_t j = i + 1; j < nchunks; j++) if (first[j] != SIZE_MAX) { end = first[j]; break; }
-        FILE *f = _wfopen(widen(out).c_str(), L"r+b");
+        FILE *f = ufopen(out, "r+b");
         if (!f) return;
         std::vector<int32_t> s; std::vector<u8> buf;
         size_t p = first[i]; Hdr h;
@@ -238,7 +238,7 @@ uint64_t flac_to_raw(const std::string &in, const std::string &out, Progress &pr
                 buf.resize((size_t)cnt * bpsmp);
                 if (bpsmp == 1) for (uint32_t k = 0; k < cnt; k++) buf[k] = (u8)(s[k] + 128);
                 else for (uint32_t k = 0; k < cnt; k++) { uint16_t v = (uint16_t)(s[k] + 32768); buf[2 * k] = (u8)v; buf[2 * k + 1] = (u8)(v >> 8); }
-                _fseeki64(f, (int64_t)(h.first_sample * bpsmp), SEEK_SET);
+                fseek64(f, (int64_t)(h.first_sample * bpsmp), SEEK_SET);
                 fwrite(buf.data(), 1, buf.size(), f);
                 uint64_t dn = done += cnt;
                 if ((dn / cnt) % 512 == 0) pr.progress((long long)(dn >> 10), (long long)(total >> 10), "unpacking FLAC");

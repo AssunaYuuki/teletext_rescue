@@ -65,15 +65,20 @@ recording's own text — the list is shown before anything is changed, and every
 
 ## Building
 
-MinGW-w64 g++ and CMake with Ninja:
+**Windows** — MinGW-w64 g++, CMake and Ninja: run `build.bat` (the program and `trcli`);
+`build.bat setup` also makes the installer with Inno Setup.
+
+**Linux and macOS** — `trcli`, the same decoders, reports and HTML exports from the command line
+(the windowed program is Windows only):
 
 ```
-cd cpp\build
-cmake -G Ninja .. -DCMAKE_CXX_COMPILER=g++ -DCMAKE_RC_COMPILER=windres
-ninja
+sh build.sh
+cpp/build-linux/trcli vbi recording.vbi      # cpp/build-darwin/trcli on macOS
 ```
 
-The installer is made with Inno Setup from `setup.iss`.
+Needs a C++20 compiler (g++ 10+, clang 12+ / Xcode 13+) and CMake 3.20+. Decoding uses the
+graphics card through OpenCL when it is there (Linux: `ocl-icd` plus the card's driver; macOS: built
+in), otherwise the processor.
 
 ## Licence
 

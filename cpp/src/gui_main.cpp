@@ -369,9 +369,13 @@ struct App : Window {
         if (R["format"].is_null()) { vbi_manual(f); return; }
         for (auto &r : R["results"].a) {
             std::string k = r.get_str("kind");
-            if (k == "teletext_project" || k == "t33" || r.get_str("service") == "Silent Radio" || is_amol(r)) open_result(r);
+            if (k == "teletext_project" || k == "t33" || k == "starsight" || r.get_str("service") == "Silent Radio" || is_amol(r) || is_xds(r)) open_result(r);
         }
         recording_window(hwnd, R, [this](const Json &r) { open_result(r); });
+    }
+    static bool is_xds(const Json &r) {
+        std::string p = r.get_str("path");
+        return basename(p).rfind("xds_", 0) == 0 && exists(stem_path(p) + ".json");
     }
     static bool is_amol(const Json &r) {
         std::string p = r.get_str("path");
@@ -380,6 +384,8 @@ struct App : Window {
     void open_result(const Json &r) {
         std::string p = r.get_str("path"), k = r.get_str("kind");
         if (is_amol(r)) { amol_window(hwnd, stem_path(p) + ".json"); return; }
+        if (is_xds(r)) { xds_window(hwnd, stem_path(p) + ".json"); return; }
+        if (k == "starsight" && exists(p)) { starsight_window(hwnd, p); return; }
         if (k == "teletext_project" && Project::is_project(p)) { if (can_leave()) load_project(p); }
         else if (k == "t33") open_t33(p);
         else if (r.get_str("service") == "Silent Radio" && exists(path_join(dirname(p), "packets.json"))) sign_window(hwnd, dirname(p));

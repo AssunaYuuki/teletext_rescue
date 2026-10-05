@@ -8,7 +8,9 @@
 //   trcli t33 <поток.t33> [папка]              (PNG и текст каждой записи NABTS)
 //   trcli t33html <поток.t33> [папка]
 //   trcli lines <запись.vbi> | packets <поток.t42> | vits <запись.vbi>
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <iostream>
 #include "opencl.h"
 #include "flac.h"
@@ -31,10 +33,16 @@ static std::string arg(const std::vector<std::string> &a, const std::string &k, 
 }
 static bool flag(const std::vector<std::string> &a, const std::string &k) { return std::find(a.begin(), a.end(), k) != a.end(); }
 
+#ifdef _WIN32
 int wmain(int argc, wchar_t **argv) {
     SetConsoleOutputCP(CP_UTF8);
     std::vector<std::string> a;
     for (int i = 1; i < argc; i++) a.push_back(narrow(argv[i]));
+#else
+int main(int argc, char **argv) {
+    std::vector<std::string> a;
+    for (int i = 1; i < argc; i++) a.push_back(argv[i]);
+#endif
     if (a.empty()) { std::cout << "usage: trcli build|export|srt|vbi|decode|probe|t33|t33html|lines|packets|vits ...\n"; return 1; }
     Progress &pr = console_progress();
     // --cpu — считать на процессоре; --gpu N — видеокарта N из списка «trcli devices»

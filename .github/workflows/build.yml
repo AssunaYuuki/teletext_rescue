@@ -1,0 +1,48 @@
+# Сборка trcli под Linux и macOS на каждый push: проверка, что всё собирается, и готовые файлы в Artifacts.
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build ocl-icd-libopencl1
+      - name: Tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+      - name: Build
+        run: sh build.sh
+      - name: Smoke test
+        run: |
+          B=cpp/build-$(uname -s | tr 'A-Z' 'a-z')
+          $B/trcli devices
+          # .t42 из двух пакетов: заголовок страницы 100 и ряд 1 -> страница собирается
+          python3 - <<'EOF'
+          H=[0x15,0x02,0x49,0x5E,0x64,0x73,0x38,0x2F,0xD0,0xC7,0x8C,0x9B,0xA1,0xB6,0xFD,0xEA]
+          def odd(c):
+              c&=0x7f
+              return c|0x80 if bin(c).count('1')%2==0 else c
+          out=bytearray()
+          for rep in range(4):
+              hdr=bytes([H[1],H[0],H[0],H[0]]+[H[0]]*6)+bytes(odd(ord(c)) for c in 'TEST PAGE      12:00:00 '.ljust(32))
+              row=bytes([H[9],H[0]])+bytes(odd(ord(c)) for c in 'Hello from the build check'.ljust(40))
+              out+=hdr+row
+          open('t.t42','wb').write(out)
+          EOF
+          $B/trcli build t.t42 tproj
+          test -f tproj/pages.json && grep -q '"100"' tproj/pages.json && echo "page 100 built"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trcli-${{ runner.os }}
+          path: cpp/build-*/trcli
