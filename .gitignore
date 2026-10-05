@@ -23,3 +23,6 @@ pages/gui_state.json
 dist/
 build/
 *.spec
+
+# сборки под Linux/macOS
+cpp/build-*/

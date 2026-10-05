@@ -76,6 +76,10 @@ sh build.sh
 cpp/build-linux/trcli vbi recording.vbi      # cpp/build-darwin/trcli on macOS
 ```
 
+Ready-made `trcli` for Linux (x86_64, ARM64) and macOS (one file for Apple Silicon and Intel) is
+attached to each release. On macOS, after unpacking: `xattr -d com.apple.quarantine trcli`.
+They can also be built on Windows with Zig: `python tools/cross_build.py path	o\zig.exe`.
+
 Needs a C++20 compiler (g++ 10+, clang 12+ / Xcode 13+) and CMake 3.20+. Decoding uses the
 graphics card through OpenCL when it is there (Linux: `ocl-icd` plus the card's driver; macOS: built
 in), otherwise the processor.
