@@ -1,9 +1,8 @@
-# Сборка trcli под Linux и macOS на каждый push: проверка, что всё собирается, и готовые файлы в Artifacts.
+# Сборка trcli под Linux и macOS на серверах GitHub: проверка, что всё собирается, и готовые файлы в Artifacts.
 name: build
 
+# запуск только вручную (Actions -> build -> Run workflow); обычно архивы собираются на Windows: tools/cross_build.py
 on:
-  push:
-  pull_request:
   workflow_dispatch:
 
 jobs:
