@@ -1,9 +1,8 @@
-; Установщик Teletext Rescue (Inno Setup 6).
-; Сначала: python build_exe.py   (собирает dist\Teletext Rescue\)
-; Потом:   ISCC.exe setup.iss    (или python build_exe.py --setup) -> dist\TeletextRescue-Setup-<версия>.exe
+﻿; Установщик Teletext Rescue (Inno Setup 6).
+; Сначала: ninja в cppuild, затем strip TeletextRescue.exe и trcli.exe в dist\Teletext Rescue <версия>\n; Потом:   ISCC.exe setup.iss  -> dist\TeletextRescue-Setup-<версия>.exe
 
 #define AppName "Teletext Rescue"
-#define AppVersion "1.0"
+#define AppVersion "1.1"
 #define AppPublisher "AssunaYuuki"
 #define AppURL "https://github.com/AssunaYuuki/teletext_rescue"
 #define AppExe "Teletext Rescue.exe"
@@ -24,12 +23,12 @@ DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 LicenseFile=LICENSE
 OutputDir=dist
-OutputBaseFilename=TeletextRescue-Setup-{#AppVersion}
+OutputBaseFilename=TeletextRescue-Setup-v{#AppVersion}
 SetupIconFile=icon.ico
 UninstallDisplayIcon={app}\{#AppExe}
 Compression=lzma2/max
 SolidCompression=yes
-; оформление как у программы: тёмный мастер, янтарное табло, значок TR (python installer_art.py)
+; оформление как у программы: тёмный мастер, янтарное табло, значок TR
 WizardStyle=modern dark includetitlebar hidebevels
 WizardBackColor=#1b1c1f
 WizardImageFile=installer\wizard_100.png,installer\wizard_150.png,installer\wizard_200.png
@@ -49,12 +48,17 @@ Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
-Source: "dist\{#AppName}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\{#AppName} {#AppVersion}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"
 Name: "{group}\{cm:UninstallProgram,{#AppName}}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
+
+[InstallDelete]
+; файлы старой версии 1.0
+Type: filesandordirs; Name: "{app}\_internal"
+Type: files; Name: "{app}\README.txt"
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent

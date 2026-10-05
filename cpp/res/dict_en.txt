@@ -1,0 +1,23 @@
+#strip: e s es ed ing y
+#endings: s es ed d ing er ers est ly ies ied ier iest ily ness ment ments tion tions al ally ful less able ity
+# function words
+the a an and or but nor so yet for of to in on at by with from into onto over under above below between among through during before after since until till about against without within along across around behind beyond near off out up down upon via per than then
+i me my mine myself you your yours yourself he him his himself she her hers herself it its itself we us our ours ourselves they them their theirs themselves this that these those who whom whose which what where when why how whether if because although though while unless as also too very just only even still already again ever never always often sometimes usually here there now today tonight tomorrow yesterday soon later early late yes no not please thanks thank hello goodbye ok
+be am is are was were been being have has had having do does did done doing will would shall should can could may might must ought get got gotten go goes went gone make made say said see saw seen come came take took taken give gave given know knew known think thought find found tell told
+all any some many much more most few less least each every either neither both other another such same own one two three four five six seven eight nine ten eleven twelve thirteen twenty thirty forty fifty hundred thousand million billion first second third fourth fifth last next half quarter
+# time
+time hour minute second day week month year century morning afternoon evening night midnight noon weekend date
+monday tuesday wednesday thursday friday saturday sunday mon tue wed thu fri sat sun
+january february march april may june july august september october november december jan feb mar apr jun jul aug sep sept oct nov dec spring summer autumn fall winter
+# television and teletext
+television tv channel programme program show series episode film movie cinema news newsroom headline headlines bulletin report reporter correspondent documentary drama comedy thriller western cartoon soap quiz game competition prize winner win lottery music concert chart charts album single band singer star stars celebrity actor actress director presenter viewer viewers audience live broadcast broadcaster schedule listing listings guide index contents page pages teletext text service information weather forecast travel traffic sport sports business finance shares markets money exchange rate rates holiday holidays horoscope horoscopes tips
+football soccer league cup premier division match goal goals score scores result results team player players manager club champion championship final semi tournament race racing formula cricket rugby tennis golf boxing athletics snooker horse horses olympic olympics world
+# society, politics, economy
+britain british england english scotland scottish wales welsh ireland irish london europe european america american usa russia russian france french germany german italy spain china japan world country countries city town village region north south east west northern southern eastern western central
+government minister prime president parliament party election vote law court police war peace army soldier conflict crisis tax taxes price prices cost bank economy company business job jobs work worker workers pay pension
+people person man men woman women child children family mother father son daughter brother sister friend love life death health hospital doctor school teacher student university
+# common verbs, adjectives, nouns
+play watch look listen read write speak talk ask answer call phone send order buy sell pay live stay leave arrive start begin end finish open close help need want like love hate try use run walk drive fly travel visit meet join win lose keep hold bring carry turn show move change happen
+good better best bad worse worst big bigger small smaller new old young long short high low fast slow early late strong weak great little large free full empty open closed main top latest special local national international public private hot cold warm cool wet dry sunny cloudy rain rainy snow wind windy fog
+white black red green blue yellow grey gray brown orange pink purple gold silver
+thing way place home house room door window road street area part side end top bottom number name word question problem idea plan reason case point fact story event day night water fire air light sun moon star sky land sea river mountain tree flower animal dog cat bird fish

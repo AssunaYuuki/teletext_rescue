@@ -1,0 +1,4 @@
+-std=c++20
+-xc++
+-DUNICODE
+-D_UNICODE

@@ -1,0 +1,28 @@
+#strip: en n e er es s st t et
+#endings: e en n er es s st t et em ern ung ungen te ten tet test ter tes tem teren ig ige igen iger iges lich liche lichen licher liches heit heiten keit keiten chen lein in innen
+# Funktionswörter
+der die das den dem des ein eine einen einem einer eines kein keine keinen keinem keiner keines und oder aber sondern denn doch jedoch auch noch schon nur erst sehr ganz gar fast etwa über unter vor hinter neben zwischen an auf aus bei mit nach seit von zu zum zur bis durch für gegen ohne um wegen trotz während statt innerhalb außerhalb ab
+ich du er sie es wir ihr mich dich ihn uns euch mir dir ihm ihnen sich mein meine deine dein sein seine ihre ihr unser unsere euer eure man jemand niemand alle alles allem allen aller jeder jede jedes jeden jedem viel viele vielen wenig wenige mehr meisten etwas nichts
+dieser diese dieses diesen diesem jener jene welcher welche welches wer wen wem wessen was wo wohin woher wann warum wie wieso weshalb ob dass daß weil wenn als ob obwohl damit falls sobald bevor nachdem
+nicht nie niemals immer oft manchmal selten jetzt heute gestern morgen übermorgen bald gleich sofort dann danach vorher später früh spät hier dort da drüben oben unten links rechts vorn hinten ja nein bitte danke hallo tschüss
+sein bin bist ist sind seid war waren warst gewesen haben habe hast hat habt hatte hatten gehabt werden werde wirst wird werdet wurde wurden geworden können kann kannst könnt konnte konnten müssen muss musst musste mussten dürfen darf durfte sollen soll sollte sollten wollen will willst wollte wollten mögen mag möchte möchten
+# Zahlen und Zeit
+null eins zwei drei vier fünf sechs sieben acht neun zehn elf zwölf dreizehn zwanzig dreißig vierzig fünfzig hundert tausend million milliarde erste zweite dritte vierte letzte nächste halb viertel
+zeit uhr stunde minute sekunde tag woche monat jahr jahrhundert morgen vormittag mittag nachmittag abend nacht wochenende datum termin
+montag dienstag mittwoch donnerstag freitag samstag sonnabend sonntag mo di mi do fr sa so
+januar februar märz april mai juni juli august september oktober november dezember jan feb mär apr jun jul aug sep okt nov dez
+frühling sommer herbst winter
+# Fernsehen und Videotext
+fernsehen fernseher sender programm sendung übersicht inhalt seite tafel videotext teletext text news nachrichten meldung schlagzeile magazin bericht reportage dokumentation film spielfilm serie folge staffel krimi komödie drama thriller western abenteuer zeichentrick show talkshow quiz gewinnspiel lotto toto gewinn gewinner preis kino premiere wiederholung live übertragung moderator moderatorin zuschauer quote kanal frequenz satellit kabel empfang
+musik konzert sänger sängerin band lied hit charts album schauspieler schauspielerin regisseur star stars promi promis kultur theater oper museum buch autor
+tipp tipps horoskop wetter vorhersage börse kurse sport fußball bundesliga tor tore spiel spieler mannschaft trainer verein meister meisterschaft pokal liga tabelle ergebnis ergebnisse sieg niederlage unentschieden punkt punkte rennen formel weltmeister weltmeisterschaft olympia olympische tennis boxen eishockey handball basketball radsport golf ski skispringen biathlon leichtathletik schwimmen
+verkehr stau autobahn straße bahn zug flug flughafen auto fahrer reise urlaub hotel ferien
+# Gesellschaft, Politik, Wirtschaft
+deutschland deutsch deutsche deutschen bundesrepublik berlin bonn hamburg münchen köln frankfurt stuttgart düsseldorf dresden leipzig hannover bremen österreich wien schweiz zürich europa europäisch amerika amerikanisch usa russland russisch frankreich französisch england englisch britisch italien spanien china japan welt land länder stadt dorf region bundesland
+regierung bundesregierung kanzler bundeskanzler kanzlerin präsident minister ministerium partei politik politiker wahl wahlen abstimmung parlament bundestag bundesrat gesetz gericht urteil polizei krieg frieden armee soldat konflikt krise reform steuer steuern geld euro mark dollar preis preise kosten bank wirtschaft unternehmen firma arbeit arbeitslos arbeitslosigkeit job beruf lohn gehalt rente miete wohnung haus
+mensch menschen leute mann frau kind kinder familie eltern mutter vater sohn tochter bruder schwester freund freundin liebe leben tod gesundheit krankheit arzt krankenhaus schule lehrer schüler student universität
+# häufige Verben, Adjektive, Nomen
+machen gehen kommen sehen sagen geben nehmen finden bleiben stehen liegen sitzen laufen fahren fliegen spielen arbeiten wohnen leben lieben essen trinken schlafen kaufen verkaufen zahlen bezahlen lesen schreiben hören sprechen fragen antworten wissen kennen denken glauben meinen zeigen bringen holen suchen warten helfen beginnen anfangen enden aufhören öffnen schließen gewinnen verlieren tanzen singen lachen weinen bestellen anrufen senden schicken erhalten bekommen erfahren
+gut besser beste schlecht groß größer klein kleiner neu alt jung lang kurz hoch tief schnell langsam früh spät stark schwach schön hässlich leicht schwer billig teuer reich arm voll leer offen frei sicher wichtig richtig falsch wahr ganz halb ander andere anderen gleich verschieden aktuell aktuelle neueste letzte erste
+weiß schwarz rot grün blau gelb grau braun orange rosa lila
+ding sache frage antwort problem lösung idee plan ziel grund art weise teil seite ende anfang mitte ort platz raum weg straße ecke fenster tür zimmer küche wasser feuer luft licht sonne mond stern himmel erde meer see fluss berg wald baum blume tier hund katze pferd vogel fisch
