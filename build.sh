@@ -30,7 +30,7 @@ if [ "$OS" = "darwin" ]; then JOBS=$(sysctl -n hw.ncpu); else JOBS=$(nproc 2>/de
 ARCH=""
 [ "$OS" = "darwin" ] && ARCH="-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
 cmake -S cpp -B "$BUILD" $GEN -DCMAKE_BUILD_TYPE=Release $ARCH
-cmake --build "$BUILD" -j "$JOBS"
+if [ -n "$GEN" ]; then cmake --build "$BUILD" -j "$JOBS" -- -k 0; else cmake --build "$BUILD" -j "$JOBS" -- -k; fi
 
 echo
 if [ "$OS" = "darwin" ]; then echo "Done: $BUILD/TeletextRescue.app and $BUILD/trcli"; else echo "Done: $BUILD/TeletextRescue and $BUILD/trcli"; fi

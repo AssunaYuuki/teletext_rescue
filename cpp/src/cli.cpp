@@ -5,6 +5,7 @@
 #define NOMINMAX
 #endif
 #include "decoder.h"
+#include "ui/util.h"
 #include "ssjson.h"
 #include "export.h"
 #include "ttpages.h"

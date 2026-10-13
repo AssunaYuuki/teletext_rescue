@@ -1,4 +1,5 @@
 #include "ssjson.h"
+#include "ui/util.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>

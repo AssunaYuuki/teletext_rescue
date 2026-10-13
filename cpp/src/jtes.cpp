@@ -702,6 +702,7 @@ bool jtesDecode(const std::vector<FastPacket>& in, JtesResult& out)
         pk.push_back(q);
     }
     // Japanese teletext: most codewords right as received or after a small repair
+    if (getenv("TR_JTESSTAT")) fprintf(stderr, "JTES: %lld lines, %lld clean, %lld fixed, %lld failed\n", (long long)out.packets, (long long)out.clean, (long long)out.fixed, (long long)out.failed);
     if (out.packets < 200 || (out.clean + out.fixed) * 10 < out.packets * 6) return false;
 
     std::stable_sort(pk.begin(), pk.end(), [](const Pkt& a, const Pkt& b) {

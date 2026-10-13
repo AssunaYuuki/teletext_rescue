@@ -2,6 +2,7 @@
 #define NOMINMAX
 #endif
 #include "vbifile.h"
+#include "ui/util.h"
 #ifdef _WIN32
 #include <windows.h>
 #endif

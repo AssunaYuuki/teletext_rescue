@@ -1,4 +1,5 @@
 #include "decoder.h"
+#include "ui/util.h"
 #include "jtes.h"
 #include "flac.h"
 #include "colour.h"
