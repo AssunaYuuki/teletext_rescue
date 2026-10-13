@@ -2,7 +2,7 @@
 ; Сначала: ninja в cppuild, затем strip TeletextRescue.exe и trcli.exe в dist\Teletext Rescue <версия>\n; Потом:   ISCC.exe setup.iss  -> dist\TeletextRescue-Setup-<версия>.exe
 
 #define AppName "Teletext Rescue"
-#define AppVersion "1.1"
+#define AppVersion "1.2"
 #define AppPublisher "AssunaYuuki"
 #define AppURL "https://github.com/AssunaYuuki/teletext_rescue"
 #define AppExe "Teletext Rescue.exe"

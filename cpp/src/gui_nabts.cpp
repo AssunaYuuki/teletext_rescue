@@ -1,14 +1,15 @@
-// Окно NABTS .t33: каталог записей и страницы NAPLPS, нарисованные как на экране приёмника.
+// NABTS window (from Teletext Rescue): the record catalogue and the NAPLPS pages
+// drawn as on the receiver screen, from the packets of the decoded recording.
 #include "gui_app.h"
 #include "nabts.h"
 #include <windowsx.h>
-#include <thread>
 
 namespace ui {
 namespace {
 const std::vector<std::pair<std::string, std::pair<int, int>>> GRIDS = {{"256 \xC3\x97 200 (as the receiver)", {256, 200}}, {"512 \xC3\x97 400", {512, 400}}, {"768 \xC3\x97 600", {768, 600}}};
 
 struct NabtsWin : Window {
+    ResultPtr R;
     std::string path;
     std::vector<nabts::Record> recs; bool loaded = false;
     int grid = 0;
@@ -20,21 +21,8 @@ struct NabtsWin : Window {
     void status(const std::string &t) { set_text(msg, t); }
     int current() { int i = ListView_GetNextItem(lst, -1, LVNI_SELECTED); return i >= 0 && i < (int)recs.size() ? i : -1; }
 
-    void load() {
-        status("parsing the stream\xE2\x80\xA6");
-        std::string p = path; HWND h = hwnd;
-        std::thread([this, p, h] {
-            auto *res = new std::pair<std::vector<nabts::Record>, nabts::Summary>();
-            std::string err;
-            try {
-                Progress pr;
-                pr.on_progress = [h](long long a, long long b, const std::string &) { PostMessageW(h, WM_APP + 5, (WPARAM)(100 * a / std::max(1LL, b)), 0); };
-                res->first = nabts::read_t33(p, res->second, &pr);
-                nabts::interpret(res->first, 256, 200);
-            } catch (std::exception &e) { err = e.what(); }
-            if (!err.empty()) { delete res; auto *e = new std::string(err); PostMessageW(h, WM_APP + 7, 0, (LPARAM)e); }
-            else PostMessageW(h, WM_APP + 6, 0, (LPARAM)res);
-        }).detach();
+    void load() {   // the records come decoded with the recording
+        loaded_cb(new std::pair<std::vector<nabts::Record>, nabts::Summary>(R->nabtsRecords, R->nabtsSummary));
     }
     void loaded_cb(std::pair<std::vector<nabts::Record>, nabts::Summary> *res) {
         recs = std::move(res->first); auto summ = res->second; delete res; loaded = true;
@@ -207,9 +195,9 @@ struct NabtsWin : Window {
 };
 }
 
-void nabts_window(HWND owner, const std::string &t33) {
-    auto *w = new NabtsWin; w->path = t33;
-    w->create(L"TRNabts", "NABTS \xE2\x80\x94 " + basename(t33), WS_OVERLAPPEDWINDOW, S(owner, 1300), S(owner, 860), owner);
+void nabts_window(HWND owner, const ResultPtr &r) {
+    auto *w = new NabtsWin; w->R = r; w->path = r->path;
+    w->create(L"TRNabts", "NABTS â " + file_name(*r), WS_OVERLAPPEDWINDOW, S(owner, 1300), S(owner, 860), owner);
     ShowWindow(w->hwnd, SW_SHOW);
 }
 }

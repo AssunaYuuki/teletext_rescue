@@ -1,5 +1,7 @@
 #include "flac.h"
-#include "vbidecode.h"
+#include <algorithm>
+#include <cstring>
+#include <functional>
 #include <atomic>
 #include <cstdio>
 #include <mutex>
@@ -48,7 +50,15 @@ uint16_t crc16(const u8 *d, size_t n) {
     for (size_t i = 0; i < n; i++) c = (uint16_t)((c << 8) ^ T[((c >> 8) ^ d[i]) & 0xFF]);
     return c;
 }
-struct Info { uint32_t min_block = 0, max_block = 0, rate = 0, channels = 0, bps = 0; uint64_t total = 0; size_t first_frame = 0; };
+struct Info { uint32_t min_block = 0, max_block = 0, rate = 0, channels = 0, bps = 0; uint64_t total = 0; size_t first_frame = 0; std::string comment; };
+uint32_t le32(const u8 *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
+void parallel_for(size_t n, const std::function<void(size_t)> &fn) {
+    unsigned nt = std::max(1u, std::thread::hardware_concurrency());
+    std::atomic<size_t> next{0};
+    std::vector<std::thread> th;
+    for (unsigned t = 0; t < nt; t++) th.emplace_back([&] { for (size_t i; (i = next++) < n;) fn(i); });
+    for (auto &t : th) t.join();
+}
 
 Info read_info(const u8 *d, size_t n) {
     if (n < 42 || memcmp(d, "fLaC", 4)) throw std::runtime_error("not a FLAC file");
@@ -63,6 +73,18 @@ Info read_info(const u8 *d, size_t n) {
             I.rate = b.get(20); I.channels = b.get(3) + 1; I.bps = b.get(5) + 1;
             I.total = ((uint64_t)b.get(4) << 32) | b.get(32);
             got = true;
+        } else if (type == 4 && p + len <= n && len >= 8) {   // VORBIS_COMMENT: capture notes such as "2048x32@25Hz"
+            size_t q = p, e = p + len;
+            uint32_t vl = le32(d + q); q += 4 + vl;
+            if (q + 4 <= e) {
+                uint32_t cnt = le32(d + q); q += 4;
+                for (uint32_t i = 0; i < cnt && q + 4 <= e; i++) {
+                    uint32_t l = le32(d + q); q += 4;
+                    if (q + l > e) break;
+                    I.comment += std::string((const char *)d + q, l) + "\n";
+                    q += l;
+                }
+            }
         }
         p += len;
     }
@@ -176,10 +198,11 @@ bool is_flac(const std::string &path) {
     return k == 4 && !memcmp(m, "fLaC", 4);
 }
 
-uint64_t flac_to_raw(const std::string &in, const std::string &out, Progress &pr) {
+uint64_t flac_to_raw(const std::string &in, const std::string &out, Progress &pr, std::string *comment) {
     MappedFile mf(in);
     const u8 *d = mf.data(); size_t n = (size_t)mf.size();
     Info I = read_info(d, n);
+    if (comment) *comment = I.comment;
     if (I.channels != 1) throw std::runtime_error(fmt("FLAC: %u channels \xE2\x80\x94 a VBI recording in FLAC has one", I.channels));
     if (I.bps != 8 && I.bps != 16) throw std::runtime_error(fmt("FLAC: %u bits per sample \xE2\x80\x94 expected 8 or 16", I.bps));
     int bpsmp = I.bps / 8;
@@ -215,7 +238,7 @@ uint64_t flac_to_raw(const std::string &in, const std::string &out, Progress &pr
         if (bytes) { fseek64(f, (int64_t)bytes - 1, SEEK_SET); fputc(0, f); }
         fclose(f);
     }
-    std::atomic<uint64_t> done{0};
+    std::atomic<uint64_t> done{0}, badFrames{0}, badSamples{0};
     std::mutex fmu;
     std::string err;
     parallel_for(nchunks, [&](size_t i) {
@@ -233,7 +256,18 @@ uint64_t flac_to_raw(const std::string &in, const std::string &out, Progress &pr
                     if (q + 16 >= n || q >= end) break;
                     p = q;
                 }
-                size_t next = decode_frame(d, n, h, I.bps, s);
+                size_t next;
+                try {
+                    next = decode_frame(d, n, h, I.bps, s);
+                } catch (std::exception &) {
+                    // a damaged frame: its samples stay zero, go on from the next frame header
+                    badFrames++, badSamples += h.block;
+                    size_t q = p + 1;
+                    while (q + 16 < n && q < end && !(d[q] == 0xFF && parse_header(d, n, q, I, h))) q++;
+                    if (q + 16 >= n || q >= end) break;
+                    p = q;
+                    continue;
+                }
                 uint32_t cnt = (uint32_t)std::min<uint64_t>(h.block, total > h.first_sample ? total - h.first_sample : 0);
                 buf.resize((size_t)cnt * bpsmp);
                 if (bpsmp == 1) for (uint32_t k = 0; k < cnt; k++) buf[k] = (u8)(s[k] + 128);
@@ -248,6 +282,49 @@ uint64_t flac_to_raw(const std::string &in, const std::string &out, Progress &pr
         fclose(f);
     });
     if (!err.empty()) throw std::runtime_error(err);
+    if (badFrames)
+        pr.log(fmt("FLAC: %llu damaged frames skipped (%llu samples, %.2f%% of the recording, left as zeros) â the file itself is damaged there",
+                   (unsigned long long)badFrames, (unsigned long long)badSamples, total ? 100.0 * badSamples / total : 0.0));
     pr.log(fmt("FLAC unpacked: %llu bytes (%u-bit samples)", (unsigned long long)bytes, I.bps));
     return bytes;
+}
+
+// ---------------------------------------------------------------- unpacked copy, kept for the next time
+std::string flac_cache_path(const std::string &flac) {
+    std::string s = abspath(flac);
+    s = s.substr(0, s.size() - 5);                               // drop .flac
+    if (ends_with_i(s, ".vbi") || ends_with_i(s, ".u8") || ends_with_i(s, ".u16") || ends_with_i(s, ".tbc")) s = stem_path(s);
+    std::string dir = s + "_vbi";
+    return path_join(dir, basename(s) + ".vbi");
+}
+
+uint64_t flac_raw_size(const std::string &flac) {
+    MappedFile mf(flac);
+    Info I = read_info(mf.data(), (size_t)mf.size());
+    return I.total * (I.bps / 8);
+}
+
+bool flac_cached(const std::string &flac) {
+    std::string raw = flac_cache_path(flac);
+    if (!exists(raw)) return false;
+    try { uint64_t want = flac_raw_size(flac); return want ? file_size(raw) == want : file_size(raw) > 0; } catch (...) { return false; }
+}
+
+std::string flac_unpack_cached(const std::string &flac, bool again, Progress &pr) {
+    std::string raw = flac_cache_path(flac);
+    if (!again && flac_cached(flac)) { pr.log("FLAC already unpacked: " + raw); return raw; }
+    make_dirs(raw.substr(0, raw.find_last_of("/\\")));
+    pr.step("Unpacking the FLAC-compressed recording");
+    std::string tmp = raw + ".part", comment;
+    flac_to_raw(flac, tmp, pr, &comment);
+    std::error_code ec;
+    fs::remove(P(raw), ec);
+    fs::rename(P(tmp), P(raw), ec);
+    if (ec) throw std::runtime_error("cannot write " + raw);
+    write_text(raw + ".info", comment);                       // the capture notes ("8bit, little-endian, 2048x32@25Hz")
+    return raw;
+}
+
+std::string capture_notes(const std::string &raw) {
+    return exists(raw + ".info") ? read_text(raw + ".info") : std::string();
 }

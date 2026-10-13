@@ -1,6 +1,6 @@
 #!/bin/sh
-# Сборка Teletext Rescue под Linux и macOS: trcli — все декодеры, отчёты и HTML из командной строки.
-# Окна программы — только под Windows (build.bat).
+# Сборка Teletext Rescue под Linux и macOS: программа с окнами (SDL3 + Dear ImGui) и trcli.
+# Под Windows — build.bat.
 #
 #   ./build.sh            сборка в cpp/build-<система>/
 #   ./build.sh clean      то же с чистого листа
@@ -33,11 +33,8 @@ cmake -S cpp -B "$BUILD" $GEN -DCMAKE_BUILD_TYPE=Release $ARCH
 cmake --build "$BUILD" -j "$JOBS"
 
 echo
-echo "Done: $BUILD/trcli"
-"$BUILD/trcli" devices || true
+if [ "$OS" = "darwin" ]; then echo "Done: $BUILD/TeletextRescue.app and $BUILD/trcli"; else echo "Done: $BUILD/TeletextRescue and $BUILD/trcli"; fi
+"$BUILD/trcli" || true
 echo
 echo "Examples:"
-echo "  $BUILD/trcli vbi recording.vbi          # examine and decode everything readable"
-echo "  $BUILD/trcli vbi recording.vbi --cpu    # the same on the processor"
-echo "  $BUILD/trcli build stream.t42 project   # pages from a .t42 stream"
-echo "  $BUILD/trcli export project             # output.t42 + HTML pages"
+echo "  $BUILD/trcli recording.vbi --export out   # decode, write everything into the folder out"

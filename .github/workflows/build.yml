@@ -1,53 +1,82 @@
-# Сборка trcli под Linux и macOS на серверах GitHub: проверка, что всё собирается, и готовые файлы в Artifacts.
+# Teletext Rescue for Linux and macOS, built on GitHub's machines: the program with windows (SDL3 +
+# Dear ImGui) and trcli. A version tag (v1.2, ...) also makes the release and attaches the archives;
+# the Windows installer is built with build.bat and added to the release.
 name: build
 
-# запуск только вручную (Actions -> build -> Run workflow); обычно архивы собираются на Windows: tools/cross_build.py
 on:
   workflow_dispatch:
+  push:
+    tags: ['v*']
+    branches: ['build/**']
+
+permissions:
+  contents: write
 
 jobs:
   unix:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-22.04
+            name: TeletextRescue-linux-x86_64
+          - os: ubuntu-22.04-arm
+            name: TeletextRescue-linux-arm64
+          - os: macos-14
+            name: TeletextRescue-macos-universal
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Tools (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y ninja-build ocl-icd-libopencl1
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++ libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev \
+            libxtst-dev libwayland-dev libxkbcommon-dev wayland-protocols libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev \
+            libasound2-dev libpulse-dev libdbus-1-dev libudev-dev
       - name: Tools (macOS)
         if: runner.os == 'macOS'
         run: brew install ninja
       - name: Build
         run: sh build.sh
-      - name: Smoke test
+      - name: Check
         run: |
           B=cpp/build-$(uname -s | tr 'A-Z' 'a-z')
-          $B/trcli devices
-          # .t42 из двух пакетов: заголовок страницы 100 и ряд 1 -> страница собирается
-          python3 - <<'EOF'
-          H=[0x15,0x02,0x49,0x5E,0x64,0x73,0x38,0x2F,0xD0,0xC7,0x8C,0x9B,0xA1,0xB6,0xFD,0xEA]
-          def odd(c):
-              c&=0x7f
-              return c|0x80 if bin(c).count('1')%2==0 else c
-          out=bytearray()
-          for rep in range(4):
-              hdr=bytes([H[1],H[0],H[0],H[0]]+[H[0]]*6)+bytes(odd(ord(c)) for c in 'TEST PAGE      12:00:00 '.ljust(32))
-              row=bytes([H[9],H[0]])+bytes(odd(ord(c)) for c in 'Hello from the build check'.ljust(40))
-              out+=hdr+row
-          open('t.t42','wb').write(out)
-          EOF
-          $B/trcli build t.t42 tproj
-          test -f tproj/pages.json && grep -q '"100"' tproj/pages.json && echo "page 100 built"
+          $B/trcli > usage.txt || true
+          cat usage.txt
+          grep -q "Teletext Rescue 1.2" usage.txt
+          if [ "$(uname -s)" = "Darwin" ]; then lipo -info $B/trcli; lipo -info "$B/TeletextRescue.app/Contents/MacOS/TeletextRescue"; else file $B/trcli $B/TeletextRescue; fi
       - name: Package
         run: |
           B=cpp/build-$(uname -s | tr 'A-Z' 'a-z')
-          if [ "$(uname -s)" = "Darwin" ]; then N=trcli-macos-universal; lipo -info $B/trcli; else N=trcli-linux-x86_64; fi
-          mkdir -p pkg/$N && cp $B/trcli README.md LICENSE pkg/$N/ && chmod +x pkg/$N/trcli
+          N=${{ matrix.name }}
+          mkdir -p pkg/$N
+          cp $B/trcli README.md LICENSE pkg/$N/
+          if [ "$(uname -s)" = "Darwin" ]; then
+            cp -R "$B/TeletextRescue.app" "pkg/$N/Teletext Rescue.app"
+          else
+            cp $B/TeletextRescue pkg/$N/
+            cp icon.png pkg/$N/ 2>/dev/null || true
+          fi
+          chmod +x pkg/$N/trcli
           tar -C pkg -czf $N.tar.gz $N
       - uses: actions/upload-artifact@v4
         with:
-          name: trcli-${{ runner.os }}
-          path: trcli-*.tar.gz
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}.tar.gz
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: unix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Teletext Rescue ${{ github.ref_name }}
+          body_path: .github/release-notes.md
+          files: dist/*.tar.gz

@@ -1,0 +1,13 @@
+// Icon, common controls 6 (dark list views) and DPI awareness.
+IDI_APP ICON "icon.ico"
+1 24 "app.manifest"
+NABTS_PLAYER RCDATA "nabts_player.js"
+OUTPUT_TEMPLATE RCDATA "output_template.html"
+PAGE_TEMPLATE RCDATA "page_template.html"
+TT_RENDER RCDATA "tt_render.js"
+SILENT_RADIO_PLAYER RCDATA "silent_radio_player.js"
+ZONED_TPL RCDATA "zoned_tpl.bin"
+CHANNEL_H RCDATA "channel_h.bin"
+DICT_RU RCDATA "dict_ru.txt"
+DICT_DE RCDATA "dict_de.txt"
+DICT_EN RCDATA "dict_en.txt"

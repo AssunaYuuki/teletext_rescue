@@ -1,88 +1,95 @@
 # Teletext Rescue
 
-Recovers teletext, NABTS and other data hidden in the vertical blanking interval (VBI) of old
-video recordings — and shows it the way viewers saw it in the 1980s–90s.
+Recovers teletext, programme guides, captions and other data hidden in the vertical blanking
+interval (VBI) of old video recordings — and shows it the way viewers saw it in the 1980s–90s.
 
 Open a raw VBI capture and the program works out the rest by itself: the capture chip and
-format, what every VBI line carries, and which decoders to run. Everything readable is decoded
-and opened.
+format, the colour system, what every VBI line carries, and which decoders to run. Everything
+readable is decoded and opened, each service in its own window.
 
 ## What it reads
 
 | Service | What you get |
 |---|---|
-| **WST teletext** (PAL/SECAM, 525-line) | pages with Level 1 rendering (flash, double size, boxes, conceal), a page editor, export to `.t42` + HTML, subtitles `.srt`, a cleaned stream, word restoration, the channel and the time of the broadcast |
-| **NABTS / NAPLPS** (CBS ExtraVision, NBC Teletext) | NAPLPS pages drawn as the receiver drew them — in time, with pauses, colour-map changes and blinking; HTML export |
-| **Silent Radio** (LED news-sign service, line 21) | the sign plays inside the program: graphics, animations, headlines, scrolling stories, score lines; all texts |
-| **Encrypted datacast** (5.73 Mbit/s) | packets voted from their copies, addresses, streams and carousel (the data itself is encrypted) |
-| **CC captions and XDS** (line 21) | caption text; station, network, time of day, programme name and rating from XDS |
-| **AMOL**, **VITC** | programme identification and time stamp in its own window; time code |
-| **Test signals (VITS)** | the frequency response of the recording, measured from the multiburst |
-| **DVB teletext** (`.ts`) | teletext pages from a digital broadcast recording |
+| **WST teletext** (625 lines, 525-line NTSC, DVB `.ts`) | pages as on a TV (Level 1), page editor, clean pages, word restoration, export to `.t42` + HTML, subtitles `.srt` |
+| **Japanese teletext** (文字多重放送, JTES / BT.653 system D) | pages exactly as the tuner drew them: kanji and kana (TU-TX100 fonts), photographic pictures, smooth mosaics, DRCS, animations, and the tunes they play |
+| **NABTS / NAPLPS** (CBS ExtraVision, NBC Teletext) | NAPLPS pages drawn as the receiver drew them, in time; HTML export |
+| **StarSight** programme guide | the guide grid with titles and descriptions (Huffman-compressed text decoded) |
+| **Gemstar GUIDE Plus+** | programme table from the guide blocks; packet table |
+| **CC captions and XDS** (line 21, NTSC and PAL) | caption text; station, network, time of day, programme, rating |
+| **AMOL** | source ID and broadcast clock |
+| **Silent Radio** (LED news-sign service) | the sign plays inside the program; all texts |
+| **TV-Inform** (Russia, Channel 1) and **Interactive Network** | packets and their decoded records |
+| **Datacasts** (5.73 Mbit/s) | packets voted from their copies, streams and carousel |
+| **Test signals (VITS)**, **VPS / WSS** | what the recording carries on each line |
 
-Capture chips: bt8x8, cx88, saa713x, cx23885, ivtv/cx18, em28xx (PAL/SECAM/NTSC), 16-bit 4fsc
-`.tbc`; FLAC-compressed captures (`.vbi.flac`, `.flac`); streams `.t42`, `.t34`, `.t33`, DVB `.ts`.
+Capture chips: bt8x8 (NTSC and PAL), cx88, saa713x, cx23885, ivtv/cx18, em28xx, 16-bit 4fsc
+`.tbc` from vhs-decode; FLAC-compressed captures (`.vbi.flac`, `.flac`); streams `.t42`, `.t34`,
+`.t33`, DVB `.ts`.
 
 Signals worn by VHS are read with MLSE (Viterbi) decoders that fit the tape channel by
-themselves. Decoding runs on the graphics card through OpenCL — NVIDIA, AMD or Intel, whichever
-the computer has — and can be switched to the processor when a recording is opened.
+themselves. Decoding runs on the graphics card through OpenCL — NVIDIA, AMD or Intel — or on the
+processor.
 
 ## Installing and running
 
-Run `TeletextRescue-Setup-v1.1.exe` (Windows 10/11, 64-bit). Nothing else is needed.
+**Windows 10/11 (64-bit):** run `TeletextRescue-Setup-v1.2.exe`. Nothing else is needed.
 
-**File → Open .vbi recording…** — the recording is examined automatically. You choose what decodes
-it (graphics card or processor; the choice can be remembered). Results go into one folder
-`<name>_vbi` next to the recording (the recording itself is never changed): `report.txt`,
-`teletext\`, `<name>.t33`, `silentradio\`, `datacast\`, `cc_*.txt`, `xds_*.txt`, `amol_*.txt`.
-A window *What is in the recording* shows a colour map of the VBI lines and opens each result.
+**File → Open .vbi recording…** — the recording is examined and decoded; the results are saved in one
+folder `<name>_vbi` next to the recording (the recording itself is never changed), so opening it
+again is instant. The start screen lists what was found; every service opens in its own window,
+and **Export everything decoded…** writes all results into a folder.
 
-Next to every teletext page the program shows the channel and broadcast time (from the page header
-and packet 8/30). The page list shows the section from the page header.
+**Linux** (x86_64, ARM64) and **macOS** (Apple Silicon and Intel): unpack the archive and run
+`TeletextRescue` (on macOS `Teletext Rescue.app`) — the same program with the same windows. On macOS,
+the first time: right click → Open, or `xattr -dr com.apple.quarantine "Teletext Rescue.app" trcli`.
 
-**Tools → Clean stream** restores damaged words, writes `clean.t42` with one assembled copy of every
-subpage in page order, and opens it. **Export → output.t42** can clean the stream as well.
-**Tools → Restore words** finds words damaged on the tape (a digit inside a word, letters with bit
-errors) and restores them from built-in Russian, German and English dictionaries and from the
-recording's own text — the list is shown before anything is changed, and every page can be undone.
+**Command line** (all systems): `trcli`, the same decoders without windows:
 
-`trcli.exe` is the same program from the command line, e.g. `trcli vbi recording.vbi`,
-`trcli devices`, `trcli vbi recording.vbi --cpu`, `trcli squash <project folder>`,
-`trcli words <project folder>`, `trcli flac recording.vbi.flac recording.vbi`.
+```
+trcli recording.vbi                     # decode, print the report
+trcli recording.vbi --export out        # write everything decoded into the folder out
+trcli recording.vbi --cpu               # on the processor (--gpu: on the graphics card)
+trcli recording.vbi --again             # decode again instead of opening the saved results
+```
 
-## What is new in 1.1
+## What is new in 1.2
 
-- The whole program rewritten in C++: one small installer, no runtime to install, decoding many
-  times faster, on the graphics card of any vendor (NVIDIA, AMD, Intel) or on the processor.
-- FLAC-compressed captures open directly.
-- Clean stream, word restoration with built-in dictionaries, channel and time next to the page.
-- XDS on line 21: station, network, time of day, programme and rating.
-- AMOL window: broadcast clock, source ID and the packet bits.
-- DVB teletext from broadcasters that repeat rows is assembled into full pages.
-- NAPLPS animations play at their real speed.
-- Capture format detection checks the captions on line 21, so cropped 27 MHz captures are no
-  longer mistaken for 13.5 MHz ones.
+- **Japanese teletext (JTES)**: the whole service — 1400+ pages from a 1996 NHK recording.
+  Errors are corrected with the majority-logic decoder of the (272,190) difference-set code
+  (up to 8 bits per line), every page is assembled from all its repeated copies and checked by
+  CRC. Photographic pictures (logos, illustrations), smooth mosaics, double-size characters,
+  DRCS, the page raster colours, animated pages (played in the window, exported frame by frame)
+  and tunes (played, exported as WAV).
+- **StarSight**: titles and descriptions decoded (the Huffman table recovered), guide grid.
+- **Gemstar GUIDE Plus+**: guide blocks decrypted and decompressed into a programme table.
+- **TV-Inform** (Channel 1, Russia), **Interactive Network** 2D service, **AMOL** text frames,
+  CBS clock in XDS, VPS / WSS, SECAM / PAL / NTSC colour of the VBI lines.
+- Captions on any line, also from PAL tapes; PAL teletext from bttv captures at 35.47 MHz.
+- A VBI line viewer: waveform, spectrum, eye diagram and the colour as on a TV.
+- Saved results: a recording decoded once opens again without decoding.
+- New program window design: a window per service, one export for everything.
+- **Linux and macOS get the program with windows** (before: the command line only).
 
 ## Building
 
-**Windows** — MinGW-w64 g++, CMake and Ninja: run `build.bat` (the program and `trcli`);
-`build.bat setup` also makes the installer with Inno Setup.
+**Windows** — MinGW-w64 g++, CMake and Ninja: `build.bat` (the program and `trcli`);
+`build.bat setup` also makes the installer with Inno Setup 6.
 
-**Linux and macOS** — `trcli`, the same decoders, reports and HTML exports from the command line
-(the windowed program is Windows only):
+**Linux and macOS** — the program with windows (SDL3 + Dear ImGui) and `trcli`:
 
 ```
 sh build.sh
-cpp/build-linux/trcli vbi recording.vbi      # cpp/build-darwin/trcli on macOS
+cpp/build-linux/TeletextRescue           # cpp/build-darwin/TeletextRescue.app on macOS
 ```
 
-Ready-made `trcli` for Linux (x86_64, ARM64) and macOS (one file for Apple Silicon and Intel) is
-attached to each release. On macOS, after unpacking: `xattr -d com.apple.quarantine trcli`.
-They can also be built on Windows with Zig: `python tools/cross_build.py C:\path\zig.exe`.
-
-Needs a C++20 compiler (g++ 10+, clang 12+ / Xcode 13+) and CMake 3.20+. Decoding uses the
-graphics card through OpenCL when it is there (Linux: `ocl-icd` plus the card's driver; macOS: built
-in), otherwise the processor.
+Needs a C++20 compiler (g++ 10+, clang 12+ / Xcode 13+), CMake 3.20+ and Git (CMake fetches SDL3);
+on Linux the X11 / Wayland development packages (Debian/Ubuntu: `libx11-dev libxext-dev libxrandr-dev
+libxcursor-dev libxi-dev libxss-dev libwayland-dev libxkbcommon-dev libegl1-mesa-dev libasound2-dev
+libpulse-dev`). The graphics card is used through OpenCL when it is there (Linux: `ocl-icd` plus the
+card's driver; macOS: built in), otherwise the processor. Ready-made builds for Linux (x86_64,
+ARM64) and macOS (one app for Apple Silicon and Intel) are attached to each release (built by
+GitHub Actions, `.github/workflows/build.yml`).
 
 ## Licence
 
