@@ -966,6 +966,14 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
             w.check = a.summary();
             for (auto& e : a.files) if (!e.ok) w.check += "; " + e.name + ": " + e.why;
             w.checkOk = a.archive && a.headerOk && a.complete && !a.files.empty() && a.good() == (int)a.files.size();
+            // unpacked even when damaged (7-Zip refuses it): whole files, and the rest as far as it unpacks
+            std::string xd = path_join(dir, safe + "_files"), list = arjExtract(a, xd);
+            if (!list.empty() && exists(xd)) {
+                write_file(path_join(xd, "_unpacked.txt"), list.data(), list.size());
+                long whole = 0, got = 0;
+                for (auto& e : a.files) { whole += e.ok; got += !e.data.empty(); }
+                w.check += fmt("; unpacked into %s_files: %ld whole, %ld in part", safe.c_str(), whole, got - whole);
+            }
         } else if (isPcx(bin)) {
             std::vector<long> un;
             for (size_t k = 0; k < txtIn.size(); k++) if (txtIn[k] < 0) un.push_back((long)k);

@@ -1,5 +1,7 @@
 // ARJ check: headers and files by CRC-32, the decompression after UNARJ (Robert K. Jung, public domain).
 #include "arjcheck.h"
+#include "ui/util.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -323,25 +325,63 @@ ArjCheck arjCheck(const std::vector<uint8_t>& a)
         for (size_t k = first; k < size && h[k]; k++) e.name += (char)h[k];
         if (!ok) e.why = "header CRC";
         size_t body = next;
+        // a damaged header still says where its file is: when its packed size does not end at the next header (or
+        // the end of the archive), the next 60 EA after the data decides
+        auto headerAt = [&](size_t q) { return q + 4 <= a.size() && a[q] == 0x60 && a[q + 1] == 0xEA; };
+        if (!ok && (body + e.packed > a.size() || !headerAt(body + e.packed))) {
+            size_t q = body;
+            while (q + 4 <= a.size() && !headerAt(q)) q++;
+            e.packed = (uint32_t)(std::min(q, a.size()) - body);
+        }
         if (body + e.packed > a.size()) { e.why = "cut off"; r.files.push_back(e); break; }
-        if (ok && h[6] != 3) {   // 3 = a directory
+        if (!ok && (e.size > e.packed * 40u + 65536u || e.size > (32u << 20))) e.size = e.packed * 40u + 65536u;
+        if (!ok && e.method > 4) e.method = 1;
+        if (h[6] != 3 || !ok) {   // 3 = a directory
             std::vector<uint8_t> out;
             bool dec = false;
-            if (flags & 1) e.why = "encrypted (garbled)";
+            if (flags & 1 && ok) e.why = "encrypted (garbled)";
             else if (e.method == 0) { out.assign(a.begin() + body, a.begin() + body + e.packed); dec = true; }
             else if (e.method >= 1 && e.method <= 3) dec = Unarj(&a[body], e.packed).lz(e.size, out);
             else if (e.method == 4) dec = Unarj(&a[body], e.packed).fast(e.size, out);
             else e.why = "unknown method";
+            e.got = (uint32_t)out.size();
+            bool right = dec && out.size() == e.size && crc32Arj(out.data(), out.size()) == crc;
             if (e.why.empty()) {
-                if (!dec || out.size() != e.size) e.why = "data does not unpack";
-                else if (crc32Arj(out.data(), out.size()) != crc) e.why = "data CRC";
+                if (!dec || out.size() != e.size) e.why = "data does not unpack whole";
+                else if (!right) e.why = "data CRC";
                 else e.ok = true;
-            }
-        } else if (ok) e.ok = true;
+            } else if (right) e.why += ", but the data's CRC is right";
+            e.data = std::move(out);
+        } else e.ok = true;
         r.files.push_back(e);
         p = body + e.packed;
     }
     return r;
+}
+
+std::string arjExtract(const ArjCheck& c, const std::string& dir)
+{
+    std::string list;
+    int n = 0;
+    bool made = false;
+    for (auto& e : c.files) {
+        n++;
+        if (e.data.empty()) {
+            list += (e.name.empty() ? "?" : e.name) + "  nothing unpacked (" + e.why + ")\n";
+            continue;
+        }
+        std::string nm;
+        for (unsigned char ch : e.name) nm += ch < 32 || ch > 126 || strchr("\\/:*?\"<>|", ch) ? '_' : (char)ch;
+        if (nm.empty() || nm == "?") nm = "file" + std::to_string(n);
+        if (!made) { make_dirs(dir); made = true; }
+        write_file(path_join(dir, nm), e.data);
+        char b[160];
+        if (e.ok) snprintf(b, sizeof b, "%u bytes, whole (CRC right)", e.size);
+        else if (e.got >= e.size) snprintf(b, sizeof b, "%u bytes, CRC wrong (bytes damaged inside)", e.got);
+        else snprintf(b, sizeof b, "%u of %u bytes (unpacking stopped at the damage)", e.got, e.size);
+        list += nm + "  " + b + (e.ok || e.why.empty() ? "" : "; " + e.why) + "\n";
+    }
+    return list;
 }
 
 std::string ArjCheck::summary() const

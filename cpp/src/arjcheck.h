@@ -12,6 +12,8 @@ struct ArjEntry {
     int method = 0;
     bool ok = false;          // unpacked and its CRC-32 is right
     std::string why;          // when not: "header CRC", "data CRC", "encrypted", "cut off", ...
+    uint32_t got = 0;         // bytes unpacked (all of size when whole; up to where the damage stopped it)
+    std::vector<uint8_t> data;   // what unpacked, also from a damaged archive
 };
 struct ArjCheck {
     bool archive = false;     // starts as an ARJ archive (main header found)
@@ -22,4 +24,7 @@ struct ArjCheck {
     std::string summary() const;   // "ARJ: 5 of 5 files right (CRC)" / "ARJ: header damaged" / ...
 };
 ArjCheck arjCheck(const std::vector<uint8_t>& data);
+// every file of the archive, whole or as far as it unpacks, into dir (made); names made safe; returns a list
+// "NAME  size  ok / CRC wrong / N of M bytes" for the report
+std::string arjExtract(const ArjCheck& c, const std::string& dir);
 uint32_t crc32Arj(const uint8_t* p, size_t n, uint32_t crc = 0);
