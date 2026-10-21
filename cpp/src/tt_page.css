@@ -1,0 +1,56 @@
+@import url("teletext-noscanlines.css");
+
+/* scanlines */
+
+.subpage {
+    /* This gradient looks worse but can be rendered at 2 (physical) pixels. */
+    --gradient-small: repeating-linear-gradient(
+                            to top,
+                            rgba(0,0,0,0.8) 0px,
+                            transparent 1px,
+                            transparent 2px,
+                            rgba(0,0,0,0.8) 3px
+                        );
+    
+    /* This gradient looks better but can't be rendered at 2 (physical) pixels. */
+    --gradient-big: repeating-linear-gradient(
+                        to top,
+                        rgba(0,0,0,1),
+                        transparent 25%,
+                        transparent 75%,
+                        rgba(0,0,0,1) 100%
+                    );
+}
+
+
+/* Small size: 245px x 250px, 1 x 1 scaling */
+@media (max-width: 660px) {
+    .subpage { font-size:10px; }
+    .subpage:after { background-image: none; }
+}
+
+/* Medium size: 490px x 500px, 2 x 2 scaling, scanlines possible */
+@media (min-width: 660px) and (max-width: 980px) {
+    .subpage { font-size:20px; }
+    .subpage:after{
+        background-size: 2px 2px;
+        background-image: var(--gradient-small);
+    }
+    /* Use the nicer gradient on hidpi/retina displays. */
+    /* This is only necessary when 2x2 scaling. */
+    @media (min-resolution: 2dppx) {
+        .subpage:after{
+            background-image: var(--gradient-big);
+        }
+    }
+}
+
+/* Large size: 735 x 750px, 3 x 3 scaling, scanlines possible */
+@media (min-width: 980px) {
+    .subpage { font-size:30px; }
+    .subpage:after{
+        /* At 3x3 scaling and above, the big gradient looks better. */
+        background-image: var(--gradient-big);
+        background-size: 3px 3px;
+    }
+}

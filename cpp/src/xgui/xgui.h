@@ -31,7 +31,7 @@ extern ImFont *F[4];
 
 // a picture on the screen (RGB pixels 0xRRGGBB), uploaded again when changed
 struct Tex {
-    SDL_Texture *t = nullptr;
+    unsigned t = 0;           // OpenGL texture (0: none)
     int w = 0, h = 0;
     void set(const uint32_t *px, int w, int h);
     void clear();
@@ -111,5 +111,5 @@ void lines_window(const ResultPtr &r);
 void export_all(const ResultPtr &r);
 
 extern SDL_Window *g_window;
-extern SDL_Renderer *g_renderer;
+extern SDL_GLContext g_gl;
 }

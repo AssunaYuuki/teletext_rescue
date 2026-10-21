@@ -21,7 +21,8 @@ int t34_to_t42(const std::string &src, const std::string &dst, Progress &pr);
 Json extract_extras(const std::vector<Packet42> &st, Progress &pr);
 // канал и время передачи: пакет 8/30 (имя в строке состояния, код сети, дата и время UTC) и постоянная часть заголовка
 Json service_info(const std::vector<Packet42> &st);
-struct ExportOpts { bool field_reset = true, sparse = false; const LineMap *lines = nullptr; int field = 16; };
+// clean: a stream without transmission errors (DVB, a cleaned .t42): rows the same on two pages are kept on both
+struct ExportOpts { bool field_reset = true, sparse = false, clean = false; const LineMap *lines = nullptr; int field = 16; };
 PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Progress &pr);
 PagesBuild merge_pages(const PagesBuild &good, const PagesBuild &full, const Json &extras, Progress &pr);
 Json quality_map(const std::string &vbi, const std::vector<Packet42> &st, const LineMap &lp, int lpf, const Json &extras, Progress &pr);

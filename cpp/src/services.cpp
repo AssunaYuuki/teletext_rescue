@@ -1,6 +1,7 @@
 // What a decoded recording holds: the services found, the full report (shared by both front ends).
 #include "services.h"
 #include "silentradio.h"
+#include "finds.h"
 #include "ui/util.h"
 #include <cmath>
 #include <map>
@@ -44,7 +45,8 @@ std::string full_report(const DecodeResult &r)
 {
     auto join = [](const std::vector<std::string> &v) { std::string s; for (auto &l : v) s += l + "\n"; return s; };
     std::string s = replace_all(summarize(r), "\r\n", "\n");
-    s += "\n=== Closed captions ===\n" + join(r.captions);
+    if (!r.vitcReport.empty()) s += "\n=== VITC time code ===\n" + join(r.vitcReport);
+    s += "\n=== Closed captions ===\n" + join(captionsTimed(r));
     s += "\n=== XDS ===\n" + join(r.xds);
     s += "\n=== Silent Radio ===\n";
     for (auto &m : r.silentRadio) s += "[" + rec_time(m.frame / frame_rate(r)) + "] " + (m.zone.empty() ? "" : "zone " + m.zone + ": ") + m.text + "\n";
@@ -107,6 +109,9 @@ std::vector<Service> services_of(const DecodeResult &r)
             size_t n = 0; for (auto &a : r.amol) n += a.stamps.size();
             s.name = "AMOL (Nielsen)"; s.kind = "AMOL"; s.window = ServiceWindow::Amol;
             s.note = n ? fmt("%zu seconds of station clock", n) : "frame counter and data words";
+        } else if (k == "VITC time code") {
+            s.name = "VITC time code"; s.kind = "VITC"; s.window = ServiceWindow::Vitc;
+            s.note = r.vitc.empty() ? "no readable code" : r.vitc.front().text() + " .. " + r.vitc.back().text();
         } else if (k == "TV-Inform") {
             size_t pg = 0; for (auto &t : r.tvinform) pg += t.pages.size();
             s.name = "TV-Inform (\xD0\xA2\xD0\x92-\xD0\xB8\xD0\xBD\xD1\x84\xD0\xBE\xD1\x80\xD0\xBC)"; s.kind = "TV-Inform"; s.window = ServiceWindow::Tvinform;
@@ -144,6 +149,19 @@ std::vector<Service> services_of(const DecodeResult &r)
             continue;   // unreadable 8-bit data: shown in the line map and the report only
         }
         out.push_back(s);
+    }
+    // files and texts of their own (ТВ-информ files and documents, «Бизнес-Текст» catalogue): first
+    {
+        auto fs = findsOf(r);
+        if (!fs.empty()) {
+            size_t files = 0, got = 0, texts = 0;
+            for (auto &f : fs) { files += f.kind == Find::File || f.kind == Find::Announced; got += f.kind == Find::File; texts += f.kind == Find::Text; }
+            Service s;
+            s.name = "Found files and texts"; s.kind = "files"; s.window = ServiceWindow::Finds;
+            s.where = fs.front().service;
+            s.note = fmt("%zu files (%zu received), %zu texts: ", files, got, texts) + fs.front().name;
+            out.insert(out.begin(), s);
+        }
     }
     // everything else the Teletext Rescue engine saved in the results folder (VPS, Syster, TOP, ...)
     for (auto &x : r.legacy.results) {

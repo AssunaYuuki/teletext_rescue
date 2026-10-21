@@ -159,7 +159,7 @@ void amolDecode(const std::vector<AmolWord>& in, AmolStream& s)
                 bool ok = true;
                 for (int c = 0; c < 5; c++) {
                     int v = amolField(w[i].bits, 12 + 7 * c, 7);
-                    if (!isalnum(v) && !strchr(" -./:&'", v)) ok = false, v = '.';   // plain text only
+                    if (!isalnum(v) && !(v && strchr(" -./:&'", v))) ok = false, v = '.';   // plain text only (strchr finds the NUL too)
                     t += (char)v;
                 }
                 int alnum = 0;

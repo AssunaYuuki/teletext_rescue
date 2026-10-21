@@ -10,6 +10,7 @@
 #include <mmsystem.h>
 #include "ssjson.h"
 #include "slicer.h"
+#include "faxg4.h"
 #include <set>
 #include <windowsx.h>
 #include <algorithm>
@@ -355,7 +356,7 @@ struct GuideWin : Window {
 // ================================================================ CC captions
 struct CapWin : Window {
     ResultPtr R;
-    struct Ln { std::string svc, text; };
+    struct Ln { std::string svc, text, time; };
     std::vector<Ln> all;
     std::vector<std::string> svcs; std::string cur;
     std::vector<int> shown;           // indexes into all for the current service
@@ -365,17 +366,24 @@ struct CapWin : Window {
     void load()
     {
         std::map<std::string, int> n;
-        for (auto &l : R->captions) {
-            auto c = l.find(": ");
-            if (l.rfind("---", 0) == 0 || c == std::string::npos || c > 4) continue;
-            all.push_back({l.substr(0, c), l.substr(c + 2)});
-            if (!n[l.substr(0, c)]++) svcs.push_back(l.substr(0, c));
-        }
+        if (!R->captionCues.empty())   // with times: the tape's VITC or the place in the recording
+            for (auto &c : R->captionCues) {
+                all.push_back({c.svc, c.text, captionTime(*R, c.frame)});
+                if (!n[c.svc]++) svcs.push_back(c.svc);
+            }
+        else
+            for (auto &l : R->captions) {
+                auto c = l.find(": ");
+                if (l.rfind("---", 0) == 0 || c == std::string::npos || c > 4) continue;
+                all.push_back({l.substr(0, c), l.substr(c + 2), ""});
+                if (!n[l.substr(0, c)]++) svcs.push_back(l.substr(0, c));
+            }
         std::sort(svcs.begin(), svcs.end(), [](const std::string &a, const std::string &b) { return (a[0] == 'C') != (b[0] == 'C') ? a[0] == 'C' : a < b; });
         if (!svcs.empty()) cur = svcs[0];
         std::string s = fmt("%zu lines", all.size());
         for (auto &k : svcs) s += fmt("  \xC2\xB7  %s %d", k.c_str(), n[k]);
         s += "  \xC2\xB7  CC = captions, T = text mode";
+        if (!R->captionCues.empty()) s += captionsUseVitc(*R) ? "  \xC2\xB7  times: VITC time code" : "  \xC2\xB7  times: place in the recording";
         set_text(summary, s);
     }
     void refill()
@@ -384,7 +392,7 @@ struct CapWin : Window {
         for (size_t i = 0; i < all.size(); i++) if (all[i].svc == cur) shown.push_back((int)i);
         ListView_DeleteAllItems(lst);
         for (size_t r = 0; r < shown.size() && r < 50000; r++) {
-            lv_set(lst, (int)r, 0, fmt("%zu", r + 1)); lv_set(lst, (int)r, 1, all[shown[r]].svc); lv_set(lst, (int)r, 2, all[shown[r]].text);
+            lv_set(lst, (int)r, 0, fmt("%zu", r + 1)); lv_set(lst, (int)r, 1, all[shown[r]].time); lv_set(lst, (int)r, 2, all[shown[r]].svc); lv_set(lst, (int)r, 3, all[shown[r]].text);
         }
         for (size_t i = 0; i < sbtn.size(); i++) set_button_style(sbtn[i], svcs[i] == cur ? BTN_ACCENT : BTN_NORMAL);
         select(0);
@@ -427,9 +435,10 @@ struct CapWin : Window {
             std::string where;
             for (auto &li : R->lines) if (li.kind == "Captions" || li.kind.rfind("XDS", 0) == 0) where += (where.empty() ? "" : ", ") + fmt("line %d field %d", li.lineNo, li.field);
             hd.create(hwnd, "CC captions", where + "  \xC2\xB7  " + file_name(*R));
+            hd.add(hwnd, 403, "Save .srt\xE2\x80\xA6", 110);
             hd.add(hwnd, 402, "Text report", 120);
             summary = label(hwnd, ""); set_label_colour(summary, ACCENT2);
-            lst = listview(hwnd, 10, {{"#", -60}, {"Service", 70}, {"Text", 640}});
+            lst = listview(hwnd, 10, {{"#", -60}, {"Time", 110}, {"Service", 70}, {"Text", 600}});
             load();
             for (size_t i = 0; i < svcs.size(); i++) sbtn.push_back(button(hwnd, 500 + (int)i, svcs[i]));
             refill();
@@ -462,8 +471,13 @@ struct CapWin : Window {
         case WM_COMMAND: {
             int id = LOWORD(w);
             if (id >= 500 && id - 500 < (int)svcs.size()) { cur = svcs[id - 500]; refill(); }
+            else if (id == 403 && !cur.empty()) {
+                if (R->captionCues.empty()) { ask(hwnd, "CC captions", "These results were saved by an older version without caption times.\nDecode the recording again to save subtitles.", MB_ICONINFORMATION); return 0; }
+                std::string out = save_file(hwnd, "Save " + cur + " as subtitles", stem_path(file_name(*R)) + "_" + cur + ".srt", "srt");
+                if (!out.empty()) write_text(out, captionsSrt(*R, cur));
+            }
             else if (id == 402) {
-                std::string s; for (auto &x : R->captions) s += x + "\n";
+                std::string s; for (auto &x : captionsTimed(*R)) s += x + "\n";
                 text_window(hwnd, "CC captions \xE2\x80\x94 " + file_name(*R), "every caption and text-mode line in the order received", s);
             }
             return 0;
@@ -1484,6 +1498,239 @@ struct JtesWin : Window {
     }
 };
 
+// ================================================================ ТВ-информ
+// One row per line that carries it; for the chosen line a card (what it is) and its text:
+// the document sent, or the inserter's test message; "Packets" shows every chunk as received.
+struct TviWin : Window {
+    ResultPtr R;
+    Header hd; HWND lst = nullptr, ed = nullptr, pkb = nullptr, flist = nullptr;
+    std::vector<TviSummary> sum;
+    int sel = 0, fsel = -1; bool packets = false, rot = true;
+    RECT card{}, pic{};
+    std::vector<uint32_t> img; int iw = 0, ih = 0;   // the chosen file as a picture (a fax page)
+    std::string picNote;
+    bool files() const { return false; }   // files and documents: the window "Found files and texts"
+    static std::string base(const std::string &p) { return p.substr(p.find_last_of("\\/") + 1); }
+    void loadPic()
+    {
+        img.clear(); iw = ih = 0; picNote.clear();
+        const auto &fl = R->tvinform[sel].files;
+        if (fsel < 0 || fsel >= (int)fl.size()) return;
+        std::vector<uint8_t> t;
+        try { Bytes b = read_file(fl[fsel]); t.assign(b.begin(), b.end()); } catch (...) { picNote = "the file is not on disk any more: " + fl[fsel]; return; }
+        int w = 0, h = 0;
+        std::vector<uint8_t> px;
+        if (!faxTiffDecode(t, w, h, px, picNote)) { picNote = fmt("%zu bytes - not a picture this window can show; Open file opens it", t.size()); return; }
+        iw = rot ? h : w; ih = rot ? w : h;
+        img.assign((size_t)iw * ih, 0xFFFFFF);
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                if (px[(size_t)y * w + x]) {
+                    int X = rot ? y : x, Y = rot ? w - 1 - x : y;   // a quarter turn to the left: fax maps are sent on their side
+                    img[(size_t)Y * iw + X] = 0;
+                }
+        InvalidateRect(hwnd, &pic, FALSE);
+    }
+    void layout()
+    {
+        RECT rc; GetClientRect(hwnd, &rc);
+        int p = S(hwnd, 14), y = hd.layout(hwnd);
+        int lh = S(hwnd, 30) + (int)std::min<size_t>(sum.size(), 6) * S(hwnd, 22);
+        MoveWindow(lst, p, y, rc.right - 2 * p, lh, TRUE); y += lh + S(hwnd, 10);
+        card = {p, y, rc.right - p, y + S(hwnd, 104)}; y = card.bottom + S(hwnd, 10);
+        int h = std::max(0L, rc.bottom - y - p);
+        if (files()) {
+            int fw = S(hwnd, 280);
+            MoveWindow(flist, p, y, fw, h, TRUE);
+            pic = {p + fw + S(hwnd, 10), y, rc.right - p, y + h};
+            ShowWindow(flist, SW_SHOW); ShowWindow(ed, SW_HIDE);
+        } else {
+            MoveWindow(ed, p, y, rc.right - 2 * p, h, TRUE);
+            pic = {};
+            ShowWindow(flist, SW_HIDE); ShowWindow(ed, SW_SHOW);
+        }
+        InvalidateRect(hwnd, nullptr, TRUE);
+    }
+    static COLORREF colour(const TviSummary &s)
+    {
+        return s.kind == TviSummary::Data ? C_PROG : s.kind == TviSummary::Test ? C_TIME : s.kind == TviSummary::Packets ? C_CHAN : C_OTHER;
+    }
+    static const char *kind_name(const TviSummary &s)
+    {
+        return s.kind == TviSummary::Data ? "DATA" : s.kind == TviSummary::Test ? "TEST" : s.kind == TviSummary::Packets ? "PACKETS" : "IDLE";
+    }
+    std::string where(size_t i) const
+    {
+        const TviStream &t = R->tvinform[i];
+        if (t.rate < 0) {
+            std::string w;
+            for (auto &li : R->lines)
+                if (li.kind.rfind("TV-Inform packets", 0) == 0) w += (w.empty() ? "lines " : ", ") + fmt("%d", li.lineNo) + (li.field == 2 ? "/f2" : "");
+            return w.empty() ? "lines 7-9" : w;
+        }
+        if (t.rate == 2) {   // fТ3: one stream over several lines
+            std::set<std::pair<int, int>> ls;
+            for (auto &w : t.words) ls.insert({w.field, w.lineNo});
+            std::string s;
+            for (auto &x : ls) s += (s.empty() ? "lines " : ", ") + fmt("%d", x.second);
+            return s.empty() ? "?" : s;
+        }
+        return t.words.empty() ? "?" : fmt("line %d field %d", t.words[0].lineNo, t.words[0].field);
+    }
+    std::string clock(size_t i) const
+    {
+        int r = R->tvinform[i].rate;
+        return r < 0 ? "5.73 MHz" : r == 0 ? "f\xD0\xA2" "1 1.73 MHz" : r == 1 ? "f\xD0\xA2" "2 3.47 MHz" : "f\xD0\xA2" "3 6.94 MHz";
+    }
+    void show()
+    {
+        if (sum.empty()) return;
+        const TviStream &t = R->tvinform[sel];
+        std::string body;
+        if (packets) body = t.rate < 0 || t.serial.empty() ? tvinform_text_one(t) : "recording    frame    kind    hdr  chars\n" + tviSerialText(t, frame_rate(*R));
+        else if (sum[sel].kind == TviSummary::Data || !t.files.empty())
+            body = "What this line brought (" + std::string(t.files.empty() ? "the document" : "the files") +
+                   ") is in the window \"Found files and texts\" \xE2\x80\x94 the button Found files on top.\n"
+                   "Packets shows what the line carried as it was received.";
+        else for (auto &l : sum[sel].text) body += l + "\n";
+        set_text(ed, replace_all(body, "\n", "\r\n"));
+        set_text(pkb, packets ? "Text" : "Packets");
+        ListView_DeleteAllItems(flist);
+        for (size_t i = 0; i < t.files.size(); i++) lv_set(flist, (int)i, 0, base(t.files[i]));
+        fsel = t.files.empty() ? -1 : 0;
+        if (fsel == 0) ListView_SetItemState(flist, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        loadPic();
+        layout();
+    }
+    static std::string tvinform_text_one(const TviStream &t) { std::string s; for (auto &l : t.report) s += l + "\n"; return s; }
+    void paint(HDC dc, RECT)
+    {
+        if (sum.empty()) return;
+        const TviSummary &s = sum[sel];
+        HFONT big = font(hwnd, 15, true), small = font(hwnd, 9), smallb = font(hwnd, 10, true);
+        fill(dc, card, PANEL);
+        int x = card.left + S(hwnd, 18), y = card.top + S(hwnd, 14);
+        std::string k = kind_name(s);
+        RECT pill{x, y, x + S(hwnd, 16) + (int)k.size() * S(hwnd, 9), y + S(hwnd, 24)};
+        fill(dc, pill, colour(s));
+        text_out(dc, pill.left + S(hwnd, 8), pill.top + S(hwnd, 3), k, RGB(255, 255, 255), smallb);
+        text_out(dc, pill.right + S(hwnd, 12), y, s.what, FG, big);
+        y += S(hwnd, 36);
+        const TviStream &t = R->tvinform[sel];
+        std::string sub = where(sel) + "  \xC2\xB7  " + clock(sel);
+        if (t.rate >= 0) sub += fmt("  \xC2\xB7  %d bits per line", t.nbits);
+        if (!s.charset.empty()) sub += "  \xC2\xB7  " + s.charset + ", levels inverted";
+        text_out(dc, x, y, sub, ACCENT2, small);
+        y += S(hwnd, 20);
+        std::string note = s.kind == TviSummary::Test ? "teleprinter test RYRY..., 1234567890 and the name of the system: no files were being sent on this line"
+                         : s.kind == TviSummary::Data ? "a file sent through the system, as received (gaps = chunks not sent on this line)"
+                         : s.kind == TviSummary::Packets ? "error-corrected packet stream; see the text for what it carries"
+                         : "the line carries the ТВ-информ carrier but no readable characters";
+        text_out(dc, x, y, note, MUTED, small);
+        if (t.rate >= 0) {
+            std::vector<std::pair<std::string, std::string>> tl = {{fmt("%d", (int)t.words.size()), "lines sliced"}, {fmt("%d", s.dataLines), "lines with data"}};
+            if (s.fixed) tl.push_back({fmt("%d", s.fixed), "bits corrected"});
+            if (s.ecTest) tl.push_back({fmt("%d", s.ecTest), "ECC test words"});
+            tiles(hwnd, dc, card, tl);
+        } else if (!t.files.empty())
+            tiles(hwnd, dc, card, {{fmt("%zu", t.files.size()), "files received"}});
+        if (pic.right > pic.left) {
+            fill(dc, pic, RGB(0x11, 0x11, 0x11));
+            int ch = S(hwnd, 22);
+            text_out(dc, pic.left + S(hwnd, 8), pic.top + S(hwnd, 4), picNote, MUTED, small);
+            if (iw > 0) {
+                int aw = pic.right - pic.left - S(hwnd, 16), ah = pic.bottom - pic.top - ch - S(hwnd, 8);
+                double ar = (double)iw / ih;
+                int w = std::min(aw, (int)(ah * ar)), h = (int)(w / ar);
+                int x = pic.left + (pic.right - pic.left - w) / 2, y = pic.top + ch + (ah - h) / 2;
+                BITMAPINFO bi{};
+                bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = iw; bi.bmiHeader.biHeight = -ih;
+                bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+                SetStretchBltMode(dc, HALFTONE); SetBrushOrgEx(dc, 0, 0, nullptr);
+                StretchDIBits(dc, x, y, w, h, 0, 0, iw, ih, img.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+            }
+        }
+    }
+    LRESULT proc(UINT m, WPARAM w, LPARAM l) override
+    {
+        switch (m) {
+        case WM_CREATE: {
+            dark_window(hwnd);
+            for (auto &t : R->tvinform) {
+                sum.push_back(tviSummarize(t));
+                if (!t.files.empty())   // packets that carried files: name them
+                    sum.back().what = t.files.size() == 1 ? "file received: " + base(t.files[0]) : fmt("%zu files received: ", t.files.size()) + base(t.files[0]) + ", ...";
+            }
+            hd.create(hwnd, "\xD0\xA2\xD0\x92-\xD0\xB8\xD0\xBD\xD1\x84\xD0\xBE\xD1\x80\xD0\xBC",
+                      fmt("Russian VBI datacast (GOST R 50822-95) \xC2\xB7 %zu lines \xC2\xB7 ", sum.size()) + file_name(*R));
+            pkb = hd.add(hwnd, 401, "Packets", 100);
+            hd.add(hwnd, 402, "Report", 90);
+            hd.add(hwnd, 403, "Save text\xE2\x80\xA6", 110);
+            hd.add(hwnd, 407, "Found files\xE2\x80\xA6", 120);
+            flist = listview(hwnd, 11, {{"File", 260}});
+            lst = listview(hwnd, 10, {{"Line", 130}, {"Clock", 100}, {"Kind", 70}, {"Content", 330}, {"Characters", 90}, {"First words", 400}});
+            for (size_t i = 0; i < sum.size(); i++) {
+                std::string first;
+                for (auto &x : sum[i].text) if (!strip(x).empty()) { first = strip(x); break; }
+                lv_set(lst, (int)i, 0, where(i)); lv_set(lst, (int)i, 1, clock(i)); lv_set(lst, (int)i, 2, kind_name(sum[i]));
+                lv_set(lst, (int)i, 3, sum[i].what); lv_set(lst, (int)i, 4, sum[i].charset); lv_set(lst, (int)i, 5, first.substr(0, 200));
+                if (sum[i].kind == TviSummary::Data && sum[sel].kind != TviSummary::Data) sel = (int)i;
+            }
+            ed = edit(hwnd, 0, "", ES_MULTILINE | ES_READONLY | WS_VSCROLL | WS_HSCROLL | ES_AUTOVSCROLL);
+            SendMessageW(ed, EM_SETLIMITTEXT, 0, 0);
+            SendMessageW(ed, WM_SETFONT, (WPARAM)font(hwnd, 10, false, L"Consolas"), TRUE);
+            for (size_t i = 0; i < sum.size(); i++)   // a line that brought files comes first
+                if (!R->tvinform[i].files.empty()) { sel = (int)i; break; }
+            if (!sum.empty()) ListView_SetItemState(lst, sel, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+            show();
+            return 0;
+        }
+        case WM_SIZE: layout(); return 0;
+        case WM_PAINT: paint_buffered(hwnd, [this](HDC dc, RECT rc) { paint(dc, rc); }); return 0;
+        case WM_ERASEBKGND: return 1;
+        case WM_NOTIFY: {
+            auto *nh = (NMHDR *)l;
+            if (nh->hwndFrom == lst) {
+                if (nh->code == NM_CUSTOMDRAW) return lv_custom_draw(l, [this](int row) { return row >= 0 && row < (int)sum.size() ? colour(sum[row]) : FG; });
+                if (nh->code == LVN_ITEMCHANGED) {
+                    auto *iv = (NMLISTVIEW *)l;
+                    if ((iv->uNewState & LVIS_SELECTED) && iv->iItem >= 0 && iv->iItem != sel) { sel = iv->iItem; show(); }
+                }
+            }
+            if (nh->hwndFrom == flist) {
+                if (nh->code == NM_CUSTOMDRAW) return lv_custom_draw(l);
+                if (nh->code == LVN_ITEMCHANGED) {
+                    auto *iv = (NMLISTVIEW *)l;
+                    if ((iv->uNewState & LVIS_SELECTED) && iv->iItem >= 0 && iv->iItem != fsel) { fsel = iv->iItem; loadPic(); }
+                }
+            }
+            return 0;
+        }
+        case WM_COMMAND: {
+            int id = LOWORD(w);
+            static const std::vector<std::string> none;
+            const auto &fl = sum.empty() ? none : R->tvinform[sel].files;
+            bool hasF = fsel >= 0 && fsel < (int)fl.size();
+            if (id == 401) { packets = !packets; show(); }
+            else if (id == 404) { rot = !rot; loadPic(); }
+            else if (id == 405 && hasF) open_path(fl[fsel]);
+            else if (id == 406 && hasF) open_path(fl[fsel].substr(0, fl[fsel].find_last_of("\\/")));
+            else if (id == 407) finds_window(hwnd, R);
+            else if (id == 402) text_window(hwnd, "TV-Inform report \xE2\x80\x94 " + file_name(*R), "everything the decoder found on the ТВ-информ lines", tvinform_text(*R));
+            else if (id == 403 && !sum.empty()) {
+                std::string p = save_file(hwnd, "Save text", "tvinform_" + where(sel) + ".txt", "txt");
+                std::string body;
+                for (auto &x : sum[sel].text) body += x + "\n";
+                if (!p.empty()) { try { write_text(p, body); } catch (std::exception &e) { ask(hwnd, "Save", e.what(), MB_ICONERROR); } }
+            }
+            return 0;
+        }
+        case WM_NCDESTROY: { LRESULT r = Window::proc(m, w, l); delete this; return r; }
+        }
+        return Window::proc(m, w, l);
+    }
+};
+
 // ================================================================ 5.73 Mbit/s data and plain text
 struct TextWin : Window {
     std::string title, subtitle, body, summary_text;
@@ -1576,6 +1823,11 @@ void data_window(HWND owner, const ResultPtr &r, const std::string &kind)
     w->body += "\n=== recovered text ===\n";
     for (auto &l : r->fastText) w->body += l + "\n";
     open_window(w, owner, L"TRData", w->title + " \xE2\x80\x94 " + file_name(*r), 1000, 720);
+}
+void tvinform_window(HWND owner, const ResultPtr &r)
+{
+    auto *w = new TviWin; w->R = r;
+    open_window(w, owner, L"TRTvinform", "\xD0\xA2\xD0\x92-\xD0\xB8\xD0\xBD\xD1\x84\xD0\xBE\xD1\x80\xD0\xBC \xE2\x80\x94 " + file_name(*r), 1100, 820);
 }
 void text_window(HWND owner, const std::string &title, const std::string &sub, const std::string &body)
 {

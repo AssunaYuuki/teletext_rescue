@@ -21,11 +21,16 @@ VbiFormat legacyDetectFormat(const std::string& path, std::string* name)
     return VbiFormat::Unknown;
 }
 
+namespace legacy { extern std::map<int, std::string> g_force_rows; namespace gpu { extern bool g_allowed; } }
+
 std::string legacyReportDir(const std::string& recording) { return legacy::vbi_report_dir(recording); }
 
 bool legacyRun(const std::string& recording, bool again, const std::function<void(const std::string&)>& step,
-               const std::function<void(const std::string&)>& log, std::atomic<bool>* cancel, LegacyReport& out, std::string& err)
+               const std::function<void(const std::string&)>& log, std::atomic<bool>* cancel, LegacyReport& out, std::string& err,
+               const std::map<int, std::string>& forceRows, bool gpu)
 {
+    legacy::g_force_rows = forceRows;
+    legacy::gpu::g_allowed = gpu;
     legacy::Progress pr;
     pr.on_step = [&](const std::string& s) { if (step) step(s); };
     pr.on_log = [&](const std::string& s) { if (log) log(s); };

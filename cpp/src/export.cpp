@@ -1,4 +1,5 @@
 #include "export.h"
+#include <set>
 #include "ssjson.h"
 #include "slicer.h"
 #include "wavetop.h"
@@ -48,7 +49,13 @@ std::string exportResult(const DecodeResult& r, const std::string& dir, Progress
     for (size_t p; (p = rep.find('\r')) != std::string::npos;) rep.erase(p, 1);
     put("report.txt", rep);
 
-    if (!r.captions.empty()) put("captions.txt", join(r.captions));
+    if (!r.captions.empty()) put("captions.txt", join(captionsTimed(r)));
+    {   // one subtitle file per caption service, timed by the tape's VITC or the place in the recording
+        std::set<std::string> svcs;
+        for (auto& c : r.captionCues) svcs.insert(c.svc);
+        for (auto& v : svcs) put("captions_" + v + ".srt", captionsSrt(r, v));
+    }
+    if (!r.vitcReport.empty()) put("vitc.txt", join(r.vitcReport));
     if (!r.xds.empty()) put("xds.txt", join(r.xds));
     if (!r.silentRadio.empty()) {
         std::string s;
@@ -151,10 +158,14 @@ std::string exportResult(const DecodeResult& r, const std::string& dir, Progress
         put("gemstar_report.txt", w);
     }
     if (!r.tvinform.empty()) {
-        std::string rep, raw;
+        std::string rep, raw, serial, text;
         for (auto& t : r.tvinform) {
             rep += join(t.report);
             rep += "\n";
+            serial += tviSerialText(t, fps);
+            std::string tx = tviText(t);
+            if (!tx.empty() && !t.words.empty())
+                text += fmt("===== line %d field %d =====\n", t.words[0].lineNo, t.words[0].field) + tx + "\n";
             for (auto& w : t.words) {
                 raw += fmt("%s,%lld,%d,%d,", clockText(w.frame / fps).c_str(), (long long)w.frame, w.lineNo, w.field);
                 for (uint8_t x : w.bytes) raw += fmt("%02x", x);
@@ -163,6 +174,8 @@ std::string exportResult(const DecodeResult& r, const std::string& dir, Progress
         }
         put("tvinform_report.txt", rep);
         put("tvinform_lines.csv", "recording,frame,line,field,bytes\n" + raw);
+        if (!serial.empty()) put("tvinform_serial.txt", "recording    frame    kind    hdr  chars (levels inverted; async = KOI-7, hamming = KOI8-R or CP866)\n" + serial);
+        if (!text.empty()) put("tvinform_text.txt", text);
     }
     if (r.db.stats.packets) {
         pr.step("StarSight database");

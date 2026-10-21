@@ -1,6 +1,8 @@
-# Teletext Rescue for Linux and macOS, built on GitHub's machines: the program with windows (SDL3 +
-# Dear ImGui) and trcli. A version tag (v1.2, ...) also makes the release and attaches the archives;
-# the Windows installer is built with build.bat and added to the release.
+# Teletext Rescue built on GitHub's machines:
+#   Linux x86_64, ARM64 and x86 (32-bit), macOS (Apple Silicon and Intel in one app): the program with windows
+#   (SDL3 + Dear ImGui) and trcli;
+#   Windows x64 and x86 (32-bit): the program with windows and trcli (MSYS2 MinGW-w64), installer and zip.
+# A version tag (v1.3, ...) also makes the release and attaches everything.
 name: build
 
 on:
@@ -22,18 +24,32 @@ jobs:
             name: TeletextRescue-linux-x86_64
           - os: ubuntu-22.04-arm
             name: TeletextRescue-linux-arm64
+          - os: ubuntu-22.04
+            name: TeletextRescue-linux-x86
+            arch: i686
           - os: macos-14
             name: TeletextRescue-macos-universal
     runs-on: ${{ matrix.os }}
+    env:
+      TR_ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v4
       - name: Tools (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.arch == ''
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build g++ libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev \
             libxtst-dev libwayland-dev libxkbcommon-dev wayland-protocols libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev \
             libasound2-dev libpulse-dev libdbus-1-dev libudev-dev
+      - name: Tools (Linux 32-bit)
+        if: runner.os == 'Linux' && matrix.arch == 'i686'
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y ninja-build gcc-multilib g++-multilib pkg-config \
+            libx11-dev:i386 libxext-dev:i386 libxrandr-dev:i386 libxcursor-dev:i386 libxfixes-dev:i386 libxi-dev:i386 \
+            libxss-dev:i386 libxtst-dev:i386 libxkbcommon-dev:i386 libgl1-mesa-dev:i386 libegl1-mesa-dev:i386 \
+            libasound2-dev:i386 libpulse-dev:i386
       - name: Tools (macOS)
         if: runner.os == 'macOS'
         run: brew install ninja
@@ -42,13 +58,16 @@ jobs:
       - name: Check
         run: |
           B=cpp/build-$(uname -s | tr 'A-Z' 'a-z')
+          [ "$TR_ARCH" = "i686" ] && B=cpp/build-linux-i686
+          V=$(sed -n 's/.*TR_VERSION "\(.*\)".*/\1/p' cpp/src/version.h)
           $B/trcli > usage.txt || true
           cat usage.txt
-          grep -q "Teletext Rescue 1.2" usage.txt
+          grep -q "Teletext Rescue $V" usage.txt
           if [ "$(uname -s)" = "Darwin" ]; then lipo -info $B/trcli; lipo -info "$B/TeletextRescue.app/Contents/MacOS/TeletextRescue"; else file $B/trcli $B/TeletextRescue; fi
       - name: Package
         run: |
           B=cpp/build-$(uname -s | tr 'A-Z' 'a-z')
+          [ "$TR_ARCH" = "i686" ] && B=cpp/build-linux-i686
           N=${{ matrix.name }}
           mkdir -p pkg/$N
           cp $B/trcli README.md LICENSE pkg/$N/
@@ -65,9 +84,71 @@ jobs:
           name: ${{ matrix.name }}
           path: ${{ matrix.name }}.tar.gz
 
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - msys: MINGW64
+            env: x86_64
+            arch: x64
+          - msys: MINGW32
+            env: i686
+            arch: x86
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msys }}
+          update: true
+          install: >-
+            mingw-w64-${{ matrix.env }}-gcc
+            mingw-w64-${{ matrix.env }}-cmake
+            mingw-w64-${{ matrix.env }}-ninja
+            zip
+      - name: Build
+        run: |
+          cmake -S cpp -B cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++ -DCMAKE_RC_COMPILER=windres
+          for i in 1 2 3; do cmake --build cpp/build -j 4 && break; done
+          test -f cpp/build/TeletextRescue.exe && test -f cpp/build/trcli.exe
+      - name: Check
+        run: |
+          V=$(sed -n 's/.*TR_VERSION "\(.*\)".*/\1/p' cpp/src/version.h)
+          cpp/build/trcli.exe > usage.txt || true
+          cat usage.txt
+          grep -q "Teletext Rescue $V" usage.txt
+      - name: Package
+        run: |
+          V=$(sed -n 's/.*TR_VERSION "\(.*\)".*/\1/p' cpp/src/version.h)
+          if [ "${{ matrix.arch }}" = "x86" ]; then STAGE="dist/Teletext Rescue $V x86"; else STAGE="dist/Teletext Rescue $V"; fi
+          mkdir -p "$STAGE"
+          strip -o "$STAGE/Teletext Rescue.exe" cpp/build/TeletextRescue.exe
+          strip -o "$STAGE/trcli.exe" cpp/build/trcli.exe
+          cp LICENSE README.txt "$STAGE/"
+          N=TeletextRescue-windows-${{ matrix.arch }}
+          (cd dist && zip -r -9 ../$N.zip "$(basename "$STAGE")")
+          echo "STAGE=$STAGE" >> $GITHUB_ENV
+      - name: Installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress; }
+          & $iscc /DArch=${{ matrix.arch }} setup.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TeletextRescue-windows-${{ matrix.arch }}
+          path: |
+            TeletextRescue-windows-${{ matrix.arch }}.zip
+            dist/TeletextRescue-Setup-*.exe
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: unix
+    needs: [unix, windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -75,8 +156,12 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - run: find dist -type f
       - uses: softprops/action-gh-release@v2
         with:
           name: Teletext Rescue ${{ github.ref_name }}
           body_path: .github/release-notes.md
-          files: dist/*.tar.gz
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/**/TeletextRescue-Setup-*.exe

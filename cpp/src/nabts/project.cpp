@@ -1,3 +1,5 @@
+#include <set>
+#include <algorithm>
 #include "project.h"
 #include "pagebuild.h"
 
@@ -68,7 +70,8 @@ std::string Project::rel(const std::string &p) const {
 
 Pages Project::load_state(std::set<std::string> &edited, std::string &src) const {
     Json j = load_json(edited_path);
-    if (j.is_obj() && j["edited"].truthy()) {
+    bool has_edits = j.is_obj() && j["edited"].truthy();
+    if (has_edits && !exists(base)) {
         Pages pages;
         for (auto &kv : j["pages"].o) pages[kv.first] = page_from_json(kv.second);
         edited.clear(); for (auto &e : j["edited"].a) edited.insert(e.str());
@@ -86,6 +89,21 @@ Pages Project::load_state(std::set<std::string> &edited, std::string &src) const
     }
     edited.clear();
     src = "original build (" + rel(base) + ")";
+    if (!has_edits) return pages;
+    // правки накладываются только на изменённые страницы: остальное — из текущей сборки
+    // (pages_edited.json от старой сборки иначе прячет её улучшения, например rot каруселей)
+    for (auto &e : j["edited"].a) {
+        const Json *pj = j["pages"].find(e.str());
+        if (!pj) continue;
+        Page p = page_from_json(*pj);
+        auto it = pages.find(e.str());
+        bool norot = std::all_of(p.versions.begin(), p.versions.end(), [](const Version &v) { return v.rot < 0; });
+        if (norot && it != pages.end() && it->second.versions.size() == p.versions.size())
+            for (size_t i = 0; i < p.versions.size(); i++) p.versions[i].rot = it->second.versions[i].rot;
+        pages[e.str()] = p;
+        edited.insert(e.str());
+    }
+    src = "your edits (" + rel(edited_path) + ") over " + src;
     return pages;
 }
 
@@ -242,12 +260,131 @@ std::string Project::version_label(const Page &pg, size_t k) const {
 // ---------------------------------------------------------------- полные страницы
 static int row_dist(const Row &a, const Row &b) { int d = 0; for (int k = 0; k < 40; k++) d += (a[k] & 0x7F) != (b[k] & 0x7F); return d; }
 
+// the versions of one subcode that show the same page: a station may rotate 2 or 4 pages under one subcode
+// (ORT 08.06.2000, 170: an article in two parts, both 0000), and the builder's snapshots between them mix
+// the rows of both. Versions are grouped by content: a version joins a group when 80% of its rows are the
+// group's; a version whose every row belongs to some group, but to more than one, is such a mixture and
+// is left out; a group sent once, or less than a tenth as often as the main one, is noise.
+static bool blank_row(const Row &r) { for (u8 c : r) if ((c & 0x7F) > 0x20) return false; return true; }
+
+// the page's own counter "NN/MM" in rows 1-24 (NN of MM pages), -1 if none
+static int page_counter(const std::map<int, Row> &rows, int &mm) {
+    for (auto &rb : rows) {
+        if (rb.first < 1 || rb.first > 24) continue;
+        std::string t; for (u8 c : rb.second) t += (char)(c & 0x7F);
+        auto dg = [&](size_t j) { return j < t.size() && t[j] >= '0' && t[j] <= '9'; };
+        for (size_t i = 0; i + 5 <= t.size(); i++) {
+            if (!dg(i) || !dg(i + 1) || t[i + 2] != '/' || !dg(i + 3) || !dg(i + 4)) continue;
+            if ((i > 0 && (dg(i - 1) || t[i - 1] == '/')) || dg(i + 5) || (i + 5 < t.size() && t[i + 5] == '/')) continue;
+            int a = (t[i] - '0') * 10 + t[i + 1] - '0', b = (t[i + 3] - '0') * 10 + t[i + 4] - '0';
+            if (a >= 1 && a <= b && b >= 2 && b <= 99) { mm = b; return a; }
+        }
+    }
+    return -1;
+}
+
+static std::vector<std::vector<const Version *>> content_groups(std::vector<const Version *> V) {
+    std::stable_sort(V.begin(), V.end(), [](const Version *a, const Version *b) { return a->n > b->n; });
+    // row -> its variants (first copy of each). A tape copy may have a third of a row wrong and still be
+    // the same text; two pages of a rotation differ in nearly every character
+    std::map<int, std::vector<const Row *>> var;
+    auto vid = [&](int r, const Row &b) {
+        auto &L = var[r];
+        for (size_t i = 0; i < L.size(); i++) if (row_dist(*L[i], b) <= 16) return (int)i;
+        L.push_back(&b);
+        return (int)L.size() - 1;
+    };
+    // a page that numbers its own pages ("06/16" on «Самбия» 676): versions with different numbers are
+    // different pages however alike their rows are (they can differ in these two digits only)
+    std::map<const Version *, int> ctr;
+    {
+        std::map<int, std::map<int, int>> byMM;
+        std::map<const Version *, int> mmOf;
+        for (auto *v : V) {
+            int mm = 0, c = page_counter(v->rows, mm);
+            if (c >= 0) { ctr[v] = c; mmOf[v] = mm; byMM[mm][c]++; }
+        }
+        int bestMM = 0, bn = 0;
+        for (auto &kv : byMM) { int n = 0; for (auto &x : kv.second) n += x.second; if (kv.second.size() >= 2 && n > bn) { bn = n; bestMM = kv.first; } }
+        for (auto it = ctr.begin(); it != ctr.end();) it = mmOf[it->first] == bestMM ? std::next(it) : ctr.erase(it);
+    }
+    // a page of a rotation the builder told apart (101 «Оглавление»: only three rows of twenty change) stays apart too
+    auto ctrOf = [&](const Version *v) { if (v->rot >= 0) return 1000 + v->rot; auto it = ctr.find(v); return it == ctr.end() ? -1 : it->second; };
+    struct G { std::map<int, int> sig; std::vector<const Version *> mem; int w = 0; int ctr = -1; };
+    std::vector<G> gs;
+    for (auto *v : V) {
+        std::map<int, int> sig;
+        for (auto &rb : v->rows) if (rb.first >= 1 && rb.first <= 24 && !blank_row(rb.second)) sig[rb.first] = vid(rb.first, rb.second);
+        int best = -1; double ba = 0;
+        int vc = ctrOf(v);
+        for (size_t g = 0; g < gs.size(); g++) {
+            if (vc >= 0 && gs[g].ctr >= 0 && vc != gs[g].ctr) continue;
+            int same = 0, common = 0;
+            for (auto &kv : sig) { auto it = gs[g].sig.find(kv.first); if (it == gs[g].sig.end()) continue; common++; same += it->second == kv.second; }
+            double a = common ? (double)same / common : 1.0;
+            if (a > ba) { ba = a; best = (int)g; }
+        }
+        int w = v->n ? v->n : 1;
+        if (best >= 0 && ba >= 0.8) {
+            auto &g = gs[best]; g.mem.push_back(v); g.w += w; for (auto &kv : sig) g.sig.emplace(kv.first, kv.second);
+            if (g.ctr < 0) g.ctr = vc;
+            continue;
+        }
+        bool newNumber = vc >= 0;
+        for (auto &g : gs) if (g.ctr == vc) newNumber = false;
+        if (!gs.empty() && !newNumber) {
+            // a mixture: (nearly) every row is some group's, and not all of one group's
+            int own = 0; std::set<int> used;
+            for (auto &kv : sig) {
+                int owner = -1;
+                for (size_t g = 0; g < gs.size() && owner < 0; g++) { auto it = gs[g].sig.find(kv.first); if (it != gs[g].sig.end() && it->second == kv.second) owner = (int)g; }
+                if (owner >= 0) { own++; used.insert(owner); }
+            }
+            if (own * 10 >= (int)sig.size() * 9 && used.size() > 1) continue;
+        }
+        G g; g.sig = sig; g.mem.push_back(v); g.w = w; g.ctr = vc;
+        gs.push_back(g);
+    }
+    // a mixture that came before the second page's own group: its rows are all in other groups. The
+    // lightest groups are looked at first; a group left out no longer explains others
+    std::vector<char> drop(gs.size(), 0);
+    std::vector<size_t> byW(gs.size());
+    for (size_t g = 0; g < gs.size(); g++) byW[g] = g;
+    std::stable_sort(byW.begin(), byW.end(), [&](size_t a, size_t b) { return gs[a].w < gs[b].w; });
+    for (size_t g : byW) {
+        if (gs.size() < 3) break;
+        if (gs[g].ctr >= 0) { int same = 0; for (auto &h : gs) same += h.ctr == gs[g].ctr; if (same == 1) continue; }
+        std::set<size_t> used; int own = 0;
+        for (auto &kv : gs[g].sig) {
+            int owner = -1;
+            for (size_t h = 0; h < gs.size() && owner < 0; h++) {
+                if (h == g || drop[h]) continue;
+                auto it = gs[h].sig.find(kv.first);
+                if (it != gs[h].sig.end() && it->second == kv.second) owner = (int)h;
+            }
+            if (owner >= 0) { own++; used.insert(owner); }
+        }
+        if (!gs[g].sig.empty() && own * 10 >= (int)gs[g].sig.size() * 9 && used.size() > 1) drop[g] = 1;
+    }
+    int top = 0; for (auto &g : gs) top = std::max(top, g.w);
+    std::vector<std::vector<const Version *>> out;
+    for (size_t g = 0; g < gs.size(); g++)
+    {
+        bool numbered = false;
+        if (gs[g].ctr >= 0) { int same = 0; for (auto &h : gs) same += h.ctr == gs[g].ctr; numbered = same == 1; }
+        if (!drop[g] && (g == 0 || numbered || (gs[g].w >= 2 && gs[g].w * 10 >= top))) out.push_back(gs[g].mem);
+    }
+    std::stable_sort(out.begin(), out.end(), [](auto &a, auto &b) {
+        double ta = 1e18, tb = 1e18; for (auto *x : a) ta = std::min(ta, x->t); for (auto *x : b) tb = std::min(tb, x->t); return ta < tb; });
+    return out;
+}
+
 std::vector<Version> Project::full_versions(const Page &pg) const {
     std::vector<std::string> order; std::map<std::string, std::vector<const Version *>> by;
     for (auto &s : pg.versions) { if (!by.count(s.s)) order.push_back(s.s); by[s.s].push_back(&s); }
     std::vector<Version> out;
-    for (auto &sub : order) {
-        auto &V = by[sub];
+    for (auto &sub : order)
+    for (auto &V : content_groups(by[sub])) {
         const Version *last = V[0];
         for (auto *x : V) if (x->t > last->t) last = x;
         Version res; std::set<int> rset;
@@ -268,12 +405,14 @@ std::vector<Version> Project::full_versions(const Page &pg) const {
             size_t best = 0;
             for (size_t i = 1; i < var.size(); i++)
                 if (score[i] > score[best] || (score[i] == score[best] && var[i].t > var[best].t)) best = i;
+            // the copies of this row voted character by character: of this group only (a row of the other
+            // page of a rotation is not a copy)
             std::vector<std::pair<const Row *, int>> grp;
-            for (auto &x : pg.versions) {
-                auto it = x.rows.find(r);
-                if (it == x.rows.end() || row_dist(*var[best].b, it->second) > 6) continue;
-                auto c = x.c.find(r);
-                grp.push_back({&it->second, (c != x.c.end() && c->second) ? c->second : (x.n ? x.n : 1)});
+            for (auto *x : V) {
+                auto it = x->rows.find(r);
+                if (it == x->rows.end() || row_dist(*var[best].b, it->second) > 6) continue;
+                auto c = x->c.find(r);
+                grp.push_back({&it->second, (c != x->c.end() && c->second) ? c->second : (x->n ? x->n : 1)});
             }
             Row row;
             for (int k = 0; k < 40; k++) {
@@ -592,6 +731,8 @@ document.querySelector('#tbl tbody').innerHTML=D.map(d=>`<tr><td class="n">${d.m
 </script></body></html>)~";
 }
 
+#include "../tt_page_html.inc"
+
 int Project::to_page_htmls(const Pages &pages, const std::string &dir) const {
     make_dirs(dir);
     std::error_code ec;
@@ -600,51 +741,22 @@ int Project::to_page_htmls(const Pages &pages, const std::string &dir) const {
         if (f.size() == 8 && isdigit((u8)f[0]) && isdigit((u8)f[1]) && isdigit((u8)f[2]) && f.substr(3) == ".html") fs::remove(e.path(), ec);
     }
     write_text(path_join(dir, "tt_render.js"), resource_text("TT_RENDER"));
-    std::string tpl = resource_text("PAGE_TEMPLATE");
+    write_text(path_join(dir, "teletext.css"), resource_text("TT_PAGE_CSS"));
+    write_text(path_join(dir, "teletext-noscanlines.css"), resource_text("TT_PAGE_CSS2"));
+    write_text(path_join(dir, "teletext2.ttf"), resource_text("TT_FONT2"));
+    write_text(path_join(dir, "teletext4.ttf"), resource_text("TT_FONT4"));
     std::vector<std::string> ids;
     for (auto &kv : pages) if (!kv.second.deleted) ids.push_back(kv.first);
-    Json exist = Json::array(); for (auto &p : ids) exist.push(p);
-    std::string exist_s = exist.dump();
-    for (size_t i = 0; i < ids.size(); i++) {
-        const std::string &pid = ids[i];
-        const Page &pg = pages.at(pid);
-        Json vers = versions_for_html(*this, pg);
-        const Charset &t = table(&pg);
-        std::string text;
-        for (size_t k = 0; k < pg.versions.size(); k++) {
-            const Version &s = pg.versions[k];
-            text += "=== " + vers[k]["label"].str() + " ===\n";
-            for (int r = 0; r < 25; r++) {
-                auto it = s.rows.find(r);
-                text += (it != s.rows.end() ? row_text(it->second, overlay(pg, &s), r, t) : "");
-                text += "\n";
-            }
-        }
-        if (!text.empty()) text.pop_back();
-        std::string note = service_note(pg);
-        Json extra = Json::object();
-        extra["flof"] = flof_json(pg);
-        extra["cs"] = from_u32(std::u32string(t.begin(), t.end()));
-        const Charset *t2 = table2();
-        extra["cs2"] = t2 ? Json(from_u32(std::u32string(t2->begin(), t2->end()))) : Json();
-        std::string html = tpl;
-        html = replace_all(html, "__PID__", pid);
-        html = replace_all(html, "__PREV__", ids[(i + ids.size() - 1) % ids.size()]);
-        html = replace_all(html, "__NEXT__", ids[(i + 1) % ids.size()]);
-        html = replace_all(html, "__NOTE__", note.empty() ? "" : "<div class=\"note\">" + html_escape(note) + "</div>");
-        html = replace_all(html, "__TEXT__", html_escape(text));
-        html = replace_all(html, "__EXIST__", exist_s);
-        html = replace_all(html, "__EXTRA__", extra.dump());
-        html = replace_all(html, "__HINT_TITLE__", html_escape(title));
-        html = replace_all(html, "__DATA__", vers.dump());
-        write_text(path_join(dir, pid + ".html"), html);
-    }
+    std::set<std::string> exist(ids.begin(), ids.end());
+    for (auto &pid : ids) write_text(path_join(dir, pid + ".html"), tt_page_html(*this, pages.at(pid), pid, exist));
     write_text(path_join(dir, "index.html"), index_html(*this, pages, ids));
     write_text(path_join(dir, "quality.html"), quality_html(*this));
     return (int)ids.size();
 }
 
-std::string Project::export_all(const Pages &pages_in, bool full, bool clean) const {
+std::string Project::export_all(const Pages &pages_in, bool full, bool clean, const std::string &dir) const {
+    const std::string &outdir = dir.empty() ? this->outdir : dir;
+    if (!dir.empty()) { std::error_code ec; fs::create_directories(P(dir), ec); }
     Pages pages = full || clean ? full_pages(pages_in) : pages_in;
     std::string tag = full ? "_full" : "";
     int n = 0;
@@ -681,7 +793,7 @@ std::string Project::squash(const Pages &pages_in) const {
     Bytes t42 = to_t42(pages, n);
     std::string out = path_join(outdir, "clean.t42");
     write_atomic(out, std::string(t42.begin(), t42.end()));
-    return fmt("clean.t42: %zu pages, %zu subpages, %d packets (one assembled copy of each subpage) written in ", np, ns, n) + outdir;
+    return fmt("clean.t42: %zu pages, %zu subpages, %d packets (one assembled copy of each subpage; pages a station rotates under one subcode stay apart) written in ", np, ns, n) + outdir;
 }
 
 // ---------------------------------------------------------------- канал и время

@@ -10,6 +10,7 @@ struct Version {
     std::map<int, int> c;      // ряд -> сколько копий подтвердили
     std::string s;             // код подстраницы (S4 S3 S2 S1), пусто — нет
     bool full = false;         // полная страница (собрана из всех версий)
+    int rot = -1;              // page of a rotation under one subcode the builder told apart (Clean keeps them apart), -1 none
 };
 
 using PagesBuild = std::map<std::string, std::vector<Version>>;   // pages.json

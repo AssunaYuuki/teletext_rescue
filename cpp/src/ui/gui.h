@@ -45,12 +45,14 @@ LRESULT lv_custom_draw(LPARAM lp, const std::function<COLORREF(int row)> &text_c
 
 // ---------------------------------------------------------------- рисование
 void blit(HDC dc, const Image &im, int x, int y, int w, int h, bool smooth = false);
+// a large window (teletext, live capture): 92% of the monitor work area, centred, never smaller than it was made
+void fit_large(HWND h);
 void fill(HDC dc, RECT r, COLORREF c);
 void text_out(HDC dc, int x, int y, const std::string &s, COLORREF c, HFONT f, UINT align = 0);
 
 // ---------------------------------------------------------------- диалоги
 std::string open_file(HWND owner, const std::string &title, const std::vector<std::pair<std::string, std::string>> &filters);
-std::string save_file(HWND owner, const std::string &title, const std::string &def_name, const std::string &ext);
+std::string save_file(HWND owner, const std::string &title, const std::string &def_name, const std::string &ext, const std::string &start = "");
 std::string pick_folder(HWND owner, const std::string &title, const std::string &start = "");
 int ask(HWND owner, const std::string &title, const std::string &text, UINT flags);   // MessageBox
 bool input(HWND owner, const std::string &title, const std::string &prompt, std::string &value);

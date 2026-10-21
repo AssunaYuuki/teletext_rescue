@@ -6,7 +6,7 @@
 namespace {
 
 constexpr uint32_t kMagic = 0x31435254;   // "TRC1"
-constexpr uint32_t kVersion = 7;          // bump when a saved structure changes
+constexpr uint32_t kVersion = 22;          // bump when a saved structure changes
 
 // One archive type for both directions: R = reading.
 template <bool R> struct Ar {
@@ -58,7 +58,7 @@ template <bool R, class... T> void all(Ar<R>& a, T&... x) { (io(a, x), ...); }
 
 template <bool R> void io(Ar<R>& a, VbiGeometry& g)
 {
-    all(a, g.format, g.fmt, g.samplesPerLine, g.validSamples, g.lineBytes, g.linesPerFrame, g.lineSamples, g.firstLine, g.pal,
+    all(a, g.format, g.fmt, g.samplesPerLine, g.validSamples, g.lineBytes, g.linesPerFrame, g.lineSamples, g.firstLine, g.tvFirst[0], g.tvFirst[1], g.pal,
         g.lineRate, g.fastRate, g.frames, g.storedPerField, g.skipLines);
 }
 template <bool R> void io(Ar<R>& a, LineInfo& l) { all(a, l.index, l.lineNo, l.field, l.mode, l.detectRate, l.kind, l.tviRate); }
@@ -111,7 +111,9 @@ template <bool R> void io(Ar<R>& a, GemstarStream& s)
 // ТВ-информ
 template <bool R> void io(Ar<R>& a, TviWord& w) { all(a, w.frame, w.lineNo, w.field, w.bytes, w.quality); }
 template <bool R> void io(Ar<R>& a, TviPage& p) { all(a, p.lineNo, p.field, p.copies, p.bytes); }
-template <bool R> void io(Ar<R>& a, TviStream& s) { all(a, s.rate, s.nbits, s.words, s.pages, s.entropy, s.report); }
+template <bool R> void io(Ar<R>& a, TviChunk& c) { all(a, c.frame, c.header, c.kind, c.fixed, c.chars); }
+template <bool R> void io(Ar<R>& a, TviFile& f) { all(a, f.id, f.size, f.crc, f.blocks, f.have, f.name, f.shortName, f.time, f.path, f.note, f.missing); }
+template <bool R> void io(Ar<R>& a, TviStream& s) { all(a, s.rate, s.nbits, s.words, s.pages, s.serial, s.entropy, s.report, s.files, s.fileInfo, s.beacons); }
 // 5.7 Mbit/s, teletext, old engine
 template <bool R> void io(Ar<R>& a, FastPacket& p) { all(a, p.frame, p.lineNo, p.field, p.kind, p.syncErr, p.crc, p.bytes); }
 template <bool R> void io(Ar<R>& a, TtResult& t) { all(a, t.project, t.packets, t.pages, t.subpages, t.service, t.system); }
@@ -119,6 +121,11 @@ template <bool R> void io(Ar<R>& a, LegacyLine& l) { all(a, l.row, l.tvLine, l.k
 template <bool R> void io(Ar<R>& a, LegacyResult& r) { all(a, r.service, r.kind, r.path, r.note); }
 template <bool R> void io(Ar<R>& a, LegacyReport& r) { all(a, r.format, r.dir, r.lines, r.results, r.vits); }
 
+template <bool R> void io(Ar<R>& a, CaptionCue& c) { all(a, c.frame, c.end, c.svc, c.text); }
+template <bool R> void io(Ar<R>& a, VitcCode& c)
+{
+    all(a, c.frame, c.hour, c.minute, c.second, c.fr, c.drop, c.colourFrame, c.fieldMark, c.user, c.lineNo, c.field);
+}
 // Japanese teletext
 template <bool R> void io(Ar<R>& a, JtesUnit& u) { all(a, u.type, u.data); }
 template <bool R> void io(Ar<R>& a, JtesPage& p)
@@ -131,7 +138,7 @@ template <bool R> void io(Ar<R>& a, DecodeResult& r)
 {
     all(a, r.path, r.source, r.captureNotes, r.geom, r.slicerName, r.sliceSeconds, r.totalSeconds, r.lines, r.db, r.captions,
         r.xds, r.silentRadio, r.amol, r.gemstar, r.tvinform, r.fieldsSwapped, r.fastPackets, r.fastReport, r.fastText,
-        r.nabtsT33, r.nabtsField, r.nabtsLine, r.legacy, r.teletext, r.colour, r.log, r.jtes);
+        r.nabtsT33, r.nabtsField, r.nabtsLine, r.legacy, r.teletext, r.colour, r.log, r.jtes, r.captionCues, r.vitc, r.vitcReport, r.lineForce, r.timeCode);
 }
 
 // size and modification time of the recording: saved results only fit the same file

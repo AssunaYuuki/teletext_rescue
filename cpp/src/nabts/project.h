@@ -36,7 +36,7 @@ struct Project {
     std::string to_output_html(const Pages &pages) const;
     int to_page_htmls(const Pages &pages, const std::string &outdir) const;
     // clean — output.t42 без повторов: по одной собранной копии каждой подстраницы (как clean.t42)
-    std::string export_all(const Pages &pages, bool full, bool clean = false) const;
+    std::string export_all(const Pages &pages, bool full, bool clean = false, const std::string &dir = "") const;   // dir: elsewhere than outdir
     std::pair<std::string, int> export_srt(const std::string &page) const;
     // очищенный поток: по одной собранной (проголосованной) копии каждой подстраницы, по порядку номеров -> clean.t42
     std::string squash(const Pages &pages) const;

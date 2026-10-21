@@ -2,7 +2,11 @@
 ; Сначала: ninja в cppuild, затем strip TeletextRescue.exe и trcli.exe в dist\Teletext Rescue <версия>\n; Потом:   ISCC.exe setup.iss  -> dist\TeletextRescue-Setup-<версия>.exe
 
 #define AppName "Teletext Rescue"
-#define AppVersion "1.2"
+#define AppVersion "1.3"
+; ISCC /DArch=x86 setup.iss: the 32-bit build (dist\Teletext Rescue 1.3 x86)
+#ifndef Arch
+#define Arch "x64"
+#endif
 #define AppPublisher "AssunaYuuki"
 #define AppURL "https://github.com/AssunaYuuki/teletext_rescue"
 #define AppExe "Teletext Rescue.exe"
@@ -23,7 +27,11 @@ DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 LicenseFile=LICENSE
 OutputDir=dist
+#if Arch == "x86"
+OutputBaseFilename=TeletextRescue-Setup-v{#AppVersion}-x86
+#else
 OutputBaseFilename=TeletextRescue-Setup-v{#AppVersion}
+#endif
 SetupIconFile=icon.ico
 UninstallDisplayIcon={app}\{#AppExe}
 Compression=lzma2/max
@@ -37,8 +45,10 @@ WizardImageBackColor=#1b1c1f
 WizardSmallImageBackColor=#1b1c1f
 WizardImageStretch=no
 DisableWelcomePage=no
+#if Arch == "x64"
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+#endif
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -48,7 +58,11 @@ Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
+#if Arch == "x86"
+Source: "dist\{#AppName} {#AppVersion} x86\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+#else
 Source: "dist\{#AppName} {#AppVersion}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+#endif
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"

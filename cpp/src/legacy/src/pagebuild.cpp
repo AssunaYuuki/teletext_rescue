@@ -1,4 +1,6 @@
 #include "pagebuild.h"
+#include <deque>
+#include <functional>
 #include <numeric>
 #include <unordered_map>
 
@@ -454,6 +456,15 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
         }
         const u8 *p = st[i].data();
         int a = H(p[0]), b = H(p[1]);
+        if (a < 0 || b < 0) {
+            // a page header with one wrong bit in its address (ТЕЛЕИНФ 352/0003 was lost so): taken when the
+            // address corrects to row 0 and the page number and subcode read exactly. Single-bit correction
+            // is not used elsewhere: on tape a bit slip turns 0x15 (0) into 0x2B / 0x2D, which "correct" to 7
+            int fa = ham::fix[p[0]], fb = ham::fix[p[1]];
+            bool hdr = fa >= 0 && fb >= 0 && ((fa >> 3) | (fb << 1)) == 0;
+            for (int k = 2; k < 8 && hdr; k++) hdr = H(p[k]) >= 0;
+            if (hdr) { a = fa; b = fb; }
+        }
         if (a < 0 || b < 0) continue;
         int mag = (a & 7) ? (a & 7) : 8, row = (a >> 3) | (b << 1);
         if (row == 0) {
@@ -476,8 +487,14 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
             if (row <= last[mag]) {
                 // повтор уже принятого ряда (DVB шлёт группы рядов дважды: 1,2,3,1,2,3,4,5,6…) — страница продолжается;
                 // другой ряд с тем же номером — значит, начался чужой кусок
-                bool rep = false;
-                for (auto &rb : *it->second->rows) if (rb.first == row && dist(rb.second, r) <= 4) { rep = true; break; }
+                bool rep = false, seen = false, onlyLow = true;
+                for (auto &rb : *it->second->rows) {
+                    if (rb.first == row) { seen = true; if (dist(rb.second, r) <= 4) rep = true; }
+                    if (rb.first >= 1 && rb.first < 20) onlyLow = false;
+                }
+                // the bottom rows first, then 1..21 (Polsat 1996: header, 22, 23, 24, 27, 1, 2, ...): a row not yet
+                // received after only rows 20+ goes on with the page
+                if (!seen && onlyLow) { it->second->rows->push_back({row, r}); last[mag] = row; continue; }
                 if (!rep) cur[mag] = nullptr;
                 continue;
             }
@@ -645,6 +662,224 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
             }
             lab.push_back(L);
         }
+        // pages a station rotates under one subcode («Самбия» 676 01/16 .. 16/16, all 0000): every transmission
+        // differs from the one before, so no snapshot below lasts MIN_ROW transmissions and all but one or two are
+        // lost. The transmissions are grouped by their own rows instead: rows that differ between transmissions
+        // (each variant sent at least MIN_ROW times) say which page of the rotation a transmission is
+        {
+            auto sigRow = [](int r) { return r >= 1 && r <= 23; };
+            std::set<int> varying;
+            for (auto &kv : reps) {
+                if (!sigRow(kv.first)) continue;
+                int big = 0;
+                for (auto &cl : kv.second) if ((int)cl.mem.size() >= MIN_ROW && informative(*cl.rep)) big++;
+                if (big >= 2) varying.insert(kv.first);
+            }
+            // the page's own counter "NN/MM" (676: "06/16"): rows of two pages of a rotation can be the same but
+            // for these two digits, so transmissions with different NN never join
+            auto counterOf = [](const SegRows &rows, int &mm) {
+                for (auto &rb : rows) {
+                    if (rb.first < 1 || rb.first > 24) continue;
+                    std::string t; for (u8 c : rb.second) t += (char)(c & 0x7F);
+                    for (size_t i = 0; i + 5 <= t.size(); i++) {
+                        auto dg = [&](size_t j) { return j < t.size() && t[j] >= '0' && t[j] <= '9'; };
+                        if (!dg(i) || !dg(i + 1) || t[i + 2] != '/' || !dg(i + 3) || !dg(i + 4)) continue;
+                        if ((i > 0 && (dg(i - 1) || t[i - 1] == '/')) || dg(i + 5) || (i + 5 < t.size() && t[i + 5] == '/')) continue;
+                        int a = (t[i] - '0') * 10 + t[i + 1] - '0', b = (t[i + 3] - '0') * 10 + t[i + 4] - '0';
+                        if (a >= 1 && a <= b && b >= 2 && b <= 99) { mm = b; return a; }
+                    }
+                }
+                // or "N/M" in the header (Саратов 100: "меню телетекст 2/5", five pages under 0000; the
+                // graphic one does not send row 16, which the snapshots took from the page before)
+                // or at the right end of row 1 (НТВ 1994 115: "НОВОСТИ      1/2")
+                for (auto &rb : rows) {
+                    if (rb.first > 1) continue;
+                    std::string t; for (u8 c : rb.second) t += (char)(c & 0x7F);
+                    auto dg = [&](size_t j) { return j < t.size() && t[j] >= '0' && t[j] <= '9'; };
+                    for (size_t i = rb.first ? 30 : 12; i + 3 <= t.size(); i++) {
+                        if (!dg(i) || t[i + 1] != '/' || !dg(i + 2)) continue;
+                        if (dg(i - 1) || t[i - 1] == '/' || dg(i + 3) || (i + 3 < t.size() && t[i + 3] == '/')) continue;
+                        if (rb.first) { bool end = true; for (size_t j = i + 3; j < t.size(); j++) end &= t[j] == ' '; if (!end) continue; }
+                        int a = t[i] - '0', b = t[i + 2] - '0';
+                        if (a >= 1 && a <= b && b >= 2) { mm = 100 + b; return a; }
+                    }
+                }
+                return -1;
+            };
+            std::vector<int> ctr(T.size(), -1);
+            {
+                std::map<int, std::map<int, int>> byMM;   // MM -> NN -> transmissions
+                std::vector<int> mms(T.size(), 0);
+                for (size_t k = 0; k < T.size(); k++) { ctr[k] = counterOf(*T[k].rows, mms[k]); if (ctr[k] >= 0) byMM[mms[k]][ctr[k]]++; }
+                int bestMM = 0, bn = 0;
+                for (auto &kv : byMM) { int s = 0; for (auto &x : kv.second) s += x.second; if (s > bn && kv.second.size() >= 2) { bn = s; bestMM = kv.first; } }
+                for (size_t k = 0; k < T.size(); k++) if (!bestMM || mms[k] != bestMM) ctr[k] = -1;
+            }
+            // only a page that numbers its own pages is taken for a rotation: on a torn tape (tvinfoorm) a
+            // transmission brings a few rows, and the snapshots below gather them, while groups of
+            // transmissions would lose the rows of transmissions with nothing to tell their page by
+            std::set<int> ctrs; for (int c : ctr) if (c >= 0) ctrs.insert(c);
+            bool whole = false;
+            {
+                std::set<int> uni; std::vector<int> per;
+                for (size_t k = 0; k < T.size(); k++) {
+                    int n = 0;
+                    for (auto &rb : *T[k].rows) if (sigRow(rb.first) && informative(rb.second)) { uni.insert(rb.first); n++; }
+                    if (n) per.push_back(n);
+                }
+                if (uni.size() >= 8 && per.size() >= 4) {
+                    std::sort(per.begin(), per.end());
+                    whole = per[per.size() / 4] * 10 >= (int)uni.size() * 8;   // three quarters bring 80% of the rows
+                }
+            }
+            // rows that change between whole transmissions, a variant seen once included
+            std::set<int> varyAll;
+            if (whole)
+                for (auto &kv : reps) {
+                    if (!sigRow(kv.first)) continue;
+                    int inf = 0;
+                    for (auto &cl : kv.second) if (informative(*cl.rep)) inf++;
+                    if (inf >= 2) varyAll.insert(kv.first);
+                }
+            bool rotation = ctrs.size() >= 2 || whole;
+            struct G { std::map<int, int> sig; std::vector<size_t> mem; int ctr = -1; };
+            std::vector<G> gs;
+            for (size_t k = 0; k < T.size(); k++) {
+                std::map<int, int> sig;
+                for (auto &rc : lab[k]) {
+                    auto &cl = reps[rc.first][rc.second];
+                    if (!informative(*cl.rep)) continue;
+                    if (whole && ctrs.size() < 2 ? varyAll.count(rc.first) : varying.count(rc.first) && (int)cl.mem.size() >= MIN_ROW)
+                        sig[rc.first] = rc.second;
+                }
+                if (sig.empty() && ctr[k] < 0) continue;
+                int best = -1; double ba = 0;
+                for (size_t g = 0; g < gs.size(); g++) {
+                    // a different counter never joins; the same counter still wants the same rows (665 "02/02"
+                    // was sent with three different contents in turn: updates of that page)
+                    bool sameCtr = ctr[k] >= 0 && ctr[k] == gs[g].ctr;
+                    if (ctr[k] >= 0 && gs[g].ctr >= 0 && !sameCtr) continue;
+                    int same = 0, common = 0;
+                    for (auto &kv : sig) { auto it = gs[g].sig.find(kv.first); if (it == gs[g].sig.end()) continue; common++; same += it->second == kv.second; }
+                    if (!common) { if (sameCtr && ba < 0.8) { ba = 0.8; best = (int)g; } continue; }
+                    double a = (double)same / common;
+                    if (a > ba) { ba = a; best = (int)g; }
+                }
+                if (best >= 0 && ba >= 0.8) {
+                    gs[best].mem.push_back(k); for (auto &kv : sig) gs[best].sig.emplace(kv.first, kv.second);
+                    if (gs[best].ctr < 0) gs[best].ctr = ctr[k];
+                } else gs.push_back({sig, {k}, ctr[k]});
+            }
+            std::vector<const G *> real;
+            for (auto &g : gs) if ((int)g.mem.size() >= MIN_ROW) real.push_back(&g);
+            // a page of a long rotation sent once in the recording (205: 52 pages) is taken when its own counter
+            // says which page it is and no other group has that number (the fullest such transmission)
+            {
+                std::set<int> have; for (auto *g : real) if (g->ctr >= 0) have.insert(g->ctr);
+                std::map<int, const G *> once;
+                for (auto &g : gs)
+                    if ((int)g.mem.size() < MIN_ROW && g.ctr >= 0 && !have.count(g.ctr)) {
+                        auto it = once.find(g.ctr);
+                        if (it == once.end() || T[g.mem[0]].rows->size() > T[it->second->mem[0]].rows->size()) once[g.ctr] = &g;
+                    }
+                for (auto &kv : once) real.push_back(kv.second);
+                // whole transmissions without a counter: a page sent once is taken when at least two of its rows
+                // are new text (more than 10 characters from that row of every other page: a table of contents changes half a row), not tape damage
+                if (whole)
+                    for (auto &g : gs) {
+                        if (ctrs.size() >= 2 && g.ctr >= 0) continue;   // numbered pages: by their number above
+                        if ((int)g.mem.size() >= MIN_ROW) continue;
+                        int fresh = 0;
+                        for (auto &kv : g.sig) {
+                            const R40 &mine = *reps[kv.first][kv.second].rep;
+                            bool near = false;
+                            for (auto &h : gs) {
+                                if (&h == &g) continue;
+                                auto it = h.sig.find(kv.first);
+                                if (it != h.sig.end() && dist(*reps[kv.first][it->second].rep, mine) <= 10) { near = true; break; }
+                            }
+                            fresh += !near;
+                        }
+                        if (fresh >= 2) real.push_back(&g);
+                    }
+                std::stable_sort(real.begin(), real.end(), [&](const G *a, const G *b) { return T[a->mem[0]].i < T[b->mem[0]].i; });
+            }
+            // without a counter two groups are two pages only when a row of text differs (more than 10
+            // characters): copies of one page that tape noise split (Культура 130: a mosaic row and a few
+            // letters) are joined again; a table of contents may change one row only (101)
+            std::deque<G> joined;
+            if (rotation && ctrs.size() < 2 && real.size() >= 2) {
+                auto mosaic = [](const R40 &r) { for (u8 c : r) if ((c & 0x7F) >= 0x10 && (c & 0x7F) <= 0x17) return true; return false; };
+                std::vector<int> root(real.size());
+                for (size_t i = 0; i < real.size(); i++) root[i] = (int)i;
+                std::function<int(int)> find = [&](int i) { return root[i] == i ? i : root[i] = find(root[i]); };
+                for (size_t x = 0; x < real.size(); x++)
+                    for (size_t y = x + 1; y < real.size(); y++) {
+                        bool differ = false;
+                        for (auto &kv : real[x]->sig) {
+                            auto it = real[y]->sig.find(kv.first);
+                            if (it == real[y]->sig.end()) continue;
+                            const R40 &p = *reps[kv.first][kv.second].rep, &q = *reps[kv.first][it->second].rep;
+                            if (!mosaic(p) && !mosaic(q) && dist(p, q) > 10) { differ = true; break; }
+                        }
+                        if (!differ) root[find((int)y)] = find((int)x);
+                    }
+                std::map<int, G *> byRoot;
+                for (size_t i = 0; i < real.size(); i++) {
+                    int r = find((int)i);
+                    if (!byRoot.count(r)) { joined.push_back(G{}); byRoot[r] = &joined.back(); }
+                    G &g = *byRoot[r];
+                    g.mem.insert(g.mem.end(), real[i]->mem.begin(), real[i]->mem.end());
+                    for (auto &kv : real[i]->sig) g.sig.emplace(kv.first, kv.second);
+                }
+                real.clear();
+                for (auto &g : joined) { std::sort(g.mem.begin(), g.mem.end()); real.push_back(&g); }
+                std::stable_sort(real.begin(), real.end(), [&](const G *x, const G *y) { return T[x->mem[0]].i < T[y->mem[0]].i; });
+            }
+            if (rotation && real.size() >= 2) {
+                R40 hdr0; hdr0.fill(32);
+                if (reps.count(0) && !reps[0].empty()) {
+                    auto &cl = reps[0]; size_t b = 0;
+                    for (size_t k = 1; k < cl.size(); k++) if (cl[k].mem.size() > cl[b].mem.size()) b = k;
+                    hdr0 = vote(cl[b].mem);
+                }
+                std::vector<Version> out;
+                int rk = 0;
+                for (auto *g : real) {
+                    Version v; v.n = (int)g->mem.size(); v.rot = rk++;
+                    v.t = round(T[g->mem[0]].i / 650.0 * 10) / 10;
+                    Row h; std::copy(hdr0.begin(), hdr0.end(), h.begin()); v.rows[0] = h;
+                    std::map<int, std::map<int, int>> cnt;   // row -> cluster -> transmissions of this group
+                    std::map<int, std::map<int, std::vector<const R40 *>>> own;   // row -> cluster -> this group's copies
+                    for (size_t k : g->mem) {
+                        for (auto &rc : lab[k]) if (rc.first != 0) cnt[rc.first][rc.second]++;
+                        auto &L = lab[k]; auto &R = *T[k].rows;
+                        for (size_t j = 0; j < R.size() && j < L.size(); j++) own[R[j].first][L[j].second].push_back(&R[j].second);
+                    }
+                    // the header of this page's own transmissions (its counter "2/5")
+                    if (own.count(0)) {
+                        const std::vector<const R40 *> *hb = nullptr;
+                        for (auto &c : own[0]) if (!hb || c.second.size() > hb->size()) hb = &c.second;
+                        R40 r = vote(*hb); std::copy(r.begin(), r.end(), v.rows[0].begin());
+                    }
+                    for (auto &rk : cnt) {
+                        int bc = -1, bn = 0;
+                        for (auto &c : rk.second) if (c.second > bn) { bn = c.second; bc = c.first; }
+                        // a row of this page only, or one every page shares (sent often enough as a whole)
+                        // (a page sent a few times keeps all its rows: НТВ 1994 sends each page of a rotation once or twice)
+                        if (bn < MIN_ROW && (int)reps[rk.first][bc].mem.size() < MIN_ROW && (int)g->mem.size() > 2 * MIN_ROW) continue;
+                        // voted from this page's own copies: rows of two pages of a rotation that differ in a
+                        // few characters (the counter) fall in one cluster
+                        R40 r = vote(own[rk.first][bc]);
+                        Row rr; std::copy(r.begin(), r.end(), rr.begin());
+                        // copies of the row as in the snapshots: the foreign-row pass below compares pages by it
+                        v.rows[rk.first] = rr; v.c[rk.first] = (int)reps[rk.first][bc].mem.size();
+                    }
+                    out.push_back(v);
+                }
+                return out;
+            }
+        }
         struct Snap { std::vector<std::pair<int, int>> st; long t0, t1; int n; };
         auto st_get = [](const std::vector<std::pair<int, int>> &st, int r) { for (auto &p : st) if (p.first == r) return p.second; return -1; };
         auto st_set = [](std::vector<std::pair<int, int>> &st, int r, int ci) { for (auto &p : st) if (p.first == r) { p.second = ci; return; } st.push_back({r, ci}); };
@@ -783,7 +1018,9 @@ PagesBuild merge_pages(const PagesBuild &good, const PagesBuild &full, const Jso
         for (auto &s : G) {
             Version v = s;
             const Version *f = nullptr;
-            for (auto &x : F) if (x.s == s.s && (!f || fabs(x.t - s.t) < fabs(f->t - s.t))) f = &x;
+            // a page of a rotation under one subcode: the full snapshots of that subcode hold the other pages' rows
+            // (Саратов 100: the graphic page sends no row 12 and got the one of the page before)
+            if (s.rot < 0 || s.rows.size() < 4) for (auto &x : F) if (x.s == s.s && (!f || fabs(x.t - s.t) < fabs(f->t - s.t))) f = &x;
             if (f) for (auto &rb : f->rows) if (!v.rows.count(rb.first)) {
                 v.rows[rb.first] = rb.second; auto c = f->c.find(rb.first); v.c[rb.first] = c == f->c.end() ? 1 : c->second; filled++;
             }

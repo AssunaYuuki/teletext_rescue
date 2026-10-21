@@ -1,3 +1,5 @@
+#include <set>
+#include <algorithm>
 #include "project.h"
 #include "pagebuild.h"
 
@@ -592,6 +594,8 @@ document.querySelector('#tbl tbody').innerHTML=D.map(d=>`<tr><td class="n">${d.m
 </script></body></html>)~";
 }
 
+#include "../../tt_page_html.inc"
+
 int Project::to_page_htmls(const Pages &pages, const std::string &dir) const {
     make_dirs(dir);
     std::error_code ec;
@@ -600,45 +604,14 @@ int Project::to_page_htmls(const Pages &pages, const std::string &dir) const {
         if (f.size() == 8 && isdigit((u8)f[0]) && isdigit((u8)f[1]) && isdigit((u8)f[2]) && f.substr(3) == ".html") fs::remove(e.path(), ec);
     }
     write_text(path_join(dir, "tt_render.js"), resource_text("TT_RENDER"));
-    std::string tpl = resource_text("PAGE_TEMPLATE");
+    write_text(path_join(dir, "teletext.css"), resource_text("TT_PAGE_CSS"));
+    write_text(path_join(dir, "teletext-noscanlines.css"), resource_text("TT_PAGE_CSS2"));
+    write_text(path_join(dir, "teletext2.ttf"), resource_text("TT_FONT2"));
+    write_text(path_join(dir, "teletext4.ttf"), resource_text("TT_FONT4"));
     std::vector<std::string> ids;
     for (auto &kv : pages) if (!kv.second.deleted) ids.push_back(kv.first);
-    Json exist = Json::array(); for (auto &p : ids) exist.push(p);
-    std::string exist_s = exist.dump();
-    for (size_t i = 0; i < ids.size(); i++) {
-        const std::string &pid = ids[i];
-        const Page &pg = pages.at(pid);
-        Json vers = versions_for_html(*this, pg);
-        const Charset &t = table(&pg);
-        std::string text;
-        for (size_t k = 0; k < pg.versions.size(); k++) {
-            const Version &s = pg.versions[k];
-            text += "=== " + vers[k]["label"].str() + " ===\n";
-            for (int r = 0; r < 25; r++) {
-                auto it = s.rows.find(r);
-                text += (it != s.rows.end() ? row_text(it->second, overlay(pg, &s), r, t) : "");
-                text += "\n";
-            }
-        }
-        if (!text.empty()) text.pop_back();
-        std::string note = service_note(pg);
-        Json extra = Json::object();
-        extra["flof"] = flof_json(pg);
-        extra["cs"] = from_u32(std::u32string(t.begin(), t.end()));
-        const Charset *t2 = table2();
-        extra["cs2"] = t2 ? Json(from_u32(std::u32string(t2->begin(), t2->end()))) : Json();
-        std::string html = tpl;
-        html = replace_all(html, "__PID__", pid);
-        html = replace_all(html, "__PREV__", ids[(i + ids.size() - 1) % ids.size()]);
-        html = replace_all(html, "__NEXT__", ids[(i + 1) % ids.size()]);
-        html = replace_all(html, "__NOTE__", note.empty() ? "" : "<div class=\"note\">" + html_escape(note) + "</div>");
-        html = replace_all(html, "__TEXT__", html_escape(text));
-        html = replace_all(html, "__EXIST__", exist_s);
-        html = replace_all(html, "__EXTRA__", extra.dump());
-        html = replace_all(html, "__HINT_TITLE__", html_escape(title));
-        html = replace_all(html, "__DATA__", vers.dump());
-        write_text(path_join(dir, pid + ".html"), html);
-    }
+    std::set<std::string> exist(ids.begin(), ids.end());
+    for (auto &pid : ids) write_text(path_join(dir, pid + ".html"), tt_page_html(*this, pages.at(pid), pid, exist));
     write_text(path_join(dir, "index.html"), index_html(*this, pages, ids));
     write_text(path_join(dir, "quality.html"), quality_html(*this));
     return (int)ids.size();

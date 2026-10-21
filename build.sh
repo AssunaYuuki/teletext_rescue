@@ -29,6 +29,13 @@ if [ "$OS" = "darwin" ]; then JOBS=$(sysctl -n hw.ncpu); else JOBS=$(nproc 2>/de
 # macOS: один файл и для Apple Silicon, и для Intel
 ARCH=""
 [ "$OS" = "darwin" ] && ARCH="-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
+# Linux 32-bit (x86) on a 64-bit machine: TR_ARCH=i686 ./build.sh  (needs gcc-multilib and the :i386 libraries)
+if [ "$OS" = "linux" ] && [ "$TR_ARCH" = "i686" ]; then
+    BUILD="cpp/build-linux-i686"
+    export PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig
+    ARCH="-DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32 -DCMAKE_EXE_LINKER_FLAGS=-m32 -DCMAKE_SYSTEM_PROCESSOR=i686 -DSDL_WAYLAND=OFF"
+    [ "$1" = "clean" ] && rm -rf "$BUILD"
+fi
 cmake -S cpp -B "$BUILD" $GEN -DCMAKE_BUILD_TYPE=Release $ARCH
 if [ -n "$GEN" ]; then cmake --build "$BUILD" -j "$JOBS" -- -k 0; else cmake --build "$BUILD" -j "$JOBS" -- -k; fi
 

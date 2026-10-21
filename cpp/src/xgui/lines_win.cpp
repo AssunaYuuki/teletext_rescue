@@ -39,7 +39,7 @@ struct LinesWin : Win {
     const uint8_t *line_of(const std::vector<uint8_t> &buf, int f, int l) const { return &buf[(size_t)f * g.frameBytes() + (size_t)l * g.lineBytes]; }
     int nsamp() const { return std::max(1, g.validSamples); }
     double fs() const { return g.lineSamples * g.lineRate; }
-    std::string line_label(int l) const { int fld = l < g.linesPerFrame / 2 ? 1 : 2; return fmt("%d f%d", g.firstLine + l % std::max(1, g.linesPerFrame / 2), fld); }
+    std::string line_label(int l) const { int n, fld; lineOf(g, l, n, fld); return fmt("%d f%d", n, fld); }
     const LineInfo *info_of(int l) const { for (auto &li : R->lines) if (li.index == l) return &li; return nullptr; }
     double clock_of(int l) const
     {
@@ -48,6 +48,8 @@ struct LinesWin : Win {
         const std::string &k = li->kind;
         if (li->mode == MODE_TVINFORM) return kTviRateHz[li->tviRate == 0 ? 0 : 1];
         if (k.find("WST PAL") != std::string::npos || (g.pal && k.find("teletext") != std::string::npos)) return 6.9375e6;
+        // Norpak packets on 625 lines: the NTSC NABTS clock 364 x 15734.26 Hz
+        if (k.find("Norpak") != std::string::npos) return 364 * 4.5e6 / 286;
         if (k.find("VPS") != std::string::npos) return 2.5e6;
         if (k.find("WSS") != std::string::npos) return 5e6 / 6 * 3;
         if (li->mode == MODE_FAST || k.find("NABTS") != std::string::npos || k.find("Didon") != std::string::npos) return g.pal ? 6.9375e6 : 364 * g.lineRate;

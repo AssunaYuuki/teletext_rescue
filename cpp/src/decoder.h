@@ -10,10 +10,22 @@
 #include "textservices.h"
 #include "vbifile.h"
 #include "legacy_bridge.h"
+#include "vitc.h"
+#include "finds.h"
+#include <map>
+#include <memory>
 #include <atomic>
 #include <functional>
 #include <string>
 #include <vector>
+
+// a line's signal set by hand before decoding (VBI lines window); Auto = let the decoder find it
+enum class LineForce : uint8_t { Auto = 0, None, Captions, SilentRadio, Amol, Gemstar, TviT1, TviT2, Fast, Teletext625, Vitc, Test, Norpak, TviT3, Count };
+const char* lineForceName(LineForce f);   // "Captions / XDS / StarSight (32 x fH)" ...
+const char* lineForceKey(LineForce f);    // "cc", "sr", ... (trcli --line 21f1=cc)
+LineForce lineForceFromKey(const std::string& k);   // Count if unknown
+
+struct JtesRecRead;
 
 struct DecodeOptions {
     bool gpu = false;
@@ -28,7 +40,14 @@ struct DecodeOptions {
     std::atomic<bool>* cancel = nullptr;
     bool reunpack = false;        // FLAC: unpack again even if x_vbi/x.vbi is ready
     bool again = false;           // results folder x_vbi: decode again even where results exist
+    std::map<int, LineForce> lineForce;   // stored line index -> signal set by hand
+    bool probeOnly = false;       // open the recording (format, geometry) and decode nothing
     std::string sourcePath;       // internal: the file the user opened (a FLAC), for the results folder
+    // Japanese teletext receiver (27 MHz 8-bit 525 lines): how a recording is read, when already known (live chunks);
+    // jtesFound gets what the probe found; jtesProbe false = no probe (live gave up after a few chunks)
+    const JtesRecRead* jtesHow = nullptr;
+    JtesRecRead* jtesFound = nullptr;
+    bool jtesProbe = true;
 };
 
 struct LineInfo {
@@ -42,6 +61,8 @@ struct LineInfo {
 };
 
 struct DecodeResult {
+    // files and texts found (prepareFinds: made once, with the «Бизнес-Текст» files written); null = not yet
+    std::shared_ptr<const std::vector<Find>> finds;
     std::string path;
     std::string source;           // the FLAC file this recording was unpacked from (empty = path itself)
     std::string colour, colourWhy;   // "SECAM" / "PAL" / "NTSC" / "" and how it was found
@@ -52,6 +73,11 @@ struct DecodeResult {
     std::vector<LineInfo> lines;
     SsDatabase db;
     std::vector<std::string> captions;
+    std::vector<CaptionCue> captionCues;   // the same caption lines with their frames (times: VITC or recording)
+    std::vector<VitcCode> vitc;            // VITC time code, one per frame that has it
+    std::vector<std::string> vitcReport;
+    std::vector<std::string> timeCode;     // the time code line of ORT (line 6: 1 MHz burst + 25 symbols a second)
+    std::map<int, LineForce> lineForce;    // line types the user set by hand for this decoding
     std::vector<std::string> xds;
     std::vector<SilentRadioMessage> silentRadio;
     std::vector<AmolStream> amol;          // Nielsen AMOL I lines

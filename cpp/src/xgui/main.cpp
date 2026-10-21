@@ -5,12 +5,13 @@
 #include "draw.h"
 #include "version.h"
 #include "export.h"
+#include "finds.h"
 #include "flac.h"
 #include "legacy_bridge.h"
 #include "rescache.h"
 #include "slicer.h"
 #include "backends/imgui_impl_sdl3.h"
-#include "backends/imgui_impl_sdlrenderer3.h"
+#include "backends/imgui_impl_opengl3.h"
 #include "png.h"
 #include <cmath>
 #include <ctime>
@@ -20,7 +21,7 @@
 namespace xg {
 
 SDL_Window *g_window = nullptr;
-SDL_Renderer *g_renderer = nullptr;
+SDL_GLContext g_gl = nullptr;
 ImFont *F[4] = {};
 
 ImU32 service_colour(const std::string &k0)
@@ -43,21 +44,66 @@ ImU32 service_colour(const std::string &k0)
 }
 
 // ---------------------------------------------------------------- pictures
+// the few OpenGL 1.1 calls for pictures, taken from the driver through SDL (no OpenGL library linked on Linux)
+#ifdef _WIN32
+#define GLAPI_ __stdcall
+#else
+#define GLAPI_
+#endif
+namespace gl {
+typedef void(GLAPI_ *GenT)(int, unsigned *);
+typedef void(GLAPI_ *DelT)(int, const unsigned *);
+typedef void(GLAPI_ *BindT)(unsigned, unsigned);
+typedef void(GLAPI_ *ParT)(unsigned, unsigned, int);
+typedef void(GLAPI_ *StoreT)(unsigned, int);
+typedef void(GLAPI_ *ImgT)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *);
+typedef void(GLAPI_ *SubT)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *);
+typedef void(GLAPI_ *ReadT)(int, int, int, int, unsigned, unsigned, void *);
+typedef void(GLAPI_ *ViewT)(int, int, int, int);
+typedef void(GLAPI_ *ColT)(float, float, float, float);
+typedef void(GLAPI_ *ClrT)(unsigned);
+GenT GenTextures; DelT DeleteTextures; BindT BindTexture; ParT TexParameteri; StoreT PixelStorei; ImgT TexImage2D;
+SubT TexSubImage2D; ReadT ReadPixels; ViewT Viewport; ColT ClearColor; ClrT Clear;
+const unsigned TEXTURE_2D = 0x0DE1, MIN_FILTER = 0x2801, MAG_FILTER = 0x2800, NEAREST = 0x2600, WRAP_S = 0x2802, WRAP_T = 0x2803,
+               CLAMP_TO_EDGE = 0x812F, RGBA = 0x1908, BGRA = 0x80E1, UNSIGNED_BYTE = 0x1401, UNPACK_ROW_LENGTH = 0x0CF2,
+               PACK_ALIGNMENT = 0x0D05, COLOR_BUFFER_BIT = 0x4000;
+template <class T> static void get(T &f, const char *name) { f = (T)SDL_GL_GetProcAddress(name); }
+static void load()
+{
+    get(GenTextures, "glGenTextures"); get(DeleteTextures, "glDeleteTextures"); get(BindTexture, "glBindTexture");
+    get(TexParameteri, "glTexParameteri"); get(PixelStorei, "glPixelStorei"); get(TexImage2D, "glTexImage2D");
+    get(TexSubImage2D, "glTexSubImage2D"); get(ReadPixels, "glReadPixels"); get(Viewport, "glViewport");
+    get(ClearColor, "glClearColor"); get(Clear, "glClear");
+}
+}
+
 void Tex::set(const uint32_t *px, int W, int H)
 {
+    // 0xRRGGBB words are B, G, R, 0 in memory: uploaded as BGRA with the alpha byte set to FF
+    std::vector<uint32_t> tmp((size_t)W * H);
+    for (size_t i = 0; i < tmp.size(); i++) tmp[i] = px[i] | 0xFF000000u;
     if (!t || w != W || h != H) {
         clear();
-        t = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING, W, H);
+        gl::GenTextures(1, &t);
         if (!t) return;
-        SDL_SetTextureScaleMode(t, SDL_SCALEMODE_NEAREST);
+        gl::BindTexture(gl::TEXTURE_2D, t);
+        gl::TexParameteri(gl::TEXTURE_2D, gl::MIN_FILTER, gl::NEAREST);
+        gl::TexParameteri(gl::TEXTURE_2D, gl::MAG_FILTER, gl::NEAREST);
+        gl::TexParameteri(gl::TEXTURE_2D, gl::WRAP_S, gl::CLAMP_TO_EDGE);
+        gl::TexParameteri(gl::TEXTURE_2D, gl::WRAP_T, gl::CLAMP_TO_EDGE);
+        gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 0);
+        gl::TexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, W, H, 0, gl::BGRA, gl::UNSIGNED_BYTE, tmp.data());
         w = W; h = H;
+        return;
     }
-    SDL_UpdateTexture(t, nullptr, px, W * 4);
+    gl::BindTexture(gl::TEXTURE_2D, t);
+    gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 0);
+    gl::TexSubImage2D(gl::TEXTURE_2D, 0, 0, 0, W, H, gl::BGRA, gl::UNSIGNED_BYTE, tmp.data());
 }
 void Tex::clear()
 {
-    if (t) SDL_DestroyTexture(t);
-    t = nullptr; w = h = 0;
+    if (t) gl::DeleteTextures(1, &t);
+    t = 0; w = h = 0;
 }
 void image_fit(Tex &t, ImVec2 avail, double ar, ImVec2 *at, ImVec2 *size)
 {
@@ -387,6 +433,24 @@ void open_service(const ResultPtr &r, const Service &s)
     case ServiceWindow::Data: data_window(r, s.dataKind); break;
     case ServiceWindow::Gemstar: gemstar_window(r); break;
     case ServiceWindow::Jtes: jtes_window(r); break;
+    case ServiceWindow::Vitc: {
+        std::string t;
+        for (auto &l : r->vitcReport) t += l + "\n";
+        for (size_t i = 0; i < r->vitc.size(); i += 25) t += "[" + ui::rec_time(r->vitc[i].frame / ui::frame_rate(*r)) + "]  " + r->vitc[i].text() + "\n";
+        text_window("VITC time code \xE2\x80\x94 " + ui::file_name(*r), "time code of the tape, read from the VBI", t);
+        break;
+    }
+    case ServiceWindow::Finds: {   // files and texts as a list (the Windows program has its own window)
+        std::string t;
+        for (auto &f : findsOf(*r)) {
+            t += f.name + (f.shortName.empty() ? "" : " (" + f.shortName + ")") + "  [" + f.type + "]  " + f.status + "\n    " + f.service + ", " + f.where +
+                 (f.when.empty() ? "" : "  " + f.when) + (f.path.empty() ? "" : "\n    " + f.path) + (f.note.empty() ? "" : "\n    " + f.note) + "\n";
+            for (auto &l : f.text) t += "    " + l + "\n";
+            t += "\n";
+        }
+        text_window("Found files and texts \xE2\x80\x94 " + ui::file_name(*r), "files and texts the recording brought", t);
+        break;
+    }
     case ServiceWindow::Tvinform:
         text_window("TV-Inform \xE2\x80\x94 " + ui::file_name(*r), "\xD0\xA2\xD0\x92-\xD0\xB8\xD0\xBD\xD1\x84\xD0\xBE\xD1\x80\xD0\xBC (GOST R 50822-95), voted carousel pages", ui::tvinform_text(*r));
         break;
@@ -546,7 +610,10 @@ static void draw_tasks()
         ImGuiViewport *vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x / 2, vp->WorkPos.y + vp->WorkSize.y / 2), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
         ImGui::SetNextWindowSize(ImVec2(640, 380), ImGuiCond_Appearing);
-        ImGui::Begin((t->title + "##task" + std::to_string((intptr_t)t.get())).c_str(), nullptr, ImGuiWindowFlags_NoCollapse);
+        ImGuiWindowClass wc;   // a window of its own, as the others
+        wc.ViewportFlagsOverrideSet = ImGuiViewportFlags_NoAutoMerge;
+        ImGui::SetNextWindowClass(&wc);
+        ImGui::Begin((t->title + "##task" + std::to_string((intptr_t)t.get())).c_str(), nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar);
         std::string step;
         std::vector<std::string> log;
         int64_t d, a;
@@ -731,14 +798,15 @@ static void setup_style(float scale)
 // a picture of the whole program (TR_XSHOT=file.png): for checking the windows
 static void screenshot(const std::string &path)
 {
-    SDL_Surface *s = SDL_RenderReadPixels(g_renderer, nullptr);
-    if (!s) return;
-    SDL_Surface *c = SDL_ConvertSurface(s, SDL_PIXELFORMAT_XRGB8888);
-    SDL_DestroySurface(s);
-    if (!c) return;
-    Image im(c->w, c->h);
-    for (int y = 0; y < c->h; y++) memcpy(&im.px[(size_t)y * c->w], (uint8_t *)c->pixels + (size_t)y * c->pitch, c->w * 4);
-    SDL_DestroySurface(c);
+    int w = 0, h = 0;
+    SDL_GetWindowSizeInPixels(g_window, &w, &h);
+    if (w <= 0 || h <= 0) return;
+    std::vector<uint32_t> px((size_t)w * h);
+    gl::PixelStorei(gl::PACK_ALIGNMENT, 1);
+    gl::ReadPixels(0, 0, w, h, gl::BGRA, gl::UNSIGNED_BYTE, px.data());
+    Image im(w, h);
+    for (int y = 0; y < h; y++)   // OpenGL rows go bottom up
+        for (int x = 0; x < w; x++) im.px[(size_t)y * w + x] = px[(size_t)(h - 1 - y) * w + x] & 0xFFFFFF;
     png_save(path, im);
 }
 
@@ -761,8 +829,14 @@ static void frame()
         ImGui::SetNextWindowSize(w->size, ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 60 + (k % 8) * 28, vp->WorkPos.y + 50 + (k % 8) * 28), ImGuiCond_FirstUseEver);
         k++;
-        int fl = ImGuiWindowFlags_NoCollapse;
+        // the system's title bar names, moves and closes it; no second one of ImGui inside
+        int fl = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar;
         w->flags(fl);
+        // a window of its own on the desktop (title bar, taskbar / Dock entry), never merged into the main one
+        ImGuiWindowClass wc;
+        wc.ViewportFlagsOverrideSet = ImGuiViewportFlags_NoAutoMerge;
+        wc.ViewportFlagsOverrideClear = ImGuiViewportFlags_NoTaskBarIcon;
+        ImGui::SetNextWindowClass(&wc);
         if (ImGui::Begin(w->title.c_str(), &w->open, fl)) w->draw();
         ImGui::End();
     }
@@ -777,20 +851,37 @@ int run()
     float scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
     if (scale <= 0) scale = 1;
     g_scale = scale;
-    g_window = SDL_CreateWindow("Teletext Rescue " TR_VERSION, (int)(1320 * scale), (int)(900 * scale), SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    // OpenGL 3.2 core (what macOS gives), GLSL 150; every window of the program shares this context's textures
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
+    SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+    g_window = SDL_CreateWindow("Teletext Rescue " TR_VERSION, (int)(1320 * scale), (int)(900 * scale),
+                                SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!g_window) { fprintf(stderr, "SDL window: %s\n", SDL_GetError()); return 1; }
-    g_renderer = SDL_CreateRenderer(g_window, nullptr);
-    SDL_SetRenderVSync(g_renderer, 1);
+    g_gl = SDL_GL_CreateContext(g_window);
+    if (!g_gl) { fprintf(stderr, "OpenGL: %s\n", SDL_GetError()); return 1; }
+    SDL_GL_MakeCurrent(g_window, g_gl);
+    SDL_GL_SetSwapInterval(1);
+    gl::load();
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
     io.IniFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigWindowsMoveFromTitleBarOnly = true;
+    // windows of the program are windows of the system (as on Windows), not panels inside the main one
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+    io.ConfigViewportsNoAutoMerge = true;
+    io.ConfigViewportsNoTaskBarIcon = false;
+    io.ConfigViewportsNoDecoration = false;   // the system's own title bar, buttons and resizing
     setup_style(scale);
     setup_fonts(scale);
-    ImGui_ImplSDL3_InitForSDLRenderer(g_window, g_renderer);
-    ImGui_ImplSDLRenderer3_Init(g_renderer);
+    ImGui_ImplSDL3_InitForOpenGL(g_window, g_gl);
+    ImGui_ImplOpenGL3_Init("#version 150");
 
     // for checking: TR_XOPEN opens a recording (saved results), TR_XSHOT saves a picture and quits
     const char *shot = getenv("TR_XSHOT");
@@ -806,27 +897,34 @@ int run()
         while (SDL_PollEvent(&e)) {
             ImGui_ImplSDL3_ProcessEvent(&e);
             if (e.type == SDL_EVENT_QUIT) g_quit = true;
+            if (e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED && e.window.windowID == SDL_GetWindowID(g_window)) g_quit = true;
             if (e.type == SDL_EVENT_DROP_FILE && e.drop.data) open_recording(e.drop.data);
         }
-        if (SDL_GetWindowFlags(g_window) & SDL_WINDOW_MINIMIZED) { SDL_Delay(30); continue; }
-        ImGui_ImplSDLRenderer3_NewFrame();
+        if (SDL_GetWindowFlags(g_window) & SDL_WINDOW_MINIMIZED) SDL_Delay(15);   // the other windows still work
+        ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
         frame();
         ImGui::Render();
-        SDL_SetRenderScale(g_renderer, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
-        SDL_SetRenderDrawColor(g_renderer, 0x1b, 0x1c, 0x1f, 255);
-        SDL_RenderClear(g_renderer);
-        ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), g_renderer);
+        int fw = 0, fh = 0;
+        SDL_GetWindowSizeInPixels(g_window, &fw, &fh);
+        gl::Viewport(0, 0, fw, fh);
+        gl::ClearColor(0x1b / 255.f, 0x1c / 255.f, 0x1f / 255.f, 1);
+        gl::Clear(gl::COLOR_BUFFER_BIT);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         if (shot && ++frames == 30) { screenshot(shot); g_quit = true; }
-        SDL_RenderPresent(g_renderer);
+        // the windows of their own: drawn by ImGui into theirs, then the main window's context again
+        ImGui::UpdatePlatformWindows();
+        ImGui::RenderPlatformWindowsDefault();
+        SDL_GL_MakeCurrent(g_window, g_gl);
+        SDL_GL_SwapWindow(g_window);
     }
     stop_sound();
     g_wins.clear();
-    ImGui_ImplSDLRenderer3_Shutdown();
+    ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
-    SDL_DestroyRenderer(g_renderer);
+    SDL_GL_DestroyContext(g_gl);
     SDL_DestroyWindow(g_window);
     SDL_Quit();
     return 0;

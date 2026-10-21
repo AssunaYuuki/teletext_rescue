@@ -9,7 +9,7 @@
 namespace ui {
 using ResultPtr = std::shared_ptr<DecodeResult>;
 
-enum class ServiceWindow { StarSight, Captions, Xds, Sign, Data, Amol, Nabts, Teletext, Gemstar, Tvinform, Report, LegacyFile, Jtes };
+enum class ServiceWindow { StarSight, Captions, Xds, Sign, Data, Amol, Nabts, Teletext, Gemstar, Tvinform, Report, LegacyFile, Jtes, Vitc, Finds };
 struct Service {
     std::string name;       // shown on the result button
     std::string kind;       // for service_colour()

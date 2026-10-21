@@ -175,37 +175,61 @@ struct Screen {
     int fg = 7, bg = 8, x = 0, y = 24, oy = TOP;
     int rasH = 8, rasB = 8;                  // raster colours of the header row and of the page (8: none)
     std::vector<uint32_t> base;              // the picture plane (raster, photographic) under the text plane
-    bool over = false;                       // non-spacing: transparent dots leave what is there
     std::vector<JtesFrame>* frames = nullptr;  // TIME: the screen so far is a frame of an animation
     int G[4] = {KANJI, ALNUM, HIRA, MACRO}, GL = 0, GR = 2;
     void reset(char sz, int top)
     {
-        size = sz; fg = 7; bg = 8; x = 0; oy = top; y = cellH();
+        size = sz; fg = 7; bg = 8; x = 0; oy = top; y = cellH(); stl = false; ov.m.clear();
         G[0] = KANJI; G[1] = ALNUM; G[2] = HIRA; G[3] = MACRO; GL = 0; GR = 2;
     }
     // S small 8x12, M middle 8x24, N normal 16x24; SZX: T tall 16x48, W wide 32x24, D double 32x48, F 16x20, Q 4x4
     int cellW() const { return size == 'W' || size == 'D' ? 32 : size == 'N' || size == 'T' || size == 'F' ? 16 : size == 'Q' ? 4 : 8; }
     int cellH() const { return size == 'S' ? 12 : size == 'T' || size == 'D' ? 48 : size == 'F' ? 20 : size == 'Q' ? 4 : 24; }
-    // draw a glyph of gw x gh dots (rows: gw <= 8 one byte, else two) into the current cell, then advance
-    void paint(const uint8_t* rows, int gw, int gh, const std::string& t)
+    // STL (9A) .. SPL (99): underlined text; mosaics as the TU-TX100 draws them (JTES Decoder 0.9.55/0.9.56):
+    // C and D are separated, single A and B unchanged, a C/D composite is separated after composition, its A/B
+    // part included, and a composite completed by a text character (SP) is also underlined
+    bool stl = false;
+    // C / D are non-spacing: their dots wait at the cell (x, y, size) for the spacing character that completes them
+    struct Overlay { int x = 0, y = 0, w = 0, h = 0; std::vector<uint8_t> m; } ov;
+    // draw a glyph of gw x gh dots (rows: gw <= 8 one byte, else two) into the current cell, then advance;
+    // kind: 0 text, 1 mosaic A / B, 2 mosaic C / D (non-spacing)
+    void paint(const uint8_t* rows, int gw, int gh, const std::string& t, int kind = 0)
     {
         int cw = cellW(), ch = cellH();
         if (x + cw > W) { x = 0; y += ch; }
+        std::vector<uint8_t> m((size_t)cw * ch, 0);
+        if (rows)
+            for (int yy = 0; yy < ch; yy++)
+                for (int xx = 0; xx < cw; xx++) {
+                    int sx = xx * gw / cw, sy = yy * gh / ch;
+                    m[(size_t)yy * cw + xx] = gw <= 8 ? (rows[sy] >> (7 - sx)) & 1 : (rows[sy * 2 + sx / 8] >> (7 - sx % 8)) & 1;
+                }
+        bool here = !ov.m.empty() && ov.x == x && ov.y == y && ov.w == cw && ov.h == ch;
+        if (kind == 2) {
+            if (here) for (size_t k = 0; k < m.size(); k++) m[k] |= ov.m[k];
+            ov = {x, y, cw, ch, m};
+            return;
+        }
+        if (here) for (size_t k = 0; k < m.size(); k++) m[k] |= ov.m[k];
+        ov.m.clear();
+        if (stl && here)   // the 1-dot separation grid of the 16 x 24 cell
+            for (int yy = 0; yy < ch; yy++)
+                for (int xx = 0; xx < cw; xx++) {
+                    int X = xx * 16 / cw % 8, Y = yy * 24 / ch % 8;
+                    if (X == 0 || X == 7 || Y == 0 || Y == 7) m[(size_t)yy * cw + xx] = 0;
+                }
+        if (stl && kind == 0)
+            for (int xx = 0; xx < cw; xx++) m[(size_t)(ch - 1) * cw + xx] = 1;
         if (!t.empty()) text.push_back({y + oy, x, t});
         if (img) {
             for (int yy = 0; yy < ch; yy++)
                 for (int xx = 0; xx < cw; xx++) {
                     int X = x + xx, Y = y - ch + yy + oy;
                     if (X < 0 || Y < 0 || X >= img->w || Y >= img->h) continue;
-                    bool on = false;
-                    if (rows) {
-                        int sx = xx * gw / cw, sy = yy * gh / ch;
-                        on = gw <= 8 ? (rows[sy] >> (7 - sx)) & 1 : (rows[sy * 2 + sx / 8] >> (7 - sx % 8)) & 1;
-                    }
-                    uint32_t c = kPal[on ? fg : bg];
+                    uint32_t c = kPal[m[(size_t)yy * cw + xx] ? fg : bg];
                     size_t at = (size_t)Y * img->w + X;
                     if (c != 0xFFFFFFFF) img->px[at] = c;
-                    else if (!over && at < base.size()) img->px[at] = base[at];   // transparent: the picture shows
+                    else if (at < base.size()) img->px[at] = base[at];   // transparent: the picture shows
                 }
         }
         x += cw;
@@ -219,21 +243,17 @@ struct Screen {
         if (size == 'S' && (g = findGlyph(jtSmallCode, jtSmallBits, code))) return paint(g, 8, 12, t);
         paint(findGlyph(jtFullCode, jtFullBits, code), 16, 24, t);   // also squeezed into a half / small cell
     }
-    // mosaic A-D: 16 x 24 glyphs; C and D are non-spacing: drawn over the cell without background, no advance
+    // mosaic A-D: the receiver's 16 x 24 rasters (reserved codes blank); C and D are non-spacing (see paint)
     void mosaic(int set, int c)
     {
         uint8_t rows[48] = {};
-        if (c >= 0x21 && c <= 0x7E) {
-            const uint16_t* g = jtMosaic[(set - MOSA) * 94 + c - 0x21];
+        int tab = set == MOSD && stl ? 4 : set - MOSA;
+        if (c >= 0x21 && c <= 0x7E && jtMosaicHas[tab * 94 + c - 0x21]) {
+            const uint16_t* g = jtMosaic[tab * 94 + c - 0x21];
             for (int yy = 0; yy < 24; yy++) { rows[yy * 2] = (uint8_t)(g[yy] >> 8); rows[yy * 2 + 1] = (uint8_t)g[yy]; }
         }
-        over = set >= MOSC;
-        int keep = bg;
-        if (over) bg = 8;
-        paint(rows, 16, 24, over ? "" : "\xE2\x96\x92");
-        if (over) x -= cellW();
-        bg = keep;
-        over = false;
+        bool non = set >= MOSC;
+        paint(rows, 16, 24, non ? "" : "\xE2\x96\x92", non ? 2 : 1);
     }
     void character(int set, int c, int c2)
     {
@@ -339,6 +359,8 @@ struct Screen {
                 continue;
             }
             case 0x98: rpc = at(i++) - 0x40; continue;   // RPC: the next character n times, 0 = to the end of the row
+            case 0x99: stl = false; continue;            // SPL
+            case 0x9A: stl = true; continue;             // STL
             case 0x91: case 0x92: case 0x93: case 0x94: case 0x97: i++; continue;
             case 0x90: {
                 int p = at(i++);
@@ -546,13 +568,19 @@ std::string rowsText(std::vector<Screen::Cell> cells)
     std::stable_sort(cells.begin(), cells.end(), [](const Screen::Cell& a, const Screen::Cell& b) { return a.y != b.y ? a.y < b.y : a.x < b.x; });
     std::string out, line;
     int y = -1000;
+    std::vector<const Screen::Cell*> row;   // the cells of the line so far
     for (auto& c : cells) {
         if (c.y - y >= 6) {
             while (!line.empty() && line.back() == ' ') line.pop_back();
             if (!line.empty() || y > -1000) out += line + "\n";
             line.clear();
+            row.clear();
             y = c.y;
         }
+        // the same character drawn again a few dots off (outlined captions of 999: shadow, then the letter) is one
+        if (c.s != " " && std::any_of(row.begin(), row.end(), [&](const Screen::Cell* o) { return o->s == c.s && std::abs(o->x - c.x) <= 4; }))
+            continue;
+        row.push_back(&c);
         line += c.s;
     }
     while (!line.empty() && line.back() == ' ') line.pop_back();

@@ -6,6 +6,7 @@
 
 namespace gpu {
 bool available();                 // есть устройство GPU с OpenCL
+extern bool g_allowed;            // TeletextRescue: выбор пользователя (процессор = false)
 std::string device_name();
 size_t local_mem();               // байт локальной памяти рабочей группы
 size_t max_group();               // потоков в группе (NVIDIA 1024, AMD и Intel 256)

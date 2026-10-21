@@ -589,6 +589,10 @@ const Page *g_page_for_mask = nullptr;   // заполняется на врем
 
 bool pattern_covers(int pattern, Pt pel, Pt mask_size, const Mask *mask, double x, double y) {
     auto band = [](double v, double pitch) { if (!(fabs(pitch) > 1e-9)) return true; return fmod(fabs(floor(v / fabs(pitch))), 2.0) < 1.0; };
+    // a mask the page never defined is drawn as cross-hatching: CBS ExtraVision sent its time zone map in 1984 with
+    // mask A (never defined in the record) and in 1987 the same drawing with cross-hatching; filled solid, the 1984
+    // Central zone (green on green) vanished
+    if (pattern >= 4 && (!mask || !mask->defined())) pattern = 3;
     if (pattern == 1) return band(x, pel.first);
     if (pattern == 2) return band(y, pel.second);
     if (pattern == 3) return band(x, pel.first) || band(y, pel.second);
@@ -621,6 +625,9 @@ const FaceDef *face_for(int gridw, int cols, int rows) {
 struct Rasteriser {
     Surface &s; double cpu, rpu;
     struct Traced { int c0, r0, w, h; std::vector<char> cells; } *traced = nullptr;
+    // fine hatching (pattern 1-3 with a pel of one or two receiver dots) runs together on a TV into one colour: the
+    // ink mixed with what it is drawn over (share = the part of the area the hatching covers); -1 — keep the dots
+    std::function<int(int under, int ink, double share)> mix;
     Rasteriser(Surface &surf, int gw, int gh, bool unit = false) : s(surf), cpu(gw), rpu(unit ? gh : gh / DISPLAY_H) {}
     Pt cp(Pt p) const { return {p.first * cpu, p.second * rpu}; }
     Pt cs(Pt z) const { return {z.first * cpu, z.second * rpu}; }
@@ -709,6 +716,8 @@ struct Rasteriser {
                 int y = idx / w, x = idx % w;
                 for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) { int yy = y + dy, xx = x + dx; if (yy >= 0 && yy < h && xx >= 0 && xx < w) nearv[yy * w + xx] = 1; }
             }
+        if (pattern >= 4 && (!mask || !mask->defined())) pattern = 3;   // as pattern_covers draws it
+        bool fine = mix && pattern >= 1 && pattern <= 3 && fabs(pel.first) <= 2.0 / 256 + 1e-9 && fabs(pel.second) <= 2.0 / 256 + 1e-9;
         std::vector<int> stack;
         for (int idx = 0; idx < w * h; idx++) if (!enclosed[idx] && !tr.cells[idx] && !nearv[idx]) { outside[idx] = 1; stack.push_back(idx); }
         while (!stack.empty()) {
@@ -720,6 +729,7 @@ struct Rasteriser {
         for (int row = std::max(r0, 0); row < std::min(r0 + h, H); row++)
             for (int col = std::max(c0, 0); col < std::min(c0 + w, W); col++) {
                 if (outside[(row - r0) * w + col - c0]) continue;
+                if (fine) { int m = mix(s.cells[row * W + col], ink, pattern == 3 ? 0.75 : 0.5); if (m >= 0) { s.set(row * W + col, m); continue; } }
                 if (pattern && !pattern_covers(pattern, pel, mask_size, mask, (col + 0.5) / cpu, (row + 0.5) / rpu)) continue;
                 s.set(row * W + col, ink);
             }
@@ -1575,6 +1585,16 @@ bool Player::advance(double T, bool all) {
     Surface surf(gw, gh); surf.cells.swap(cells); surf.log = logging ? &log : nullptr;
     Rasteriser ras(surf, gw, gh);
     PenFn pf = [this](const Ink &s) { return pen(s); };
+    ras.mix = [this](int under, int ink, double share) {
+        if (under < 0 || under >= (int)inks.size() || ink < 0 || ink >= (int)inks.size()) return -1;
+        auto steady = [&](const Ink &s) { return s.k == 'c' || !blink[((s.a % 16) + 16) % 16].set; };
+        const Ink a = inks[under], b = inks[ink];
+        if (!steady(a) || !steady(b)) return -1;
+        Col u = colour(a, -1), o = colour(b, -1);
+        if (u.t || o.t) return -1;
+        auto m = [&](int x, int y) { return (int)lround(y * share + x * (1 - share)); };
+        return pen(Ink{'c', {m(u.g, o.g), m(u.r, o.r), m(u.b, o.b), false}, 0});
+    };
     while (i_ < ev().size() && (all || ev()[i_].t <= T)) {
         const Event &e = ev()[i_++]; changed = true;
         if (e.type == 'p') draw_primitive(ras, *e.p, &page_, false, nullptr, pf);

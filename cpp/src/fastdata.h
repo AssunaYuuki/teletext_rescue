@@ -69,7 +69,8 @@ struct FastLineJob {
 // packets in time order. Lines it cannot learn are left out.
 std::vector<FastPacket> fdSecondPass(VbiFile& vf, const std::vector<FastLineJob>& jobs, int threads, std::atomic<bool>* cancel,
                                      const std::function<void(double)>& progress, const std::function<void(const std::string&)>& note,
-                                     std::vector<std::pair<int, int>>* rejected = nullptr); // (line, field) found not to be the kind
+                                     std::vector<std::pair<int, int>>* rejected = nullptr, // (line, field) found not to be the kind
+                                     bool gpu = false);   // the Viterbi of the original engine on the GPU (MlseBatch)
 
 struct FastReport {
     std::vector<std::string> lines;  // human readable summary

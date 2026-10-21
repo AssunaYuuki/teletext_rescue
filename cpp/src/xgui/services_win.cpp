@@ -316,12 +316,18 @@ struct CapWin : Win {
     {
         for (auto &li : R->lines) if (li.kind == "Captions" || li.kind.rfind("XDS", 0) == 0) where += (where.empty() ? "" : ", ") + fmt("line %d field %d", li.lineNo, li.field);
         std::map<std::string, int> n;
-        for (auto &l : R->captions) {
-            auto c = l.find(": ");
-            if (l.rfind("---", 0) == 0 || c == std::string::npos || c > 4) continue;
-            all.push_back({l.substr(0, c), l.substr(c + 2)});
-            if (!n[l.substr(0, c)]++) svcs.push_back(l.substr(0, c));
-        }
+        if (!R->captionCues.empty())   // with times: the tape's VITC or the place in the recording
+            for (auto &c : R->captionCues) {
+                all.push_back({c.svc, "[" + captionTime(*R, c.frame) + "] " + c.text});
+                if (!n[c.svc]++) svcs.push_back(c.svc);
+            }
+        else
+            for (auto &l : R->captions) {
+                auto c = l.find(": ");
+                if (l.rfind("---", 0) == 0 || c == std::string::npos || c > 4) continue;
+                all.push_back({l.substr(0, c), l.substr(c + 2)});
+                if (!n[l.substr(0, c)]++) svcs.push_back(l.substr(0, c));
+            }
         std::sort(svcs.begin(), svcs.end(), [](const std::string &a, const std::string &b) { return (a[0] == 'C') != (b[0] == 'C') ? a[0] == 'C' : a < b; });
         if (!svcs.empty()) cur = svcs[0];
         summary = fmt("%zu lines", all.size());

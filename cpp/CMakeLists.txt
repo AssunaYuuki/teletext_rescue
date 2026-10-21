@@ -33,8 +33,9 @@ set_source_files_properties(${LEGACY} PROPERTIES COMPILE_OPTIONS "-w")
 
 # OpenCL is loaded at run time (OpenCL.dll / libOpenCL / OpenCL.framework), no SDK needed.
 set(CORE
-  src/amol.cpp src/gemstar.cpp src/gemguide.cpp src/jtes.cpp src/tvinform.cpp src/tvinorpak.cpp src/onair.cpp src/ttpages.cpp src/export.cpp
-  src/decoder.cpp src/starsight.cpp src/textservices.cpp src/silentradio.cpp src/ssjson.cpp src/rescache.cpp src/colour.cpp src/legacy_bridge.cpp src/services.cpp src/linecolour.cpp
+  src/amol.cpp src/vitc.cpp src/gemstar.cpp src/gemguide.cpp src/jtes.cpp src/jtesrx.cpp src/tvinform.cpp src/tvinorpak.cpp src/tviftr3.cpp src/biznestext.cpp src/arjcheck.cpp src/finds.cpp src/pcxfix.cpp src/faxg4.cpp src/onair.cpp src/ttpages.cpp src/ttsquash.cpp src/vbirepair.cpp src/export.cpp
+  src/decoder.cpp src/ttdata.cpp src/starsight.cpp src/textservices.cpp src/silentradio.cpp src/ssjson.cpp src/rescache.cpp src/colour.cpp src/legacy_bridge.cpp src/services.cpp src/linecolour.cpp
+  src/live.cpp src/tvtime.cpp src/vbicodes.cpp
   src/flac.cpp src/vbifile.cpp src/slicer_cpu.cpp src/slicer_gpu.cpp src/fastdata.cpp src/fastmlse.cpp src/mlse.cpp
   src/speller.cpp src/ui/util.cpp src/ui/json.cpp
   src/nabts/nabts.cpp src/nabts/nabts_html.cpp src/nabts/teletext.cpp src/nabts/png.cpp src/nabts/saa5050.cpp src/nabts/wavetop.cpp
@@ -44,11 +45,11 @@ set(CORE
 if(WIN32)
   add_library(trcore STATIC ${CORE})
   target_include_directories(trcore PUBLIC src src/ui src/nabts)
-  set(LIBS trcore comctl32 uxtheme dwmapi gdi32 comdlg32 shell32 ole32 winhttp shlwapi advapi32 uuid winmm)
+  set(LIBS trcore comctl32 uxtheme dwmapi gdi32 comdlg32 shell32 ole32 winhttp shlwapi advapi32 uuid winmm strmiids oleaut32)
 
-  add_executable(TeletextRescue WIN32 src/gui_main.cpp src/gui_services.cpp src/gui_nabts.cpp src/gui_teletext.cpp src/gui_lines.cpp src/ui/gui_widgets.cpp src/app.rc)
+  add_executable(TeletextRescue WIN32 src/gui_main.cpp src/gui_services.cpp src/gui_finds.cpp src/gui_nabts.cpp src/gui_teletext.cpp src/gui_lines.cpp src/gui_capture.cpp src/gui_repair.cpp src/gui_vps.cpp src/capture.cpp src/ui/gui_widgets.cpp src/app.rc)
   target_link_libraries(TeletextRescue ${LIBS})
-  add_executable(trcli src/cli.cpp src/app.rc)
+  add_executable(trcli src/cli.cpp src/capture.cpp src/app.rc)
   target_link_libraries(trcli ${LIBS})
   if(MINGW)
     # src/nomanifest holds an empty default-manifest.o, so MinGW does not add a second manifest next to ours
@@ -90,7 +91,8 @@ else()
 endif()
 
 # The windowed program on Linux and macOS (TeletextRescue), and on Windows for testing (TeletextRescueX,
-# -DTR_XGUI=ON): SDL3 (fetched by CMake, built static) and Dear ImGui (src/third_party/imgui).
+# -DTR_XGUI=ON): SDL3 (fetched by CMake, built static) and Dear ImGui (src/third_party/imgui, docking branch: every
+# window of the program is a window of the system, drawn with OpenGL).
 option(TR_XGUI "build the SDL3 / Dear ImGui program" OFF)
 if(NOT WIN32 OR TR_XGUI)
   include(FetchContent)
@@ -108,7 +110,7 @@ if(NOT WIN32 OR TR_XGUI)
     set(XNAME TeletextRescue)
   endif()
   add_executable(${XNAME} ${XGUI} ${IMGUI}/imgui.cpp ${IMGUI}/imgui_draw.cpp ${IMGUI}/imgui_tables.cpp ${IMGUI}/imgui_widgets.cpp
-                 ${IMGUI}/backends/imgui_impl_sdl3.cpp ${IMGUI}/backends/imgui_impl_sdlrenderer3.cpp)
+                 ${IMGUI}/backends/imgui_impl_sdl3.cpp ${IMGUI}/backends/imgui_impl_opengl3.cpp)
   target_include_directories(${XNAME} PRIVATE ${IMGUI} src/xgui)
   target_link_libraries(${XNAME} trcore SDL3::SDL3-static)
   if(WIN32)
@@ -120,7 +122,11 @@ if(NOT WIN32 OR TR_XGUI)
     target_link_libraries(${XNAME} Threads::Threads ${CMAKE_DL_LIBS})
   endif()
   if(APPLE)
+    target_link_libraries(${XNAME} "-framework OpenGL")
+    target_compile_definitions(${XNAME} PRIVATE GL_SILENCE_DEPRECATION)
+  endif()
+  if(APPLE)
     set_target_properties(${XNAME} PROPERTIES MACOSX_BUNDLE TRUE MACOSX_BUNDLE_BUNDLE_NAME "Teletext Rescue"
-      MACOSX_BUNDLE_GUI_IDENTIFIER "io.github.assunayuuki.teletextrescue" MACOSX_BUNDLE_BUNDLE_VERSION "1.2" MACOSX_BUNDLE_SHORT_VERSION_STRING "1.2")
+      MACOSX_BUNDLE_GUI_IDENTIFIER "io.github.assunayuuki.teletextrescue" MACOSX_BUNDLE_BUNDLE_VERSION "1.3" MACOSX_BUNDLE_SHORT_VERSION_STRING "1.3")
   endif()
 endif()

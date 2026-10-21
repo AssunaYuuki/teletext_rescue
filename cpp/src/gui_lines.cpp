@@ -10,7 +10,10 @@
 //   lines (colour bars, ITS / VITS) and the SECAM identification show as a TV would.
 //   Right, bottom: the same line over the following frames (carousels and repeats show up as
 //   vertical patterns). Frame slider, Play, mouse wheel and arrow keys move through the recording.
+//   Opens without decoding too (File > View VBI lines): the signal of a line can be set by hand
+//   ("Line signal", right click on the raster) and the recording decoded with those line types.
 #include "gui_app.h"
+#include "vbirepair.h"
 #include "slicer.h"
 #include "linecolour.h"
 #include <windowsx.h>
@@ -48,6 +51,68 @@ struct LinesWin : Window {
     View view = WAVE;
     bool falseColour = false, secamColour = false, playing = false;
     double z0 = 0, z1 = 1;             // waveform zoom (share of the line)
+    std::map<int, LineForce> force;    // line index -> signal set by hand
+    HWND b_force = nullptr, b_decode = nullptr, b_layout = nullptr;
+    // VBI repair (VHSTTX): the lines shown repaired; the repair window writes the settings here and tells us
+    std::shared_ptr<VbiRepair> rep = std::make_shared<VbiRepair>();
+    static constexpr UINT WM_REPAIR = WM_APP + 7;
+    bool decoded() const { return !R->slicerName.empty(); }
+    LineForce force_of(int l) const { auto it = force.find(l); return it == force.end() ? LineForce::Auto : it->second; }
+    void update_force_button()
+    {
+        LineForce f = force_of(sel);
+        set_text(b_force, f == LineForce::Auto ? std::string("Line signal: automatic \xE2\x96\xBE") : std::string("Line signal: ") + lineForceKey(f) + " \xE2\x96\xBE");
+        set_button_style(b_force, f == LineForce::Auto ? BTN_NORMAL : BTN_ACCENT);
+        set_text(b_decode, force.empty() ? (decoded() ? "Decode again" : "Decode") : fmt("Decode with %zu line type%s", force.size(), force.size() == 1 ? "" : "s"));
+    }
+    // the menu of signals for the selected line
+    void pick_force(POINT at)
+    {
+        HMENU m = CreatePopupMenu();
+        for (int i = 0; i < (int)LineForce::Count; i++) {
+            if (g.pal ? (LineForce)i == LineForce::SilentRadio : ((LineForce)i == LineForce::Teletext625 || (LineForce)i == LineForce::Norpak)) continue;
+            AppendMenuW(m, MF_STRING | (force_of(sel) == (LineForce)i ? MF_CHECKED : 0), 700 + i, W(lineForceName((LineForce)i)).c_str());
+            if (i == 1) AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        }
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(m, MF_STRING | (force.empty() ? MF_GRAYED : 0), 699, L"All lines back to automatic");
+        int c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, at.x, at.y, 0, hwnd, nullptr);
+        DestroyMenu(m);
+        if (c == 699) force.clear();
+        else if (c >= 700) { if (c == 700) force.erase(sel); else force[sel] = (LineForce)(c - 700); }
+        else return;
+        update_force_button();
+        load();
+    }
+    // the layout (card / chip) the recording is read in: the ones its size allows; the lines are read
+    // again in the one picked and Decode uses it
+    void pick_layout(POINT at)
+    {
+        int64_t size = 0;
+        if (FILE *f = _wfopen(W(R->path).c_str(), L"rb")) { _fseeki64(f, 0, SEEK_END); size = _ftelli64(f); fclose(f); }
+        std::vector<VbiFormat> c = candidateFormats(size);
+        HMENU m = CreatePopupMenu();
+        for (size_t i = 0; i < c.size(); i++)
+            AppendMenuW(m, MF_STRING | (c[i] == g.format ? MF_CHECKED : 0), 800 + (UINT)i, W(std::string(formatKey(c[i])) + "  \xE2\x80\x94  " + formatName(c[i])).c_str());
+        int k = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, at.x, at.y, 0, hwnd, nullptr);
+        DestroyMenu(m);
+        if (k < 800 || k - 800 >= (int)c.size() || c[k - 800] == g.format) return;
+        VbiFile nf;
+        std::string err;
+        if (!nf.open(R->path, err, c[k - 800])) { ask(hwnd, "VBI lines", "Cannot open the recording so:\n" + err, MB_ICONERROR); return; }
+        vf.close();
+        vf.open(R->path, err, c[k - 800]);
+        g = vf.geom();
+        R->geom = g;
+        R->lines.clear();     // what the lines carried was found in the other layout
+        force.clear();
+        sel = std::min(sel, g.linesPerFrame - 1);
+        runFrom = -1;
+        SendMessageW(slider, TBM_SETRANGEMAX, TRUE, (LPARAM)std::max<int64_t>(0, g.frames - 1));
+        set_text(b_layout, std::string("Layout: ") + formatKey(g.format) + " \xE2\x96\xBE");
+        update_force_button();
+        load();
+    }
     int dragFrom = -1, dragTo = -1;    // waveform drag, pixels
     POINT mouse{-1, -1};
 
@@ -57,8 +122,9 @@ struct LinesWin : Window {
     double fs() const { return g.lineSamples * g.lineRate; }
     std::string line_label(int l) const
     {
-        int fld = l < g.linesPerFrame / 2 ? 1 : 2;
-        return fmt("%d f%d", g.firstLine + l % std::max(1, g.linesPerFrame / 2), fld);
+        int n, fld;
+        lineOf(g, l, n, fld);
+        return fmt("%d f%d", n, fld);
     }
     const LineInfo *info_of(int l) const
     {
@@ -73,6 +139,8 @@ struct LinesWin : Window {
         const std::string &k = li->kind;
         if (li->mode == MODE_TVINFORM) return kTviRateHz[li->tviRate == 0 ? 0 : 1];
         if (k.find("WST PAL") != std::string::npos || (g.pal && k.find("teletext") != std::string::npos)) return 6.9375e6;
+        // Norpak packets on 625 lines: the NTSC NABTS clock 364 x 15734.26 Hz
+        if (k.find("Norpak") != std::string::npos) return 364 * 4.5e6 / 286;
         if (k.find("VPS") != std::string::npos) return 2.5e6;
         if (k.find("WSS") != std::string::npos) return 5e6 / 6 * 3;
         if (li->mode == MODE_FAST || k.find("NABTS") != std::string::npos || k.find("Didon") != std::string::npos) return g.pal ? 6.9375e6 : 364 * g.lineRate;
@@ -84,19 +152,25 @@ struct LinesWin : Window {
     void load()
     {
         frame = std::max<int64_t>(0, std::min<int64_t>(frame, g.frames - 1));
-        if (vf.read(frame, 1, cur) < 1) cur.assign(g.frameBytes(), 0);
         if (runFrom != frame) {
             run.clear();
             vf.read(frame, kHist, run);
             run.resize((size_t)kHist * g.frameBytes(), 0);
             runFrom = frame;
+            if (rep->active()) {   // the frames in order through one repairer (temporal controls)
+                VbiRepairer rr(*rep);
+                for (int k = 0; k < kHist; k++) rr.frame(&run[(size_t)k * g.frameBytes()], g);
+            }
         }
+        cur.assign(run.begin(), run.begin() + g.frameBytes());
         SendMessageW(slider, TBM_SETPOS, TRUE, (LPARAM)(frame));
         const LineInfo *li = info_of(sel);
         double fr = frame_rate(*R);
         std::string s = fmt("frame %lld of %lld  \xC2\xB7  %s  \xC2\xB7  line %s", (long long)frame + 1, (long long)g.frames,
                             rec_time(frame / fr).c_str(), line_label(sel).c_str());
         if (li) s += "  \xC2\xB7  " + li->kind + fmt(" (signal %.0f%%)", li->detectRate * 100);
+        else if (!decoded()) s += "  \xC2\xB7  not decoded";
+        if (force_of(sel) != LineForce::Auto) s += std::string("  \xC2\xB7  set by hand: ") + lineForceName(force_of(sel));
         double ck = clock_of(sel);
         if (ck > 0) s += fmt("  \xC2\xB7  clock %.4f MHz = %.2f samples/bit", ck / 1e6, fs() / ck);
         s += fmt("  \xC2\xB7  %.2f MHz sampling", fs() / 1e6);
@@ -486,9 +560,13 @@ struct LinesWin : Window {
         for (int l = 0; l < L; l++) {
             int y0 = img.top + (int)(l * rh), y1 = img.top + (int)((l + 1) * rh);
             const LineInfo *li = info_of(l);
+            const LineForce fl = force_of(l);
             RECT m{rast.left + lab, y0 + 1, rast.left + lab + mark, std::max(y0 + 2, y1 - 1)};
-            fill(dc, m, li ? service_colour(li->kind) : service_colour("empty"));
-            if (rh >= S(hwnd, 11)) text_out(dc, rast.left + S(hwnd, 6), y0 + (int)(rh - S(hwnd, 13)) / 2, line_label(l), l == sel ? ACCENT : MUTED, small);
+            static const char *const kForceKind[] = {"", "empty", "CC", "Silent Radio", "AMOL", "Gemstar", "TV-Inform", "TV-Inform", "NABTS", "WST", "VITC", "test", "TV-Inform packets (Norpak, 55 55 E7)"};
+            fill(dc, m, fl != LineForce::Auto ? service_colour(kForceKind[(int)fl]) : li ? service_colour(li->kind) : service_colour("empty"));
+            if (rh >= S(hwnd, 11))
+                text_out(dc, rast.left + S(hwnd, 6), y0 + (int)(rh - S(hwnd, 13)) / 2, line_label(l) + (fl != LineForce::Auto ? " *" : ""),
+                         l == sel ? ACCENT : fl != LineForce::Auto ? ACCENT2 : MUTED, small);
             if (l == sel) {
                 HPEN pen = CreatePen(PS_SOLID, std::max(1, S(hwnd, 2)), ACCENT); HGDIOBJ op = SelectObject(dc, pen);
                 HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
@@ -529,13 +607,17 @@ struct LinesWin : Window {
         switch (m) {
         case WM_CREATE: {
             dark_window(hwnd);
-            hd.create(hwnd, "VBI lines", file_name(*R) + " \xC2\xB7 " + formatName(R->geom.format));
+            hd.create(hwnd, "VBI lines", file_name(*R) + " \xC2\xB7 " + formatName(R->geom.format) + (decoded() ? "" : " \xC2\xB7 not decoded"));
+            b_force = hd.add(hwnd, 520, "Line signal", 190);
+            b_decode = hd.add(hwnd, 521, "Decode", 170);
+            b_layout = hd.add(hwnd, 523, std::string("Layout: ") + formatKey(R->geom.format) + " \xE2\x96\xBE", 190);
             b_play = hd.add(hwnd, 506, "\xE2\x96\xB6 Play", 80);
             hd.add(hwnd, 501, "\xE2\x97\x80\xE2\x97\x80 1 s", 70);
             hd.add(hwnd, 502, "\xE2\x97\x80 frame", 76);
             hd.add(hwnd, 503, "frame \xE2\x96\xB6", 76);
             hd.add(hwnd, 504, "1 s \xE2\x96\xB6\xE2\x96\xB6", 70);
             hd.add(hwnd, 505, "Save PNG\xE2\x80\xA6", 96);
+            hd.add(hwnd, 522, "VBI repair\xE2\x80\xA6", 110);
             std::string err;
             if (!vf.open(R->path, err, R->geom.format)) { ask(hwnd, "VBI lines", "Cannot open the recording:\n" + err, MB_ICONERROR); return -1; }
             g = vf.geom();
@@ -557,6 +639,9 @@ struct LinesWin : Window {
             if (R->colour == "SECAM" || tests) { secamColour = true; set_checked(b_secam, true); }
             // start on the first line the decoder found something on
             for (auto &li : R->lines) if (li.mode != MODE_TEST) { sel = li.index; break; }
+            force = R->lineForce;
+            for (auto it = force.begin(); it != force.end();) it = it->second == LineForce::Auto ? force.erase(it) : std::next(it);
+            update_force_button();
             load();
             return 0;
         }
@@ -606,7 +691,7 @@ struct LinesWin : Window {
             POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
             SetFocus(hwnd);
             int top = rast.top + S(hwnd, 6), h = rast.bottom - S(hwnd, 6) - top;
-            if (PtInRect(&rast, pt) && h > 0) { sel = std::max(0, std::min(g.linesPerFrame - 1, (int)((pt.y - top) * (int64_t)g.linesPerFrame / h))); z0 = 0; z1 = 1; load(); }
+            if (PtInRect(&rast, pt) && h > 0) { sel = std::max(0, std::min(g.linesPerFrame - 1, (int)((pt.y - top) * (int64_t)g.linesPerFrame / h))); z0 = 0; z1 = 1; update_force_button(); load(); }
             int ht = hist.top + S(hwnd, 22), hh = hist.bottom - S(hwnd, 6) - ht;
             if (PtInRect(&hist, pt) && hh > 0 && pt.y >= ht) go(frame + (pt.y - ht) * (int64_t)kHist / hh);
             if (view == WAVE && PtInRect(&plot, pt)) { dragFrom = dragTo = pt.x; SetCapture(hwnd); }
@@ -624,7 +709,18 @@ struct LinesWin : Window {
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             return 0;
-        case WM_RBUTTONDOWN: z0 = 0; z1 = 1; InvalidateRect(hwnd, nullptr, FALSE); return 0;
+        case WM_RBUTTONDOWN: {
+            POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+            int top = rast.top + S(hwnd, 6), h = rast.bottom - S(hwnd, 6) - top;
+            if (PtInRect(&rast, pt) && h > 0) {   // right click on a line: its signal
+                sel = std::max(0, std::min(g.linesPerFrame - 1, (int)((pt.y - top) * (int64_t)g.linesPerFrame / h)));
+                update_force_button(); load();
+                ClientToScreen(hwnd, &pt);
+                pick_force(pt);
+                return 0;
+            }
+            z0 = 0; z1 = 1; InvalidateRect(hwnd, nullptr, FALSE); return 0;
+        }
         case WM_KEYDOWN:
             switch (w) {
             case VK_LEFT: go(frame - 1); break;
@@ -633,12 +729,13 @@ struct LinesWin : Window {
             case VK_NEXT: go(frame + 25); break;
             case VK_HOME: go(0); break;
             case VK_END: go(g.frames - 1); break;
-            case VK_UP: sel = (sel + g.linesPerFrame - 1) % g.linesPerFrame; load(); break;
-            case VK_DOWN: sel = (sel + 1) % g.linesPerFrame; load(); break;
+            case VK_UP: sel = (sel + g.linesPerFrame - 1) % g.linesPerFrame; update_force_button(); load(); break;
+            case VK_DOWN: sel = (sel + 1) % g.linesPerFrame; update_force_button(); load(); break;
             case VK_SPACE: SendMessageW(hwnd, WM_COMMAND, 506, 0); break;
             }
             return 0;
         case WM_GETDLGCODE: return DLGC_WANTARROWS;
+        case WM_REPAIR: runFrom = -1; load(); return 0;
         case WM_COMMAND: {
             int id = LOWORD(w);
             int64_t sec = (int64_t)std::lround(frame_rate(*R));
@@ -654,6 +751,35 @@ struct LinesWin : Window {
             else if (id == 515) set_view(FM);
             else if (id == 513) { falseColour = !falseColour; set_checked(b_colour, falseColour); InvalidateRect(hwnd, nullptr, FALSE); }
             else if (id == 514) { secamColour = !secamColour; set_checked(b_secam, secamColour); load(); }
+            else if (id == 520) { RECT br; GetWindowRect(b_force, &br); pick_force({br.left, br.bottom}); }
+            else if (id == 523) { RECT br; GetWindowRect(b_layout, &br); pick_layout({br.left, br.bottom}); }
+            else if (id == 522) {
+                HWND me = hwnd;
+                auto sp = rep;
+                std::string src = R->source.empty() ? R->path : R->source;
+                VbiFormat fmtv = R->geom.format;
+                RepairSource rs;
+                rs.path = src;
+                rs.format = (int)fmtv;
+                rs.frame = [this, me]() -> int64_t { return IsWindow(me) ? frame : 0; };
+                rs.lineName = [this, me](int l) { return IsWindow(me) ? line_label(l) : std::to_string(l); };
+                rs.go = [this, me](int64_t f) { if (IsWindow(me)) go(f); };
+                repair_window(hwnd, file_name(*R) + " \xC2\xB7 the lines here are shown repaired",
+                              [me, sp](const VbiRepair& r) { *sp = r; if (IsWindow(me)) SendMessageW(me, WM_REPAIR, 0, 0); },
+                              {{"Save a repaired copy and decode it\xE2\x80\xA6", [me, src, fmtv](const VbiRepair& r) {
+                                    std::string out = save_file(me, "Repaired copy of the recording", stem_path(basename(src)) + "_repaired.vbi", "vbi");
+                                    if (out.empty()) return;
+                                    run_task(me, "VBI repair", [src, out, fmtv, r](Progress& pr) {
+                                        std::string err;
+                                        pr.step("repairing the VBI lines (" + r.text() + ")");
+                                        if (!vbiRepairFile(src, out, fmtv, r, [&](double x) { pr.progress((long long)(x * 1000), 1000); }, &pr.cancel, err)) throw std::runtime_error(err);
+                                    }, [out](bool ok) { if (ok && open_recording_hook()) open_recording_hook()(out); });
+                                }}}, &rs);
+            }
+            else if (id == 521) {
+                if (decode_lines_hook()) decode_lines_hook()(R->source.empty() ? R->path : R->source, R->geom.format, force);
+                return 0;
+            }
             else if (id == 505) {
                 std::string out = save_file(hwnd, "Save the frame raster", stem_path(file_name(*R)) + fmt("_frame%lld.png", (long long)frame), "png");
                 if (!out.empty()) {

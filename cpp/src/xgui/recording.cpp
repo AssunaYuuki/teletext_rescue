@@ -14,13 +14,14 @@ struct RecWin : Win {
     void build()
     {
         const VbiGeometry &g = R->geom;
-        int per = std::max(1, g.linesPerFrame / 2), f2 = g.pal ? 313 : 263;
+        int per = std::max(1, g.linesPerFrame / 2);
         for (int f = 1; f <= 2; f++)
             for (int i = 0; i < per; i++) {
-                int line = g.firstLine + i;
-                Row r{line + (f == 2 ? f2 : 0), "empty", "", 0};
+                int l = (f - 1) * per + i, line, fld;
+                lineOf(g, l, line, fld);
+                Row r{tvLineOf(g, l), "empty", "", 0};
                 for (auto &li : R->lines)
-                    if (li.lineNo == line && li.field == f) {
+                    if (li.lineNo == line && li.field == fld) {
                         std::string k = li.kind;
                         r.read = li.detectRate;
                         if (k == "StarSight") { r.kind = "StarSight"; r.text = "StarSight programme guide"; }

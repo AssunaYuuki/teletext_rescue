@@ -34,6 +34,7 @@ struct Rec {
     int rec_lines = 0, rec_len = 0, bytes_per = 1;   // геометрия файла
     bool is_ntsc = false; double t27 = 0;
     Rec(const std::string &path, const std::string &fmt);
+    void number_by_sync();
     std::vector<float> line(int u, int r) const;
     void line(int u, int r, float *out) const;
     int t27_start() const { return (int)(ns * t27); }
@@ -49,7 +50,7 @@ private:
 };
 
 std::pair<std::string, Json> detect_format(const std::string &path);   // формат или "", кандидаты
-Json vbi_probe(const std::string &path, Progress &pr, int units = 240);
+Json vbi_probe(const std::string &path, Progress &pr, int units = 240, const std::string &force = "");   // force: format name (no detection)
 double zc_coherence(const float *y, double fs, double rate, int lo, int hi);
 
 // EIA-608: 2 байта или пусто

@@ -197,7 +197,7 @@ struct NabtsWin : Window {
 
 void nabts_window(HWND owner, const ResultPtr &r) {
     auto *w = new NabtsWin; w->R = r; w->path = r->path;
-    w->create(L"TRNabts", "NABTS â " + file_name(*r), WS_OVERLAPPEDWINDOW, S(owner, 1300), S(owner, 860), owner);
+    w->create(L"TRNabts", "NABTS \xE2\x80\x94 " + file_name(*r), WS_OVERLAPPEDWINDOW, S(owner, 1300), S(owner, 860), owner);
     ShowWindow(w->hwnd, SW_SHOW);
 }
 }

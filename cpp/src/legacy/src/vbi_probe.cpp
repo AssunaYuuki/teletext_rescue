@@ -51,6 +51,56 @@ Rec::Rec(const std::string &p, const std::string &f) : path(p), fmt(f) {
     for (int i = 0; i < F->n2; i++) { int r = rec_lines / 2 + F->skip2 + i; rows.push_back(r); tv[r] = F->first2 + i; }
     n = (int)(size / ((uint64_t)rec_lines * rec_len * bytes_per));
     if (fmt == "4fsc16") number_by_cc();
+    else if (!is_ntsc && !F->field_unit) number_by_sync();
+}
+
+// 625 lines: a recording that holds the field sync is numbered from it (as VbiFile::numberBySync):
+// broad pulses over both halves of lines 1, 2 and the first half of 3; the second half of 313, both of 314, 315
+void Rec::number_by_sync() {
+    if (n < 20 || rec_lines < 6) return;
+    const int half = rec_lines / 2, frames = 24;
+    std::vector<float> lv;
+    std::vector<int> us;
+    for (int k = 0; k < frames; k++) us.push_back((int)((int64_t)n * (k + 1) / (frames + 2)));
+    for (int u : us)
+        for (int r = 0; r < rec_lines; r++) { auto y = line(u, r); for (int i = 0; i < ns; i += 4) lv.push_back(y[i]); }
+    std::sort(lv.begin(), lv.end());
+    double syncLv = lv[lv.size() / 100], blank = lv[lv.size() / 2];
+    if (getenv("TR_DEBUG")) fprintf(stderr, "number_by_sync: %s n %d, sync %.0f blank %.0f\n", fmt.c_str(), n, syncLv, blank);
+    if (blank - syncLv < 20) return;
+    double thr = syncLv + (blank - syncLv) * 0.3;
+    // each frame votes (tvinfoorm.vbi swaps its fields in the middle of the recording)
+    auto broad = [](double v) { return v > 0.5; };
+    auto none = [](double v) { return v < 0.25; };
+    std::map<std::pair<int, int>, int> votes;
+    for (int u : us) {
+        std::vector<double> a(rec_lines, 0), b(rec_lines, 0);
+        for (int r = 0; r < rec_lines; r++) {
+            auto y = line(u, r);
+            int ca = 0, cb = 0;
+            for (int i = 0; i < ns; i++) if (y[i] <= thr) (i < ns / 2 ? ca : cb)++;
+            a[r] = (double)ca / (ns / 2);
+            b[r] = (double)cb / (ns - ns / 2);
+        }
+        int f[2] = {0, 0};
+        for (int h = 0; h < 2; h++)
+            for (int k = 0; k + 2 < half && !f[h]; k++) {
+                int r = h * half + k;
+                if (broad(a[r]) && broad(b[r]) && broad(a[r + 1]) && broad(b[r + 1]) && broad(a[r + 2]) && none(b[r + 2]))
+                    f[h] = (1 - k + 625 - 1) % 625 + 1;
+                else if (none(a[r]) && broad(b[r]) && broad(a[r + 1]) && broad(b[r + 1]) && broad(a[r + 2]) && broad(b[r + 2]))
+                    f[h] = (313 - k + 625 - 1) % 625 + 1;
+            }
+        if (f[0] && f[1] && (f[0] > 313) != (f[1] > 313)) votes[{f[0], f[1]}]++;
+    }
+    std::pair<int, int> best{0, 0};
+    int bestN = 0;
+    for (auto &kv : votes) if (kv.second > bestN) { bestN = kv.second; best = kv.first; }
+    if (getenv("TR_DEBUG")) fprintf(stderr, "number_by_sync: sync %.0f blank %.0f, best %d/%d votes %d of %d\n", syncLv, blank, best.first, best.second, bestN, frames);
+    // the same place in (nearly) every frame (a VCR in pause makes its own sync at another place)
+    if (bestN * 10 < frames * 9) return;
+    int first[2] = {best.first, best.second};
+    for (int r : rows) { int h = r < half ? 0 : 1; tv[r] = (first[h] - 1 + r % half) % 625 + 1; }
 }
 
 void Rec::line(int u, int r, float *out) const {
@@ -568,8 +618,12 @@ static void confirm(const Rec &R, Json &res, Progress &pr) {
         for (int u = par >= 0 ? par : 0; u < R.n && uu.size() < 300; u += step) uu.push_back(u);
         // телетекст PAL, который не узнали по такту (VHS: срез по белому, строка то с ИТС, то с телетекстом).
         // Обратно не понижаем: у изношенной головки вступления почти нет, а строка всё равно телетекст.
-        if (!R.ntsc() && (k.rfind("picture", 0) == 0 || k.rfind("test signal (VITS)", 0) == 0 || k == "unknown" ||
-                          k.rfind("interference", 0) == 0 || k.rfind("data at", 0) == 0)) {
+        // A line that hardly changes from frame to frame is a test signal: a multiburst passes for a run-in
+        // (Бизнес-Текст tape 1996, line 18: static 0.80, its teletext lines 0.18-0.22)
+        if (!R.ntsc() && L.get_num("static") < 0.7 &&
+            // (and "CC" on a 625-line tape: copy-protection pulses at 0.5 MHz over the teletext, BT848 1996 tape, field 1)
+            (k.rfind("picture", 0) == 0 || k.rfind("test signal (VITS)", 0) == 0 || k == "unknown" || k == "CC (line 21)" ||
+             k.rfind("interference", 0) == 0 || k.rfind("data at", 0) == 0)) {
             std::vector<int> u60;
             for (size_t i = 0; i < uu.size() && u60.size() < 60; i += std::max<size_t>(1, uu.size() / 60)) u60.push_back(uu[i]);
             double sh = wst_cri_share(R, row, u60);
@@ -616,9 +670,16 @@ static void confirm(const Rec &R, Json &res, Progress &pr) {
     if (any_nabts)
         for (auto &L : res["lines"].a)
             if (L["kind"].str().rfind("data at 5.73", 0) == 0 && L.get_num("read") >= 0.1) L["kind"] = "NABTS";
+    // 625 lines: 5.73 Mbit/s packets on GOST lines 7-9 / 320-322 are ТВ-информ sent with Norpak equipment, even
+    // where the 55 55 E7 prefix reads too badly for the NABTS test (ORT 08.06.2000, lines 7 / 320: the
+    // datacast reader took them for PBS National Datacast, which never ran on 625 lines)
     if (!R.ntsc())
-        for (auto &L : res["lines"].a)
+        for (auto &L : res["lines"].a) {
+            int tvl = L["tv_line"].integer();
+            bool gost = (tvl >= 7 && tvl <= 9) || (tvl >= 320 && tvl <= 322);
+            if (gost && L["kind"].str().rfind("encrypted datacast", 0) == 0) L["kind"] = "NABTS";
             if (L["kind"].str() == "NABTS") L["label"] = "TV-Inform packets (Norpak equipment, 55 55 E7, 5.73 Mbit/s)";
+        }
     // AMOL (Nielsen, строки 20/22) и VITC — на строках с сигналом, где служба не опознана
     double fh = R.ntsc() ? 15734.264 : 15625.0;
     for (auto &L : res["lines"].a) {
@@ -648,8 +709,8 @@ static void confirm(const Rec &R, Json &res, Progress &pr) {
     }
 }
 
-Json vbi_probe(const std::string &path, Progress &pr, int units) {
-    auto fc = detect_format(path);
+Json vbi_probe(const std::string &path, Progress &pr, int units, const std::string &force) {
+    auto fc = force.empty() ? detect_format(path) : std::make_pair(force, Json());
     Json res = Json::object();
     res["file"] = abspath(path);
     if (fc.first.empty()) { res["format"] = Json(); res["lines"] = Json::array(); return res; }
@@ -666,7 +727,9 @@ Json vbi_probe(const std::string &path, Progress &pr, int units) {
             allv.insert(allv.end(), s.begin(), s.end()); stds.push_back(stdev(s));
         }
     double span = percentile(allv, 99.5) - percentile(allv, 0.5);
-    double thr = std::max(0.05 * span, 3 * percentile(stds, 10));
+    // 3 x the quietest lines, but no more than 15% of the span: on a SECAM tape every line of the
+    // bt8x8 window carries something (colour identification), and that threshold hid the teletext lines
+    double thr = std::max(0.05 * span, std::min(3 * percentile(stds, 10), 0.15 * span));
     Json lines = Json::array();
     bool fld = R.unit == "field";
     int nk = 0, nkeys = (int)R.rows.size() * (fld ? 2 : 1);
@@ -773,6 +836,44 @@ static double cubic(double x, const float *y, int n) {
     return p1 + 0.5 * t * (p2 - p0 + t * (2 * p0 - 5 * p1 + 4 * p2 - p3 + t * (3 * (p1 - p2) + p3 - p0)));
 }
 
+// Начало вступления по разбросу между кадрами: вступление и код 0x27 одинаковы в каждой строке,
+// а с адреса пакета (бит 24) сигнал меняется. На VHS-записи с SECAM (кассета 1995 г. через SAA7231)
+// вступление 1010 срезано полосой магнитофона и корреляция его не находит или находит не там.
+static double wst_start_by_spread(const Rec &R) {
+    double spb = R.fs / 6.9375e6;
+    int box = std::max(1, (int)lround(R.fs / 4.4e6));   // the SECAM chroma subcarrier (~4.25-4.4 MHz) falls into the null
+    std::vector<double> starts;
+    for (int r : R.rows) {
+        std::vector<double> s1(R.ns, 0), s2(R.ns, 0), y2(R.ns);
+        auto uu = linspace_int(0, R.n - 1, 200);
+        for (int u : uu) {
+            auto y = R.line(u, r);
+            double acc = 0;
+            for (int q = 0; q < R.ns; q++) {
+                acc += y[q] - (q >= box ? y[q - box] : 0);
+                y2[q] = acc / std::min(q + 1, box);
+            }
+            for (int q = 0; q < R.ns; q++) { s1[q] += y2[q]; s2[q] += y2[q] * y2[q]; }
+        }
+        std::vector<double> sd(R.ns);
+        for (int q = 0; q < R.ns; q++) { double m = s1[q] / uu.size(); sd[q] = sqrt(std::max(0.0, s2[q] / uu.size() - m * m)); }
+        std::vector<double> mid(sd.begin() + R.ns / 3, sd.begin() + 2 * R.ns / 3);
+        double ref = median(mid);
+        // the run-in + framing code: >= 12 bits that barely change between frames, then the packet
+        int w = std::max(2, (int)(spb * 2)), quiet = (int)(12 * spb), first = -1, still = 0;
+        for (int q = 0; q + w < R.ns / 2 && first < 0; q++) {
+            double a = 0; for (int k = 0; k < w; k++) a += sd[q + k];
+            a /= w;
+            if (a < 0.35 * ref) still++;
+            else if (a > 0.6 * ref && still >= quiet) first = q + w / 2;
+            else if (a > 0.6 * ref) still = 0;
+        }
+        if (getenv("TR_DEBUG")) fprintf(stderr, "row %d: spread rises at %d (ref %.1f)\n", r, first, ref);
+        if (first >= 0 && ref > 3) starts.push_back(first - 24 * spb);
+    }
+    return starts.empty() ? -1e9 : median(starts);
+}
+
 void wst_to_bt8x8(const Rec &R, const std::string &out, Progress &pr) {
     const double BT_FS = 35468950.0, BT_START = 110;   // где у bt8x8 начинается вступление (замер по пяти записям)
     bool fld = R.unit == "field";
@@ -783,6 +884,52 @@ void wst_to_bt8x8(const Rec &R, const std::string &out, Progress &pr) {
         for (int u : linspace_int(0, R.n - 1, 40)) uu.push_back(u);
         double p = 0;
         if (wst_cri_share(R, r, uu, &p) >= 0.25) pos.push_back(p);
+    }
+    double bySpread = wst_start_by_spread(R);
+    // which start reads the framing code 0x27 (bits 16-23, one bit error allowed) on more lines
+    auto framing = [&](double s0) {
+        double spb = R.fs / 6.9375e6;
+        int ok = 0;
+        std::vector<float> y(R.ns);
+        for (int r : R.rows)
+            for (int u : linspace_int(0, R.n - 1, 40)) {
+                R.line(u, r, y.data());
+                int e = std::min(R.ns, (int)(s0 + 46 * 8 * spb));
+                if (s0 < 0 || e <= (int)s0 + 24 * spb) continue;
+                double m = 0; for (int q = (int)s0; q < e; q++) m += y[q];
+                m /= e - (int)s0;
+                int v = 0;
+                for (int k = 0; k < 8; k++) {
+                    int q = (int)lround(s0 + (16 + k + 0.5) * spb);
+                    if (q < R.ns && y[q] > m) v |= 1 << k;
+                }
+                ok += __builtin_popcount(v ^ 0x27) <= 1;
+            }
+        return ok;
+    };
+    if (bySpread > -50 && !pos.empty() && fabs(median(pos) - bySpread) > 6 * R.fs / 6.9375e6) {
+        // each estimate may be off by a few samples (the run-in cut by the capture window, tape jitter):
+        // both are moved within one bit to where the framing code reads best, then compared
+        auto refine = [&](double s, int &ok) {
+            double spb = R.fs / 6.9375e6, best = s;
+            ok = -1;
+            for (double d = -spb; d <= spb + 1e-9; d += 0.5) {
+                int v = framing(s + d);
+                if (v > ok) { ok = v; best = s + d; }
+            }
+            return best;
+        };
+        int a, b;
+        double byCorr = refine(median(pos), a);
+        bySpread = refine(bySpread, b);
+        pr.log(fmt("%s: run-in by correlation at %.1f (framing code on %d lines), by the change between frames at %.1f (%d lines)", R.fmt.c_str(),
+                   byCorr, a, bySpread, b));
+        if (a >= b) { bySpread = -1e9; pos.assign(1, byCorr); }
+    }
+    if (bySpread > -50 && (pos.empty() || fabs(median(pos) - bySpread) > 6 * R.fs / 6.9375e6)) {
+        pr.log(fmt("%s: run-in by correlation %s, by the change between frames at %.1f: taking that (tape)", R.fmt.c_str(),
+                   pos.empty() ? "not found" : fmt("at %.1f", median(pos)).c_str(), bySpread));
+        pos.assign(1, std::max(0.0, bySpread));
     }
     if (pos.empty()) throw std::runtime_error("no teletext run-in found on any line of the recording");
     double src0 = median(pos), k = R.fs / BT_FS;

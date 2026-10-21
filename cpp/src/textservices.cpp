@@ -57,7 +57,8 @@ struct CcRow {
 };
 } // namespace
 
-void ccDecodeCaptions(const std::vector<uint8_t>& bytes, std::vector<std::string>& lines, int firstChannel)
+void ccDecodeCaptions(const std::vector<uint8_t>& bytes, std::vector<std::string>& lines, int firstChannel,
+                      const std::vector<int64_t>* frames, std::vector<CaptionCue>* cues)
 {
     // A field carries two channels (control byte 0x10-0x17 vs 0x18-0x1F),
     // each in caption mode (CC) or text mode (T, entered with TR/RTD).
@@ -68,14 +69,28 @@ void ccDecodeCaptions(const std::vector<uint8_t>& bytes, std::vector<std::string
     int ch = 0;
     bool inXds = false;
     uint8_t p1 = 0, p2 = 0;
+    size_t at = 0;   // byte index being read
     auto flush = [&](int k) {
         std::string s = row[k].str();
-        if (!s.empty() && s != last[k])
-            lines.push_back(std::string(k & 1 ? "T" : "CC") + std::to_string(firstChannel + (k >> 1)) + ": " + s);
+        if (!s.empty() && s != last[k]) {
+            std::string svc = std::string(k & 1 ? "T" : "CC") + std::to_string(firstChannel + (k >> 1));
+            lines.push_back(svc + ": " + s);
+            if (cues && frames && !frames->empty()) {
+                CaptionCue c;
+                c.frame = (*frames)[std::min(at / 2, frames->size() - 1)];
+                c.svc = svc;
+                c.text = s;
+                // EDM / a new caption takes the one before off the screen
+                for (auto it = cues->rbegin(); it != cues->rend(); ++it)
+                    if (it->svc == svc) { if (it->end < 0) it->end = c.frame; break; }
+                cues->push_back(std::move(c));
+            }
+        }
         if (!s.empty()) last[k] = s;
         row[k].clear();
     };
     for (size_t i = 0; i + 1 < bytes.size(); i += 2) {
+        at = i;
         uint8_t b1 = bytes[i], b2 = bytes[i + 1];
         if (!oddParity(b1) || !oddParity(b2)) continue;
         uint8_t c1 = b1 & 0x7F, c2 = b2 & 0x7F;
@@ -99,8 +114,15 @@ void ccDecodeCaptions(const std::vector<uint8_t>& bytes, std::vector<std::string
                 case 0x21: if (row[k].cursor) row[k].cursor--; break;       // backspace
                 case 0x24: row[k].cells.resize(row[k].cursor); break;       // delete to end of row
                 case 0x2D: flush(k); break;                                 // carriage return
-                case 0x2C:
-                case 0x2F: flush(ch * 2); break;                            // EDM, EOC
+                case 0x2C:                                                  // EDM: the screen goes blank
+                    flush(ch * 2);
+                    if (cues && frames && !frames->empty()) {
+                        std::string svc = "CC" + std::to_string(firstChannel + ch);
+                        for (auto it = cues->rbegin(); it != cues->rend(); ++it)
+                            if (it->svc == svc) { if (it->end < 0) it->end = (*frames)[std::min(at / 2, frames->size() - 1)]; break; }
+                    }
+                    break;
+                case 0x2F: flush(ch * 2); break;                            // EOC
                 case 0x20: case 0x25: case 0x26: case 0x27: case 0x29:       // caption modes
                     flush(ch * 2);
                     text[ch] = false;

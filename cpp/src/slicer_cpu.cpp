@@ -1,7 +1,10 @@
 #include "slicer.h"
 #include "slicer_core.h"
 #include "fastdata_core.h"
+#include "jtes_core.h"
 #include <algorithm>
+#include <atomic>
+#include <functional>
 #include <thread>
 
 namespace {
@@ -63,8 +66,48 @@ public:
         return true;
     }
 
+    bool jtesLines(const uint8_t* lines, int64_t nLines, int n, std::string&) override
+    {
+        jl_ = lines; jn_ = nLines; jw_ = n;
+        return true;
+    }
+    bool jtesDecode(const std::vector<JtesJob>& jobs, std::vector<JtesOut>& out, std::string&) override
+    {
+        out.assign(jobs.size(), JtesOut());
+        each(jobs.size(), [&](size_t i) {
+            std::vector<unsigned long long> back(299);
+            const JtesJob& j = jobs[i];
+            JtesOut& o = out[i];
+            jt_decode(jl_ + (size_t)j.line * jw_, jw_, j.st, j.spb, j.h, back.data(), o.word, o.bits, &o.cost, &o.ec);
+        });
+        return true;
+    }
+    bool jtesCand(const std::vector<int>& lines, const float* pred, std::vector<JtesCand>& out, std::string&) override
+    {
+        out.assign(lines.size(), JtesCand());
+        each(lines.size(), [&](size_t i) {
+            std::vector<float> costs(1128);
+            JtesCand& c = out[i];
+            jt_cand(jl_ + (size_t)lines[i] * jw_, jw_, pred, costs.data(), c.st, c.spb, &c.n, &c.fit);
+        });
+        return true;
+    }
+
 private:
+    // f(0 .. n-1) over the threads
+    void each(size_t n, const std::function<void(size_t)>& f)
+    {
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> pool;
+        int nt = (int)std::min<size_t>(threads_, std::max<size_t>(1, n / 4));
+        for (int t = 0; t < nt; t++)
+            pool.emplace_back([&] { for (size_t i; (i = next++) < n;) f(i); });
+        for (auto& th : pool) th.join();
+    }
     int threads_;
+    const uint8_t* jl_ = nullptr;
+    int64_t jn_ = 0;
+    int jw_ = 0;
 };
 
 } // namespace

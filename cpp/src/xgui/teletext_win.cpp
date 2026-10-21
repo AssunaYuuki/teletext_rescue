@@ -272,22 +272,35 @@ struct TtWin : Win {
             status("saved: " + f);
         });
     }
-    void do_squash()
+    // Clean (this program's way) or Squash of VHSTTX 2.7 (how = "auto", "v1", "v3" or a profile); in the cleaned
+    // view either goes back to the pages as received
+    void do_squash(const std::string &how = "")
     {
         if (cur.empty()) return;
         if (projDir != R->teletext.project) { load(R->teletext.project); return; }
         if (!edited.empty()) save();
         auto res = std::make_shared<std::string>(), out = std::make_shared<std::string>();
         std::string dir = projDir;
-        run_task("Clean stream", [dir, res, out](Task &t) {
+        run_task(how.empty() ? "Clean" : "Squash", [dir, res, out, how](Task &t) {
             Progress pr;
             pr.on_step = [&](const std::string &s) { std::lock_guard<std::mutex> l(t.mu); t.step = s; };
             pr.on_log = [&](const std::string &s) { std::lock_guard<std::mutex> l(t.mu); t.log.push_back(s); };
-            *out = ttClean(dir, pr, *res);
-        }, [this, res, out](bool ok) {
+            *out = ttClean(dir, pr, *res, "", how);
+        }, [this, res, out, how](bool ok) {
             if (!ok) { status("cleaning failed"); return; }
-            if (load(*out)) status("cleaned: " + *res);
+            if (load(*out)) status((how.empty() ? "cleaned: " : "squashed: ") + *res);
         });
+    }
+    void do_vsquash()
+    {
+        if (projDir != R->teletext.project) { do_squash(); return; }
+        choose("Squash (VHSTTX 2.7)", "Which copies of a subpage are taken as the same page:",
+               {"Auto: V1 or V3 for each page", "V1: copies with the same text", "V3: copies with the same subcode",
+                "Profile balanced", "Profile aggressive", "Profile conservative", "Profile broken subcodes"},
+               [this](int m) {
+                   static const char *keys[] = {"auto", "v1", "v3", "balanced", "aggressive", "conservative", "broken-subcodes"};
+                   if (m >= 0 && m < 7) do_squash(keys[m]);
+               });
     }
     void do_words()
     {
@@ -378,7 +391,8 @@ struct TtWin : Win {
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Tools")) {
-            if (ImGui::MenuItem("Clean stream (squash) \xE2\x86\x92 clean.t42")) do_squash();
+            if (ImGui::MenuItem("Clean \xE2\x86\x92 clean.t42")) do_squash();
+            if (ImGui::MenuItem("Squash (VHSTTX: V1 / V3 / Auto)\xE2\x80\xA6")) do_vsquash();
             if (ImGui::MenuItem("Restore words\xE2\x80\xA6")) do_words();
             ImGui::EndMenu();
         }
@@ -575,7 +589,8 @@ struct TtWin : Win {
             std::string p = path_join(path_join(P.outdir, "html"), "index.html");
             if (exists(p)) open_path(p); else status("html/index.html does not exist yet \xE2\x80\x94 run Export first");
         }
-        ImGui::SameLine(); if (ImGui::Button(cleaned ? "Show as received" : "Clean stream")) do_squash();
+        ImGui::SameLine(); if (ImGui::Button(cleaned ? "Show as received" : "Clean")) do_squash();
+        if (!cleaned) { ImGui::SameLine(); if (ImGui::Button("Squash\xE2\x80\xA6")) do_vsquash(); }
         ImGui::SameLine(); if (ImGui::Button("Restore words\xE2\x80\xA6")) do_words();
         ImGui::SameLine(); ImGui::PushStyleColor(ImGuiCol_Text, MUTED); ImGui::TextUnformatted(msg.c_str()); ImGui::PopStyleColor();
         ImVec2 av = ImGui::GetContentRegionAvail();

@@ -26,5 +26,13 @@ std::string ttWorkDir(const std::string& recording);
 // restored (built-in Russian / German / English dictionaries + the recording's own frequent words),
 // then one copy of every subpage assembled by majority over its repeats, damaged copies and rare
 // garbage versions dropped -> <project>/clean.t42, built into the project <project>/clean.
+// dest (when given): the cleaned project goes there instead, with a copy of clean.t42 in it.
 // Returns the cleaned project folder; note says what was done.
-std::string ttClean(const std::string& project, Progress& pr, std::string& note);
+// the character set guessed again by this program when the stream does not name it (X/28, M/29): the
+// original program's engine knows only Latin (Western) and Russian, and takes Polish for Russian.
+// Returns the new set ("" = kept); written to <project>/project.json
+std::string ttRecheckCharset(const std::string& project);
+// squash: "" = this program's way (above); "v1", "v3", "auto", "custom" or a profile name ("balanced", "aggressive",
+// "conservative", "broken-subcodes") = the squash of VHSTTX 2.7 on the stream as received (ttsquash.h)
+std::string ttClean(const std::string& project, Progress& pr, std::string& note, const std::string& dest = "",
+                    const std::string& squash = "");

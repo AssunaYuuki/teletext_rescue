@@ -83,6 +83,30 @@ const Dict *dict_for(const std::string &charset) {
 }
 
 struct Tok { int k0, len; };
+} // namespace
+
+#include "abc_pairs.inc"
+
+double latin_score(const std::u32string &cyr, const std::u32string &lat, bool *enKnown)
+{
+    if (enKnown) *enKnown = false;
+    std::u32string c, l;
+    for (char32_t x : cyr) c += norm(x);
+    for (char32_t x : lat) l += norm(x);
+    std::vector<int> ci{0}, li{0};
+    for (char32_t x : c) { if (x < U'а' || x > U'я') return -99; ci.push_back(int(x - U'а') + 1); }
+    for (char32_t x : l) { if (x < 'a' || x > 'z') return -99; li.push_back(int(x - 'a') + 1); }
+    ci.push_back(0); li.push_back(0);
+    const Dict *ru = dict_for("cyr2"), *la = dict_for("latin");
+    if (ru && ru->known(c)) return -99;
+    if (enKnown && la) *enKnown = la->known(l);
+    double sr = 0, se = 0;
+    for (size_t k = 0; k + 1 < ci.size(); k++) sr += kRuPair[ci[k]][ci[k + 1]];
+    for (size_t k = 0; k + 1 < li.size(); k++) se += kEnPair[li[k]][li[k + 1]];
+    return (se - sr) / 100.0 / (double)(ci.size() - 1);
+}
+
+namespace {
 // слова ряда: буквы и цифры подряд, только в текстовом режиме
 std::vector<Tok> tokens(const Row &row, const Charset &t) {
     std::vector<Tok> out;

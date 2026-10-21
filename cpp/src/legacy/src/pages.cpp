@@ -22,6 +22,7 @@ Json version_to_json(const Version &v) {
     j["c"] = c;
     if (!v.s.empty()) j["s"] = v.s;
     if (v.full) j["full"] = true;
+    if (v.rot >= 0) j["rot"] = v.rot;
     return j;
 }
 Version version_from_json(const Json &j) {
@@ -31,6 +32,7 @@ Version version_from_json(const Json &j) {
     if (auto c = j.find("c")) for (auto &kv : c->o) v.c[atoi(kv.first.c_str())] = kv.second.integer(1);
     v.s = j.get_str("s");
     v.full = j.get_bool("full");
+    v.rot = j.has("rot") ? (int)j["rot"].integer() : -1;
     return v;
 }
 

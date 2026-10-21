@@ -2,7 +2,7 @@
 rem Build Teletext Rescue on Windows: the program with windows and trcli.
 rem Needs MinGW-w64 g++ (e.g. WinLibs), CMake 3.20+, Ninja; for the installer Inno Setup 6.
 rem   build.bat           build into cpp\build
-rem   build.bat setup     also the installer dist\TeletextRescue-Setup-v1.2.exe
+rem   build.bat setup     also the installer dist\TeletextRescue-Setup-v1.3.exe
 setlocal
 cd /d "%~dp0"
 where cmake >nul 2>nul || (echo CMake not found & exit /b 1)
@@ -16,7 +16,7 @@ echo build failed & exit /b 1
 :built
 echo Done: cpp\build\TeletextRescue.exe and cpp\build\trcli.exe
 if /i not "%1"=="setup" goto :eof
-set "STAGE=dist\Teletext Rescue 1.2"
+set "STAGE=dist\Teletext Rescue 1.3"
 if not exist "%STAGE%" mkdir "%STAGE%"
 strip -o "%STAGE%\Teletext Rescue.exe" cpp\build\TeletextRescue.exe
 strip -o "%STAGE%\trcli.exe" cpp\build\trcli.exe

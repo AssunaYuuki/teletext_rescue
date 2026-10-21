@@ -33,11 +33,24 @@ void open_service(HWND owner, const ResultPtr &r, const Service &s)
     case ServiceWindow::Data: data_window(owner, r, s.dataKind); break;
     case ServiceWindow::Gemstar: gemstar_window(owner, r); break;
     case ServiceWindow::Jtes: jtes_window(owner, r); break;
-    case ServiceWindow::Tvinform: text_window(owner, "TV-Inform \xE2\x80\x94 " + file_name(*r), "\xD0\xA2\xD0\x92-\xD0\xB8\xD0\xBD\xD1\x84\xD0\xBE\xD1\x80\xD0\xBC (GOST R 50822-95); payload is the proprietary AO format, shown as voted carousel pages in hex", tvinform_text(*r)); break;
+    case ServiceWindow::Tvinform: tvinform_window(owner, r); break;
+    case ServiceWindow::Finds: finds_window(owner, r); break;
     case ServiceWindow::LegacyFile:
         if (ends_with_i(s.dataKind, ".txt")) text_window(owner, s.name + " \xE2\x80\x94 " + file_name(*r), s.note, read_text(s.dataKind));
         else open_path(s.dataKind);
         break;
+    case ServiceWindow::Vitc: {
+        std::string t;
+        for (auto &l : r->vitcReport) t += l + "\n";
+        t += "\nrecording -> time code (every second)\n";
+        int64_t step = std::max<int64_t>(1, (int64_t)std::lround(frame_rate(*r)));
+        for (size_t i = 0; i < r->vitc.size(); i++)
+            if (i == 0 || r->vitc[i].frame / step != r->vitc[i - 1].frame / step)
+                t += "[" + rec_time(r->vitc[i].frame / frame_rate(*r)) + "]  " + r->vitc[i].text() + fmt("  line %d f%d", r->vitc[i].lineNo, r->vitc[i].field) +
+                     (r->vitc[i].user ? fmt("  user bits %08X", r->vitc[i].user) : "") + "\n";
+        text_window(owner, "VITC time code \xE2\x80\x94 " + file_name(*r), "time code of the tape, read from the VBI; captions are timed by it", t);
+        break;
+    }
     case ServiceWindow::Report: text_window(owner, "Report \xE2\x80\x94 " + file_name(*r), "everything the decoder found and did", full_report(*r)); break;
     }
 }
@@ -263,13 +276,13 @@ struct LedBoard : Window {
 
 // ================================================================ start screen
 struct StartActions {
-    std::function<void()> open_vbi, open_packets, pick_device;
+    std::function<void()> open_vbi, open_packets, pick_device, capture, view_lines;
     std::function<void(const Json &)> open_recent;
 };
 
 struct StartScreen : Window {
     StartActions act;
-    HWND title, sub, b_vbi, b_pk, b_dev, hint, rec_h, svc_h, formats;
+    HWND title, sub, b_vbi, b_pk, b_dev, b_cap, b_view, hint, rec_h, svc_h, formats;
     std::vector<HWND> recent_btns; std::vector<Json> recent;
     std::vector<std::pair<std::string, std::string>> services = {
         {"StarSight", "StarSight programme guide \xE2\x80\x94 channels, schedules, titles (PBS, line 16)"},
@@ -290,6 +303,8 @@ struct StartScreen : Window {
             b_vbi = button(hwnd, 1, "\xF0\x9F\x93\xBC  Open .vbi recording\xE2\x80\xA6", BTN_ACCENT);
             b_pk = button(hwnd, 3, "Open packets .t42 / .t34 / .t33\xE2\x80\xA6", BTN_BIG);
             b_dev = button(hwnd, 2, "Decode on: graphics card or processor\xE2\x80\xA6", BTN_BIG);
+            b_cap = button(hwnd, 4, "\xF0\x9F\x93\xBA  Capture card (live)\xE2\x80\xA6", BTN_BIG);
+            b_view = button(hwnd, 5, "\xF0\x9F\x93\x88  View VBI lines (no decoding)\xE2\x80\xA6", BTN_LINK);
             hint = label(hwnd, "A recording is examined automatically: the capture chip and format (bt8x8, cx88, saa713x, cx23885, ivtv/cx18, em28xx, 4fsc .tbc) and every VBI line are identified and everything readable is decoded and opened.");
             set_label_colour(hint, MUTED);
             rec_h = label(hwnd, "Recent"); SetPropW(rec_h, L"card", (HANDLE)1); SendMessageW(rec_h, WM_SETFONT, (WPARAM)font(hwnd, 12, true), TRUE);
@@ -317,7 +332,10 @@ struct StartScreen : Window {
             MoveWindow(b_vbi, px, y, S(hwnd, 260), S(hwnd, 44), TRUE);
             MoveWindow(b_pk, px + S(hwnd, 272), y, S(hwnd, 280), S(hwnd, 44), TRUE);
             MoveWindow(b_dev, px + S(hwnd, 564), y, S(hwnd, 340), S(hwnd, 44), TRUE);
-            y += S(hwnd, 54);
+            MoveWindow(b_cap, px + S(hwnd, 916), y, S(hwnd, 250), S(hwnd, 44), TRUE);
+            y += S(hwnd, 50);
+            MoveWindow(b_view, px, y, S(hwnd, 420), S(hwnd, 30), TRUE);
+            y += S(hwnd, 36);
             MoveWindow(hint, px, y, std::min((int)rc.right - 2 * px, S(hwnd, 760)), S(hwnd, 40), TRUE); y += S(hwnd, 56);
             int cw = (rc.right - 2 * px - S(hwnd, 12)) / 2, ch = rc.bottom - y - S(hwnd, 40);
             card1 = {px, y, px + cw, y + ch}; card2 = {px + cw + S(hwnd, 12), y, rc.right - px, y + ch};
@@ -346,7 +364,7 @@ struct StartScreen : Window {
         case WM_ERASEBKGND: return 1;
         case WM_COMMAND: {
             int id = LOWORD(w);
-            if (id == 1) act.open_vbi(); else if (id == 2) act.pick_device(); else if (id == 3) act.open_packets();
+            if (id == 1) act.open_vbi(); else if (id == 2) act.pick_device(); else if (id == 3) act.open_packets(); else if (id == 4) act.capture(); else if (id == 5) act.view_lines();
             else if (id >= 100 && id - 100 < (int)recent.size()) { Json r = recent[id - 100]; act.open_recent(r); }
             return 0;
         }
@@ -367,13 +385,14 @@ struct RecWin : Window {
     void build_rows()
     {
         const VbiGeometry &g = R->geom;
-        int per = std::max(1, g.linesPerFrame / 2), f2 = g.pal ? 313 : 263;
+        int per = std::max(1, g.linesPerFrame / 2);
         for (int f = 1; f <= 2; f++)
             for (int i = 0; i < per; i++) {
-                int line = g.firstLine + i;
-                Row r{line + (f == 2 ? f2 : 0), "empty", "", 0};
+                int l = (f - 1) * per + i, line, fld;
+                lineOf(g, l, line, fld);
+                Row r{tvLineOf(g, l), "empty", "", 0};
                 for (auto &li : R->lines)
-                    if (li.lineNo == line && li.field == f) {
+                    if (li.lineNo == line && li.field == fld) {
                         std::string k = li.kind;
                         r.read = li.detectRate;
                         if (k == "StarSight") { r.kind = "StarSight"; r.text = "StarSight programme guide"; }
@@ -532,7 +551,7 @@ void recording_window(HWND owner, const ResultPtr &r)
 // ================================================================ main window
 namespace {
 enum {
-    M_OPEN_VBI = 1000, M_OPEN_PK = 1010, M_EXIT = 1001, M_DEVICE, M_UNVERIFIED, M_ABOUT, M_RECENT0 = 1100, M_FORMAT0 = 1200,
+    M_OPEN_VBI = 1000, M_OPEN_PK = 1010, M_CAPTURE = 1011, M_VIEW_LINES = 1012, M_EXIT = 1001, M_DEVICE, M_UNVERIFIED, M_ABOUT, M_RECENT0 = 1100, M_FORMAT0 = 1200,
 };
 
 struct App : Window {
@@ -547,6 +566,8 @@ struct App : Window {
         HMENU fm = CreatePopupMenu();
         AppendMenuW(fm, MF_STRING, M_OPEN_VBI, L"Open .vbi recording\x2026");
         AppendMenuW(fm, MF_STRING, M_OPEN_PK, L"Open teletext / NABTS packets (.t42, .t34, .t33)\x2026");
+        AppendMenuW(fm, MF_STRING, M_VIEW_LINES, L"View VBI lines (no decoding), set line types by hand\x2026");
+        AppendMenuW(fm, MF_STRING, M_CAPTURE, L"Capture card (live)\x2026");
         rmenu = CreatePopupMenu();
         AppendMenuW(fm, MF_POPUP, (UINT_PTR)rmenu, L"Recent");
         AppendMenuW(fm, MF_SEPARATOR, 0, nullptr);
@@ -588,6 +609,8 @@ struct App : Window {
         a.open_vbi = [this] { menu_vbi(); };
         a.open_packets = [this] { menu_packets(); };
         a.pick_device = [this] { pick_device(true); };
+        a.capture = [this] { capture_window(hwnd); };
+        a.view_lines = [this] { view_lines(); };
         a.open_recent = [this](const Json &r) { open_vbi(r.get_str("path")); };
         auto *s = new StartScreen; s->act = a;
         Window::register_class(L"TRStart", brBG);
@@ -628,14 +651,36 @@ struct App : Window {
         st["device"] = (double)dev; st["device_ask"] = !remember; save_state(st);
         return dev == 0 ? 1 : 0;
     }
-    void open_vbi(const std::string &f)
+    // the raw lines of a recording, nothing decoded: line types can be set by hand there and the
+    // recording decoded with them
+    void view_lines()
+    {
+        std::string f = open_file(hwnd, "VBI recording", {{"VBI recording", "*.vbi;*.tbc;*.flac"}, {"All files", "*.*"}});
+        if (f.empty()) return;
+        auto res = std::make_shared<DecodeResult>();
+        VbiFormat fmtv = format;
+        run_task(hwnd, "Opening " + basename(f), [f, res, fmtv](Progress &pr) {
+            DecodeOptions opt;
+            opt.probeOnly = true; opt.force = fmtv; opt.cancel = &pr.cancel;
+            std::string last;
+            opt.progress = [&](double, const std::string &s) { if (s != last) { last = s; if (pr.on_step) pr.on_step(s); } };
+            opt.log = [&](const std::string &s) { pr.log(s); };
+            std::string err;
+            if (!decodeFile(f, opt, *res, err)) {
+                if (pr.cancel) throw Cancelled();
+                throw std::runtime_error(err);
+            }
+        }, [this, res](bool ok) { if (ok) lines_window(hwnd, res); });
+    }
+    void open_vbi(const std::string &f, const std::map<int, LineForce> *force = nullptr, VbiFormat fmtForce = VbiFormat::Unknown)
     {
         if (!exists(f)) { ask(hwnd, "Could not open", "The file does not exist:\n" + f, MB_ICONERROR); return; }
         recent_add(f, "vbi");
         // as in the original program: what was decoded is kept in "<recording>_vbi"; a recording
         // decoded before opens from there at once, or is decoded (and a FLAC unpacked) again
         bool again = false, redo = false;
-        if (resultsCached(f)) {
+        if (force) redo = true;   // line types set by hand: always decoded again, with the viewer's format
+        else if (resultsCached(f)) {
             std::vector<std::string> opts = {"Open the saved results (no decoding)", "Decode the recording again"};
             if (is_flac(f)) opts.push_back("Unpack the FLAC and decode again");
             int c = choose(hwnd, "Already decoded",
@@ -647,12 +692,14 @@ struct App : Window {
                     pr.step("Opening the saved results");
                     std::string err;
                     if (!loadResults(f, *res, err)) throw std::runtime_error(err);
+                    // files and texts (the «Бизнес-Текст» files put together and written), telling which
+                    prepareFinds(*res, [&](const std::string &s) { pr.step(s); });
                 }, [this, res](bool ok) { if (ok) show_results(res); });
                 return;
             }
             redo = true;
             again = c == 2;
-        } else if (is_flac(f) && flac_cached(f)) {
+        } else if (!force && is_flac(f) && flac_cached(f)) {
             // unpacked before but never decoded to the end
             int c = choose(hwnd, "FLAC recording", "This recording was already unpacked:\n" + flac_cache_path(f),
                            {"Use the unpacked recording", "Unpack it again"}, 0);
@@ -663,10 +710,12 @@ struct App : Window {
         if (dev < 0) return;
         auto res = std::make_shared<DecodeResult>();
         bool gpu = dev == 1;
-        VbiFormat fmtv = format; bool unv = unverified;
-        run_task(hwnd, "Opening " + basename(f), [f, res, gpu, fmtv, unv, again, redo](Progress &pr) {
+        VbiFormat fmtv = force && fmtForce != VbiFormat::Unknown ? fmtForce : format; bool unv = unverified;
+        std::map<int, LineForce> lf = force ? *force : std::map<int, LineForce>{};
+        run_task(hwnd, "Opening " + basename(f), [f, res, gpu, fmtv, unv, again, redo, lf](Progress &pr) {
             DecodeOptions opt;
             opt.gpu = gpu; opt.force = fmtv; opt.keepUnverified = unv; opt.cancel = &pr.cancel; opt.reunpack = again; opt.again = redo;
+            opt.lineForce = lf;
             std::string last;
             opt.progress = [&](double, const std::string &s) { if (s != last) { last = s; if (pr.on_step) pr.on_step(s); } };
             opt.log = [&](const std::string &s) { pr.log(s); };
@@ -676,6 +725,7 @@ struct App : Window {
                 if (pr.cancel) throw Cancelled();
                 throw std::runtime_error(err == "no data lines found" ? "Nothing the program can decode was found in this recording." : err);
             }
+            prepareFinds(*res, [&](const std::string &s) { pr.step(s); pr.log(s); });
         }, [this, res](bool ok) { if (ok) show_results(res); });
     }
     void show_results(const ResultPtr &r)
@@ -694,6 +744,8 @@ struct App : Window {
         switch (m) {
         case WM_CREATE:
             g_main = hwnd; dark_window(hwnd);
+            open_recording_hook() = [this](const std::string &f) { open_vbi(f); };
+            decode_lines_hook() = [this](const std::string &f, VbiFormat fm, const std::map<int, LineForce> &lf) { open_vbi(f, &lf, fm); };
             build_menu(); show_start();
             DragAcceptFiles(hwnd, TRUE);
             return 0;
@@ -714,6 +766,8 @@ struct App : Window {
             switch (id) {
             case M_OPEN_VBI: menu_vbi(); break;
             case M_OPEN_PK: menu_packets(); break;
+            case M_CAPTURE: capture_window(hwnd); break;
+            case M_VIEW_LINES: view_lines(); break;
             case M_DEVICE: pick_device(true); break;
             case M_UNVERIFIED: unverified = !unverified; update_menu(); break;
             case M_EXIT: PostMessageW(hwnd, WM_CLOSE, 0, 0); break;
@@ -750,6 +804,8 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int show)
     int argc; LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     for (int i = 1; i < argc; i++) {
         std::string a = narrow(argv[i]);
+        if (a == "--capture") { capture_window(app.hwnd, true); break; }   // the capture window, started
+        if (a == "--test-file" && i + 1 < argc) { capture_window(app.hwnd, false, narrow(argv[i + 1])); break; }   // a .vbi played to it
         if (a.rfind("--", 0) != 0) { app.open_vbi(a); break; }
     }
     LocalFree(argv);

@@ -306,6 +306,9 @@ std::string vbi_unpacked(const std::string &src_in, Progress &pr) {
     return raw;
 }
 
+// rows whose signal the user set by hand (TeletextRescue VBI lines window): row -> kind of the line map
+std::map<int, std::string> g_force_rows;
+
 Json vbi_auto(const std::string &src_in, bool again, Progress &pr) {
     std::string src = abspath(src_in), rep_dir = vbi_report_dir(src), orig = src;
     make_dirs(rep_dir);
@@ -317,6 +320,13 @@ Json vbi_auto(const std::string &src_in, bool again, Progress &pr) {
         Json r = Json::object(); r["file"] = orig; r["format"] = Json(); r["results"] = Json::array();
         save_json(path_join(rep_dir, "report.json"), r);
         return r;
+    }
+    for (auto &L : res["lines"].a) {
+        auto f = g_force_rows.find(L["row"].integer());
+        if (f == g_force_rows.end()) continue;
+        L["kind"] = f->second;
+        if (f->second != "empty" && L["signal"].num(0) <= 0) L["signal"] = 1.0;
+        pr.log(fmt("  row %2d: set by hand to %s", f->first, f->second.c_str()));
     }
     std::string fmtname = res["format"].str();
     Rec R(src, fmtname);

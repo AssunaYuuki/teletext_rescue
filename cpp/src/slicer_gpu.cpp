@@ -30,6 +30,9 @@ static HMODULE LoadLibraryA(const char*)
 #define FASTDATA_SRC(...) static const char* kFastSrc = #__VA_ARGS__;
 #include "fastdata_core.h"
 #undef FASTDATA_SRC
+#define JTES_SRC(...) static const char* kJtesSrc = #__VA_ARGS__;
+#include "jtes_core.h"
+#undef JTES_SRC
 
 namespace {
 
@@ -109,6 +112,26 @@ const char* kFastKernelSrc =
     "               scratch + (size_t)g * 400 * 64, out);\n"
     "}\n";
 
+const char* kJtesKernelSrc =
+    "__kernel void jtes_decode_kernel(__global const unsigned char* lines, int n, __global const int* jl,\n"
+    "                                 __global const float* jf, int njobs, __global ulong* back,\n"
+    "                                 __global unsigned char* word, __global unsigned char* bits,\n"
+    "                                 __global float* cost, __global int* ec)\n"
+    "{\n"
+    "    int g = get_global_id(0);\n"
+    "    if (g >= njobs) return;\n"
+    "    jt_decode(lines + (size_t)jl[g] * n, n, jf[g * 18], jf[g * 18 + 1], jf + (size_t)g * 18 + 2, back + (size_t)g * 299,\n"
+    "              word + (size_t)g * 34, bits + (size_t)g * 37, cost + g, ec + g);\n"
+    "}\n"
+    "__kernel void jtes_cand_kernel(__global const unsigned char* lines, int n, __global const int* jl, int nl,\n"
+    "                               __global const float* pred, __global float* costs, __global float* st,\n"
+    "                               __global float* spb, __global int* cnt, __global float* fit)\n"
+    "{\n"
+    "    int g = get_global_id(0);\n"
+    "    if (g >= nl) return;\n"
+    "    jt_cand(lines + (size_t)jl[g] * n, n, pred, costs + (size_t)g * 1128, st + (size_t)g * 8, spb + (size_t)g * 8, cnt + g, fit + g);\n"
+    "}\n";
+
 class GpuSlicer : public Slicer {
 public:
     ~GpuSlicer() override
@@ -120,6 +143,11 @@ public:
         if (fastKernel_) ReleaseKernel_(fastKernel_);
         for (cl_mem m : {fInfo_, fScratch_, fBits_, fJl_, fJf_})
             if (m) Release_(m);
+        for (cl_mem m : {jLines_, jJl_, jJf_, jBack_, jWord_, jBits_, jCost_, jEc_, jPred_, jCosts_, jSt_, jSpb_, jCnt_, jFit_})
+            if (m) Release_(m);
+        if (jDecK_) ReleaseKernel_(jDecK_);
+        if (jCandK_) ReleaseKernel_(jCandK_);
+        if (jProg_) ReleaseProgram_(jProg_);
         if (prog_) ReleaseProgram_(prog_);
         if (queue_) ReleaseQueue_(queue_);
         if (ctx_) ReleaseContext_(ctx_);
@@ -239,6 +267,146 @@ public:
         return true;
     }
 
+    // ---- Japanese teletext (jtes_core.h): its own program, built at the first use
+    bool jtesBuild(std::string& err)
+    {
+        if (jDecK_) return true;
+        if (jFailed_) { err = jErr_; return false; }
+        std::string src = "#define GLOBAL __global\n#define FN\n#define JT_CONST __constant\n#define JT_U64 ulong\n";
+        src += kJtesSrc;
+        src += "\n";
+        src += kJtesKernelSrc;
+        const char* sp = src.c_str();
+        cl_int e = 0;
+        jProg_ = CreateProgramWithSource_(ctx_, 1, &sp, nullptr, &e);
+        if (!jProg_ || BuildProgram_(jProg_, 1, &dev_, "", nullptr, nullptr) != 0) {
+            std::string log;
+            if (jProg_) {
+                size_t len = 0;
+                GetProgramBuildInfo_(jProg_, dev_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &len);
+                log.assign(len + 1, '\0');
+                GetProgramBuildInfo_(jProg_, dev_, CL_PROGRAM_BUILD_LOG, len, &log[0], nullptr);
+            }
+            jFailed_ = true;
+            jErr_ = err = "OpenCL build of the Japanese teletext receiver failed: " + log.substr(0, 2000);
+            return false;
+        }
+        jDecK_ = CreateKernel_(jProg_, "jtes_decode_kernel", &e);
+        jCandK_ = CreateKernel_(jProg_, "jtes_cand_kernel", &e);
+        if (!jDecK_ || !jCandK_) { jFailed_ = true; jErr_ = err = "clCreateKernel (Japanese teletext) failed"; return false; }
+        return true;
+    }
+    bool jtesLines(const uint8_t* lines, int64_t nLines, int n, std::string& err) override
+    {
+        if (!jtesBuild(err)) return false;
+        size_t sz = (size_t)nLines * n;
+        if (!ensure(jLines_, jLinesCap_, sz, CL_MEM_READ_ONLY)) { err = "clCreateBuffer failed"; return false; }
+        if (sz && EnqueueWriteBuffer_(queue_, jLines_, CL_TRUE, 0, sz, lines, 0, nullptr, nullptr) != 0) { err = "OpenCL upload failed"; return false; }
+        jN_ = n;
+        return true;
+    }
+    bool jtesDecode(const std::vector<JtesJob>& jobs, std::vector<JtesOut>& out, std::string& err) override
+    {
+        out.assign(jobs.size(), JtesOut());
+        if (!jtesBuild(err)) return false;
+        const size_t batch = 65536;
+        std::vector<int> jl;
+        std::vector<float> jf;
+        std::vector<uint8_t> word, bits;
+        std::vector<float> cost;
+        std::vector<int> ec;
+        for (size_t b0 = 0; b0 < jobs.size(); b0 += batch) {
+            size_t m = std::min(batch, jobs.size() - b0);
+            jl.resize(m); jf.resize(m * 18);
+            for (size_t i = 0; i < m; i++) {
+                const JtesJob& j = jobs[b0 + i];
+                jl[i] = j.line;
+                jf[i * 18] = j.st; jf[i * 18 + 1] = j.spb;
+                for (int k = 0; k < 16; k++) jf[i * 18 + 2 + k] = j.h[k];
+            }
+            if (!ensure(jJl_, jJlCap_, m * sizeof(int), CL_MEM_READ_ONLY) || !ensure(jJf_, jJfCap_, m * 18 * sizeof(float), CL_MEM_READ_ONLY) ||
+                !ensure(jBack_, jBackCap_, m * 299 * 8, CL_MEM_READ_WRITE) || !ensure(jWord_, jWordCap_, m * 34, CL_MEM_WRITE_ONLY) ||
+                !ensure(jBits_, jBitsCap_, m * 37, CL_MEM_WRITE_ONLY) || !ensure(jCost_, jCostCap_, m * sizeof(float), CL_MEM_WRITE_ONLY) ||
+                !ensure(jEc_, jEcCap_, m * sizeof(int), CL_MEM_WRITE_ONLY)) { err = "clCreateBuffer failed"; return false; }
+            cl_int e = EnqueueWriteBuffer_(queue_, jJl_, CL_TRUE, 0, m * sizeof(int), jl.data(), 0, nullptr, nullptr);
+            e |= EnqueueWriteBuffer_(queue_, jJf_, CL_TRUE, 0, m * 18 * sizeof(float), jf.data(), 0, nullptr, nullptr);
+            int nj = (int)m, a = 0;
+            SetKernelArg_(jDecK_, a++, sizeof(cl_mem), &jLines_);
+            SetKernelArg_(jDecK_, a++, sizeof(int), &jN_);
+            SetKernelArg_(jDecK_, a++, sizeof(cl_mem), &jJl_);
+            SetKernelArg_(jDecK_, a++, sizeof(cl_mem), &jJf_);
+            SetKernelArg_(jDecK_, a++, sizeof(int), &nj);
+            SetKernelArg_(jDecK_, a++, sizeof(cl_mem), &jBack_);
+            SetKernelArg_(jDecK_, a++, sizeof(cl_mem), &jWord_);
+            SetKernelArg_(jDecK_, a++, sizeof(cl_mem), &jBits_);
+            SetKernelArg_(jDecK_, a++, sizeof(cl_mem), &jCost_);
+            SetKernelArg_(jDecK_, a++, sizeof(cl_mem), &jEc_);
+            size_t local = 64, global = (m + local - 1) / local * local;
+            e |= EnqueueNDRangeKernel_(queue_, jDecK_, 1, nullptr, &global, &local, 0, nullptr, nullptr);
+            word.resize(m * 34); bits.resize(m * 37); cost.resize(m); ec.resize(m);
+            e |= EnqueueReadBuffer_(queue_, jWord_, CL_TRUE, 0, m * 34, word.data(), 0, nullptr, nullptr);
+            e |= EnqueueReadBuffer_(queue_, jBits_, CL_TRUE, 0, m * 37, bits.data(), 0, nullptr, nullptr);
+            e |= EnqueueReadBuffer_(queue_, jCost_, CL_TRUE, 0, m * sizeof(float), cost.data(), 0, nullptr, nullptr);
+            e |= EnqueueReadBuffer_(queue_, jEc_, CL_TRUE, 0, m * sizeof(int), ec.data(), 0, nullptr, nullptr);
+            Finish_(queue_);
+            if (e != 0) { err = "OpenCL Japanese teletext decode failed"; return false; }
+            for (size_t i = 0; i < m; i++) {
+                JtesOut& o = out[b0 + i];
+                o.cost = cost[i]; o.ec = ec[i];
+                memcpy(o.word, &word[i * 34], 34);
+                memcpy(o.bits, &bits[i * 37], 37);
+            }
+        }
+        return true;
+    }
+    bool jtesCand(const std::vector<int>& lines, const float* pred, std::vector<JtesCand>& out, std::string& err) override
+    {
+        out.assign(lines.size(), JtesCand());
+        if (!jtesBuild(err)) return false;
+        if (!ensure(jPred_, jPredCap_, 312 * sizeof(float), CL_MEM_READ_ONLY)) { err = "clCreateBuffer failed"; return false; }
+        if (EnqueueWriteBuffer_(queue_, jPred_, CL_TRUE, 0, 312 * sizeof(float), pred, 0, nullptr, nullptr) != 0) { err = "OpenCL upload failed"; return false; }
+        const size_t batch = 32768;
+        std::vector<float> st, spb, fit;
+        std::vector<int> cnt;
+        for (size_t b0 = 0; b0 < lines.size(); b0 += batch) {
+            size_t m = std::min(batch, lines.size() - b0);
+            if (!ensure(jJl_, jJlCap_, m * sizeof(int), CL_MEM_READ_ONLY) || !ensure(jCosts_, jCostsCap_, m * 1128 * sizeof(float), CL_MEM_READ_WRITE) ||
+                !ensure(jSt_, jStCap_, m * 8 * sizeof(float), CL_MEM_WRITE_ONLY) || !ensure(jSpb_, jSpbCap_, m * 8 * sizeof(float), CL_MEM_WRITE_ONLY) ||
+                !ensure(jCnt_, jCntCap_, m * sizeof(int), CL_MEM_WRITE_ONLY) || !ensure(jFit_, jFitCap_, m * sizeof(float), CL_MEM_WRITE_ONLY)) {
+                err = "clCreateBuffer failed";
+                return false;
+            }
+            cl_int e = EnqueueWriteBuffer_(queue_, jJl_, CL_TRUE, 0, m * sizeof(int), &lines[b0], 0, nullptr, nullptr);
+            int nl = (int)m, a = 0;
+            SetKernelArg_(jCandK_, a++, sizeof(cl_mem), &jLines_);
+            SetKernelArg_(jCandK_, a++, sizeof(int), &jN_);
+            SetKernelArg_(jCandK_, a++, sizeof(cl_mem), &jJl_);
+            SetKernelArg_(jCandK_, a++, sizeof(int), &nl);
+            SetKernelArg_(jCandK_, a++, sizeof(cl_mem), &jPred_);
+            SetKernelArg_(jCandK_, a++, sizeof(cl_mem), &jCosts_);
+            SetKernelArg_(jCandK_, a++, sizeof(cl_mem), &jSt_);
+            SetKernelArg_(jCandK_, a++, sizeof(cl_mem), &jSpb_);
+            SetKernelArg_(jCandK_, a++, sizeof(cl_mem), &jCnt_);
+            SetKernelArg_(jCandK_, a++, sizeof(cl_mem), &jFit_);
+            size_t local = 64, global = (m + local - 1) / local * local;
+            e |= EnqueueNDRangeKernel_(queue_, jCandK_, 1, nullptr, &global, &local, 0, nullptr, nullptr);
+            st.resize(m * 8); spb.resize(m * 8); cnt.resize(m); fit.resize(m);
+            e |= EnqueueReadBuffer_(queue_, jSt_, CL_TRUE, 0, m * 8 * sizeof(float), st.data(), 0, nullptr, nullptr);
+            e |= EnqueueReadBuffer_(queue_, jSpb_, CL_TRUE, 0, m * 8 * sizeof(float), spb.data(), 0, nullptr, nullptr);
+            e |= EnqueueReadBuffer_(queue_, jCnt_, CL_TRUE, 0, m * sizeof(int), cnt.data(), 0, nullptr, nullptr);
+            e |= EnqueueReadBuffer_(queue_, jFit_, CL_TRUE, 0, m * sizeof(float), fit.data(), 0, nullptr, nullptr);
+            Finish_(queue_);
+            if (e != 0) { err = "OpenCL Japanese teletext start search failed"; return false; }
+            for (size_t i = 0; i < m; i++) {
+                JtesCand& c = out[b0 + i];
+                c.n = cnt[i]; c.fit = fit[i];
+                memcpy(c.st, &st[i * 8], sizeof c.st);
+                memcpy(c.spb, &spb[i * 8], sizeof c.spb);
+            }
+        }
+        return true;
+    }
+
 private:
     bool runFast(const uint8_t* chunk, int frames, const VbiGeometry& g, const std::vector<FastJob>& jobs,
                  std::vector<uint8_t>& bits, std::string& err) override
@@ -321,6 +489,15 @@ private:
     cl_mem inBuf_ = nullptr, outBuf_ = nullptr, jobBuf_ = nullptr;
     size_t inCap_ = 0, outCap_ = 0, jobCap_ = 0;
     std::string devName_;
+    cl_program jProg_ = nullptr;
+    cl_kernel jDecK_ = nullptr, jCandK_ = nullptr;
+    bool jFailed_ = false;
+    std::string jErr_;
+    int jN_ = 0;
+    cl_mem jLines_ = nullptr, jJl_ = nullptr, jJf_ = nullptr, jBack_ = nullptr, jWord_ = nullptr, jBits_ = nullptr, jCost_ = nullptr,
+           jEc_ = nullptr, jPred_ = nullptr, jCosts_ = nullptr, jSt_ = nullptr, jSpb_ = nullptr, jCnt_ = nullptr, jFit_ = nullptr;
+    size_t jLinesCap_ = 0, jJlCap_ = 0, jJfCap_ = 0, jBackCap_ = 0, jWordCap_ = 0, jBitsCap_ = 0, jCostCap_ = 0, jEcCap_ = 0,
+           jPredCap_ = 0, jCostsCap_ = 0, jStCap_ = 0, jSpbCap_ = 0, jCntCap_ = 0, jFitCap_ = 0;
 
     PFN_GetPlatformIDs GetPlatformIDs_ = nullptr;
     PFN_GetDeviceIDs GetDeviceIDs_ = nullptr;

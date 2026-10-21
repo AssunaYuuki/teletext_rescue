@@ -6,6 +6,7 @@
 #include "vbifile.h"
 #include <atomic>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -29,4 +30,6 @@ std::string legacyReportDir(const std::string& recording);
 // runs the old engine on a recording (or its FLAC; the unpacked copy is shared). again = decode again
 // even where results already exist. Returns false with err on failure.
 bool legacyRun(const std::string& recording, bool again, const std::function<void(const std::string&)>& step,
-               const std::function<void(const std::string&)>& log, std::atomic<bool>* cancel, LegacyReport& out, std::string& err);
+               const std::function<void(const std::string&)>& log, std::atomic<bool>* cancel, LegacyReport& out, std::string& err,
+               const std::map<int, std::string>& forceRows = {},   // row -> line-map kind set by hand ("empty" = nothing)
+               bool gpu = true);   // false: the engine's MLSE / templates on the processor only

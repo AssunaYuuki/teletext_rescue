@@ -7,7 +7,8 @@
 //                  "as on a TV screen", the SAA5050 screen with a cursor (click and type, arrows,
 //                  Backspace / Delete, Enter, PageUp / PageDown), FLOF colour keys (edit, double-click
 //                  to go), row / version / page actions, the text and mosaic colour palettes and the
-//                  attribute codes, row / column / code of the cursor;
+//                  attribute codes, row / column / code of the cursor; the pencil (draws
+//                  the mosaic pixels 2x3 a cell in a colour of the M buttons, right button erases anything);
 //            Tape quality: received / unreadable / parity errors per minute (charts and table);
 //   menus  - File (save, export output.t42 + HTML, complete pages only, subtitles .srt, PNG, folder),
 //            Character set (G0 set and the second set selected by ESC), Tools (clean stream, restore
@@ -71,10 +72,10 @@ int bar_hit(RECT r, size_t n, POINT p, HWND ref)
 
 namespace {
 enum {
-    ID_SEARCH = 100, ID_LIST, ID_SAVE, ID_EXPORT, ID_UNDO, ID_OPENHTML, ID_TAB_PAGE, ID_TAB_QUAL, ID_SQUASH, ID_WORDS,
-    ID_PREV, ID_PNUM, ID_NEXT, ID_VPREV, ID_VNEXT, ID_REVEAL, ID_FULL, ID_TV, ID_CODES,
+    ID_SEARCH = 100, ID_LIST, ID_SAVE, ID_EXPORT, ID_UNDO, ID_OPENHTML, ID_TAB_PAGE, ID_TAB_QUAL, ID_SQUASH, ID_WORDS, ID_VSQUASH,
+    ID_PREV, ID_PNUM, ID_NEXT, ID_VPREV, ID_VNEXT, ID_REVEAL, ID_FULL, ID_TV, ID_CODES, ID_PENCIL,
     ID_KEY0 = 130, ID_ACT0 = 140, ID_PAL0 = 160, ID_PAL2_0 = 180, ID_QLIST = 200,
-    M_SAVE = 1000, M_EXPORT, M_EXPORT_FULL, M_EXPORT_SRT, M_PNG, M_OPEN_FOLDER, M_CLOSE, M_SQUASH, M_WORDS,
+    M_SAVE = 1000, M_EXPORT, M_EXPORT_FULL, M_EXPORT_SRT, M_PNG, M_OPEN_FOLDER, M_CLOSE, M_SQUASH, M_WORDS, M_VSQUASH,
     M_CS0 = 1200, M_CS2_0 = 1300,
 };
 const COLORREF TT[8] = {RGB(0, 0, 0), RGB(255, 0, 0), RGB(0, 255, 0), RGB(255, 255, 0), RGB(0, 0, 255), RGB(255, 0, 255), RGB(0, 255, 255), RGB(255, 255, 255)};
@@ -106,10 +107,12 @@ struct TeletextWin : Window {
     int left_w = 0; bool dragging = false, tab_quality = false;
     Json quality;
     HMENU menu = nullptr, csmenu = nullptr;
-    HWND b_save, b_export, b_undo, b_html, b_squash, b_words, msg, search, hint, list, tab_page, tab_qual;
+    HWND b_save, b_export, b_undo, b_html, b_squash, b_vsquash, b_words, msg, search, hint, list, tab_page, tab_qual;
     HWND b_prev, pnum, b_next, b_vprev, vinfo, b_vnext, c_reveal, c_full, c_tv, c_codes, note;
     Screen screen; Chart chart;
-    HWND keys_l, keys[5], keys_hint, acts[6], pal[14], pal_l1, pal_l2, pal2[7], stat, help;
+    HWND keys_l, keys[5], keys_hint, acts[6], pal[14], pal_l1, pal_l2, pal2[7], c_pencil, stat, help;
+    bool stroke = false, stroke_saved = false;   // a pencil stroke goes on (one undo step for all of it)
+    int pen_colour = 7;                          // its mosaic colour, 1-7 (white)
     HWND q_title, q_list, q_help;
 
     // ---------------------------------------------------------------- creation
@@ -133,7 +136,8 @@ struct TeletextWin : Window {
         for (size_t i = 0; i < CS2.size(); i++) AppendMenuW(csmenu, MF_STRING, M_CS2_0 + i, W("   " + CS2[i].second).c_str());
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)csmenu, L"Character set");
         HMENU tm = CreatePopupMenu();
-        AppendMenuW(tm, MF_STRING, M_SQUASH, L"Clean stream (squash) \x2192 clean.t42");
+        AppendMenuW(tm, MF_STRING, M_SQUASH, L"Clean (Teletext Rescue) \x2192 clean.t42");
+        AppendMenuW(tm, MF_STRING, M_VSQUASH, L"Squash (VHSTTX: V1 / V3 / Auto)\x2026");
         AppendMenuW(tm, MF_STRING, M_WORDS, L"Restore words\x2026");
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)tm, L"Tools");
         SetMenu(hwnd, menu);
@@ -142,7 +146,7 @@ struct TeletextWin : Window {
     {
         b_save = button(hwnd, ID_SAVE, "Save (Ctrl+S)"); b_export = button(hwnd, ID_EXPORT, "Export \xE2\x86\x92 output.t42 + HTML");
         b_undo = button(hwnd, ID_UNDO, "Undo (Ctrl+Z)"); b_html = button(hwnd, ID_OPENHTML, "Open html/index.html");
-        b_squash = button(hwnd, ID_SQUASH, "Clean stream"); b_words = button(hwnd, ID_WORDS, "Restore words\xE2\x80\xA6");
+        b_squash = button(hwnd, ID_SQUASH, "Clean"); b_vsquash = button(hwnd, ID_VSQUASH, "Squash\xE2\x80\xA6"); b_words = button(hwnd, ID_WORDS, "Restore words\xE2\x80\xA6");
         msg = label(hwnd, ""); set_label_colour(msg, MUTED);
         search = edit(hwnd, ID_SEARCH);
         hint = label(hwnd, "search by number or title"); set_label_colour(hint, DIM);
@@ -164,6 +168,7 @@ struct TeletextWin : Window {
         pal_l1 = label(hwnd, " text"); pal_l2 = label(hwnd, " mosaic");
         const char *pn[7] = {"Background = colour", "Black background", "Double height", "Normal height", "Contiguous mosaic", "Separated mosaic", "Concealed"};
         for (int i = 0; i < 7; i++) pal2[i] = button(hwnd, ID_PAL2_0 + i, pn[i]);
+        c_pencil = button(hwnd, ID_PENCIL, "Pencil: white (M buttons or Ctrl+click choose the colour, right button erases)", BTN_CHECK);
         stat = label(hwnd, ""); set_label_colour(stat, MUTED);
         help = label(hwnd, "Click a character and type. Arrows \xE2\x80\x94 move, Backspace/Delete \xE2\x80\x94 erase, Enter \xE2\x80\x94 next row, PageUp/PageDown \xE2\x80\x94 neighbouring pages.");
         set_label_colour(help, DIM);
@@ -178,7 +183,7 @@ struct TeletextWin : Window {
     }
     std::vector<HWND> page_ctrls()
     {
-        std::vector<HWND> v = {b_prev, pnum, b_next, b_vprev, vinfo, b_vnext, c_reveal, c_full, c_tv, c_codes, note, screen.hwnd, keys_l, keys_hint, stat, help, pal_l1, pal_l2};
+        std::vector<HWND> v = {b_prev, pnum, b_next, b_vprev, vinfo, b_vnext, c_reveal, c_full, c_tv, c_codes, note, screen.hwnd, keys_l, keys_hint, stat, help, pal_l1, pal_l2, c_pencil};
         for (auto h : keys) v.push_back(h);
         for (auto h : acts) v.push_back(h);
         for (auto h : pal) v.push_back(h);
@@ -201,7 +206,7 @@ struct TeletextWin : Window {
         HDC dc = GetDC(hwnd); HGDIOBJ of = SelectObject(dc, font(hwnd));
         auto tw = [&](HWND h) { std::wstring t = W(get_text(h)); SIZE s; GetTextExtentPoint32W(dc, t.c_str(), (int)t.size(), &s); return (int)s.cx + S(hwnd, 24); };
         place(b_save, tw(b_save)); place(b_export, tw(b_export)); place(b_undo, tw(b_undo)); place(b_html, tw(b_html));
-        place(b_squash, tw(b_squash)); place(b_words, tw(b_words));
+        place(b_squash, tw(b_squash)); place(b_vsquash, tw(b_vsquash)); place(b_words, tw(b_words));
         MoveWindow(msg, x + p, y + S(hwnd, 6), std::max(0, (int)rc.right - x - 2 * p), S(hwnd, 20), TRUE);
         int top = y + bh + p;
         int lw = std::min(std::max(left_w, S(hwnd, 300)), (int)rc.right - S(hwnd, 500));
@@ -234,6 +239,7 @@ struct TeletextWin : Window {
             for (int i = 0; i < 7; i++) rp.push_back({pal[7 + i], S(hwnd, 28)});
             rp.push_back({pal_l2, tw(pal_l2)});
             std::vector<std::pair<HWND, int>> r2; for (int i = 0; i < 7; i++) r2.push_back({pal2[i], tw(pal2[i])});
+            r2.push_back({c_pencil, tw(c_pencil) + S(hwnd, 6)});
             int hk = flow(rk, 0, false), ha = flow(ra, 0, false), hp = flow(rp, 0, false), h2 = flow(r2, 0, false);
             x = rx;
             place(b_prev, S(hwnd, 72)); place(pnum, S(hwnd, 52), S(hwnd, 30)); place(b_next, S(hwnd, 72)); x += S(hwnd, 8);
@@ -427,6 +433,68 @@ struct TeletextWin : Window {
         if (c < 0) { c = 39; r--; }
         cursor_r = std::max(0, std::min(24, r)); cursor_c = c; draw();
     }
+    // the pencil: a mosaic cell is 2x3 pixels (bits 0-4 and 6 of its code, 0x20 always set); x, y in the screen's
+    // pixels of w x h. Drawing paints in pen_colour (1-7): a cell not in mosaic mode or in another mosaic colour
+    // gets the mosaic colour code in the cell left of it when that cell is free (a space, an empty mosaic cell or
+    // a colour code). Erasing takes away whatever is there: a mosaic pixel, a letter, a control code.
+    void pencil_at(int x, int y, int w, int h, bool on)
+    {
+        if (cur.empty() || !editable() || w <= 0 || h <= 0) return;
+        int sx = std::clamp(x * 80 / w, 0, 79), sy = std::clamp(y * 75 / h, 0, 74), r = sy / 3, c = sx / 2;
+        if (r == 0) { status("the header row is not drawn on"); return; }
+        Row R = snap().rows.count(r) ? snap().rows.at(r) : Row();
+        if (!snap().rows.count(r)) R.fill(0x20);
+        // mosaic mode and colour (0 = alphanumeric) in force at a column
+        auto colour_at = [&](int col) {
+            int m = 0;
+            for (int k = 0; k < col; k++) { int v = R[k] & 0x7F; if (v <= 0x07) m = 0; else if (v >= 0x10 && v <= 0x17) m = v - 0x10; }
+            return m;
+        };
+        int v = R[c] & 0x7F, bit = (sy % 3) * 2 + sx % 2, m = bit == 5 ? 0x40 : 1 << bit;
+        bool mosaic = colour_at(c) > 0, sextant = mosaic && v >= 0x20 && !(v >= 0x40 && v < 0x60);
+        int code = -1, nv = v;   // code: the colour code to put left of the cell
+        if (!on) {
+            if (sextant) nv = (v & ~m) | 0x20;
+            else nv = 0x20;   // a letter or a control code goes as a whole
+        } else {
+            if (v < 0x20) { status("a control code is in this cell \xE2\x80\x94 erase it first (right button)"); return; }
+            if (colour_at(c) != pen_colour) {
+                int left = c ? R[c - 1] & 0x7F : -1;
+                bool free = left == 0x20 || (left >= 0x01 && left <= 0x07) || (left >= 0x10 && left <= 0x17);
+                if (!free) { status("no free cell left of this one for the mosaic colour code \xE2\x80\x94 erase one (right button) or draw one cell further"); return; }
+                code = 0x10 + pen_colour;
+            }
+            if (!sextant) v = 0x20;   // a letter: the cell starts empty
+            nv = v | m | 0x20;
+        }
+        if (nv == (R[c] & 0x7F) && code < 0) return;
+        if (!stroke_saved) { push(); stroke_saved = true; }
+        Row &D = row(r);
+        if (code >= 0) D[c - 1] = (uint8_t)code;
+        D[c] = (uint8_t)nv;
+        cursor_r = r; cursor_c = c;
+        touch(); draw();
+    }
+    // the pencil's colour taken from the page (Ctrl+click or the middle button): the colour a cell is shown in,
+    // text or mosaic (white at the start of a row)
+    void pick_colour(int x, int y, int w, int h)
+    {
+        if (cur.empty() || w <= 0 || h <= 0) return;
+        int r = std::clamp(y * 25 / h, 0, 24), c = std::clamp(x * 40 / w, 0, 39);
+        auto it = snap().rows.find(r);
+        int col = 7;
+        if (it != snap().rows.end())
+            for (int k = 0; k < c; k++) { int v = it->second[k] & 0x7F; if (v >= 0x01 && v <= 0x07) col = v; else if (v >= 0x11 && v <= 0x17) col = v - 0x10; }
+        pen_colour = col;
+        pencil_label();
+        status("pencil colour taken from row " + std::to_string(r) + ", column " + std::to_string(c));
+    }
+    void pencil_label()
+    {
+        static const char *cn[8] = {"", "red", "green", "yellow", "blue", "magenta", "cyan", "white"};
+        set_text(c_pencil, std::string("Pencil: ") + cn[pen_colour] + " (M buttons or Ctrl+click choose the colour, right button erases)");
+        layout();
+    }
     void insert(int code) { if (cur.empty()) return; if (set_char(code)) move(0, 1); SetFocus(screen.hwnd); }
     void on_key(WPARAM vk)
     {
@@ -443,10 +511,46 @@ struct TeletextWin : Window {
     void on_char(wchar_t ch)
     {
         if (cur.empty() || ch < 0x20 || ch == 0x7F) return;
-        auto rev = charset_reverse(P.table(&page()));
-        auto it = rev.find((char32_t)ch);
-        if (it == rev.end()) { status("the character \xE2\x80\x9C" + from_cp(ch) + "\xE2\x80\x9D is not in this page's character set"); return; }
-        if (set_char(it->second)) move(0, 1);
+        const Charset &t1 = P.table(&page());
+        // ESC (0x1B) in a row switches between the page's set and the second set: the set in use at the cursor
+        auto in_second = [&](int c) {
+            bool sec = false;
+            auto r = snap().rows.find(cursor_r);
+            if (r != snap().rows.end()) for (int k = 0; k < c && k < 40; k++) if ((r->second[k] & 0x7F) == 0x1B) sec = !sec;
+            return sec;
+        };
+        auto code_in = [&](const Charset *t) { if (!t) return -1; auto rev = charset_reverse(*t); auto it = rev.find((char32_t)ch); return it == rev.end() ? -1 : it->second; };
+        const Charset *t2 = P.table2();
+        bool sec = t2 && in_second(cursor_c);
+        int code = code_in(sec ? t2 : &t1);
+        if (code >= 0) { if (set_char(code)) move(0, 1); return; }
+        // a letter of the other alphabet (English on a Russian page, Russian on an English one): through the
+        // second set - ESC, the letter, ESC back if the row goes on; the next letters of the word take the place
+        // of that closing ESC, so a word costs two cells
+        if (!t2 && code_in(&charset_table("latin", 0)) >= 0 && code_in(&t1) < 0) {
+            P.set_charset2("latin"); update_charset_menu(); t2 = P.table2();
+        } else if (!t2 && code_in(&charset_table("cyr2", 0)) >= 0 && code_in(&t1) < 0) {
+            P.set_charset2("cyr2"); update_charset_menu(); t2 = P.table2();
+        }
+        int other = code_in(sec ? &t1 : t2);
+        if (other < 0) { status("the character \xE2\x80\x9C" + from_cp(ch) + "\xE2\x80\x9D is in neither character set of this page"); return; }
+        if (!editable()) return;
+        if (cursor_r == 0 && cursor_c < 8) { status("the first 8 positions of the header are filled automatically"); return; }
+        int c = cursor_c;
+        Row &R = row(cursor_r);
+        bool closing = (R[c] & 0x7F) == 0x1B && c > 0 && in_second(c) != sec;   // the closing ESC of a word in the other set
+        if (!closing && c >= 39) { status("no room at the end of the row for the switch to the other character set"); return; }
+        push();
+        int at = c;
+        if (!closing) R[at++] = 0x1B;
+        R[at] = (uint8_t)other;
+        bool more = false;
+        for (int k = at + 1; k < 40; k++) more |= (R[k] & 0x7F) != 0x20;
+        if (at + 1 < 40 && (more || closing)) R[at + 1] = 0x1B;
+        touch();
+        cursor_c = at;
+        move(0, 1);
+        if (!closing) status("second character set (ESC) for \xE2\x80\x9C" + from_cp(ch) + "\xE2\x80\x9D: it takes one cell before the word and one after");
     }
     void action(int i)
     {
@@ -506,21 +610,29 @@ struct TeletextWin : Window {
     {
         if (cur.empty()) return;
         bool clean = false;
-        if (full) {
-            if (ask(hwnd, "Export", "Write output_full.t42, output_full.html and the folder html_full/ (complete pages only \xE2\x80\x94 one per subpage) to\n" +
-                    P.outdir + "?\nExisting files will be replaced.", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
-        } else {
-            int r = ask(hwnd, "Export", "Write output.t42, output.html and the folder html/ to\n" + P.outdir + "\n(existing files will be replaced).\n\n"
+        if (!full) {
+            int r = ask(hwnd, "Export", "Write output.t42, output.html and the folder html/ (the folder is chosen next).\n\n"
                         "Clean the stream as well?\n"
                         "Yes \xE2\x80\x94 output.t42 gets one assembled copy of every subpage, without repeats and damaged copies (like Clean stream)\n"
                         "No \xE2\x80\x94 every version as it was received", MB_YESNOCANCEL | MB_ICONQUESTION);
             if (r == IDCANCEL) return;
             clean = r == IDYES;
         }
+        // the folder: the last one used, else the recording's; a folder <recording>_teletext is made in it
+        Json st = load_state();
+        std::string start = st.get_str("export_dir");
+        if (start.empty()) start = R->path.substr(0, R->path.find_last_of("\\/"));
+        std::string where = pick_folder(hwnd, full ? "Export complete pages: choose the folder" : "Export: choose the folder", start);
+        if (where.empty()) return;
+        st["export_dir"] = where;
+        save_state(st);
+        std::string dest = path_join(where, basename(stem_path(R->path)) + "_teletext");
+        if (full && ask(hwnd, "Export", "Write output_full.t42, output_full.html and the folder html_full/ (complete pages only \xE2\x80\x94 one per subpage) to\n" +
+                        dest + "?\nExisting files will be replaced.", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
         if (!edited.empty()) save();
         Pages copy = pages; Project pc = P;
         auto res = std::make_shared<std::string>();
-        run_task(hwnd, "Export", [copy, pc, full, clean, res](Progress &pr) { pr.step("exporting"); *res = pc.export_all(copy, full, clean); pr.log(*res); },
+        run_task(hwnd, "Export", [copy, pc, full, clean, res, dest](Progress &pr) { pr.step("exporting"); *res = pc.export_all(copy, full, clean, dest); pr.log(*res); },
                  [this, res](bool ok) { status(ok ? *res : "export error"); });
     }
     void save_png()
@@ -530,24 +642,52 @@ struct TeletextWin : Window {
         std::string f = save_file(hwnd, "Save page as PNG", basename(stem_path(R->path)) + "_" + cur + fmt("_v%zu.png", ver + 1), "png");
         if (!f.empty()) { png_save(f, im.scaled(im.w * 2, im.h * 2)); status("saved: " + f); }
     }
-    // Clean stream (as vhs-teletext "squash"): damaged words restored, one copy of every subpage
-    // assembled by majority, garbage versions dropped -> clean.t42, built into "clean/" and shown here;
-    // pressed again it goes back to the pages as received
-    void do_squash()
+    // Clean (this program): damaged words restored, one copy of every subpage assembled by majority, garbage
+    // versions dropped; Squash: the squash of VHSTTX 2.7 - V1 (copies with the same text), V3 (the same subcode),
+    // Auto (V1 or V3 for each page) or one of its profiles. Either -> clean.t42, built into "clean/" and shown here;
+    // pressed again (in the cleaned view) either goes back to the pages as received
+    void do_squash(bool vhsttx)
     {
         if (cur.empty()) return;
         if (projDir != R->teletext.project) {
             if (!can_leave()) return;
-            load_project(R->teletext.project); set_text(b_squash, "Clean stream"); layout(); return;
+            load_project(R->teletext.project); set_text(b_squash, "Clean"); set_text(b_vsquash, "Squash\xE2\x80\xA6"); layout(); return;
         }
+        // the folder is chosen here: the last one used, else the recording's
+        Json st = load_state();
+        std::string how;
+        if (vhsttx) {
+            static const char* keys[] = {"auto", "v1", "v3", "balanced", "aggressive", "conservative", "broken-subcodes"};
+            int method = choose(hwnd, "Squash (VHSTTX 2.7)", "Which copies of a subpage are taken as the same page:",
+                                {"Auto: V1 or V3 for each page (default)",
+                                 "V1: copies with the same text",
+                                 "V3: copies with the same subcode",
+                                 "Profile balanced",
+                                 "Profile aggressive",
+                                 "Profile conservative",
+                                 "Profile broken subcodes"},
+                                (int)st.get_num("squash_method", 0));
+            if (method < 0) return;
+            st["squash_method"] = method;
+            how = keys[method];
+        }
+        std::string start = st.get_str("clean_dir");
+        if (start.empty()) start = R->path.substr(0, R->path.find_last_of("\\/"));
+        std::string where = pick_folder(hwnd, std::string(vhsttx ? "Squash" : "Clean") + ": folder for clean.t42 and the cleaned pages", start);
+        if (where.empty()) return;
+        st["clean_dir"] = where;
+        save_state(st);
         if (!edited.empty()) save();
         auto res = std::make_shared<std::string>();
         auto out = std::make_shared<std::string>();
-        std::string dir = projDir;
-        run_task(hwnd, "Clean stream", [dir, res, out](Progress &pr) { *out = ttClean(dir, pr, *res); pr.log(*res); },
-                 [this, res, out](bool ok) {
+        std::string dir = projDir, dest = path_join(where, basename(stem_path(R->path)) + (vhsttx ? "_squash_" + how : std::string("_clean")));
+        run_task(hwnd, vhsttx ? "Squash" : "Clean", [dir, dest, res, out, how](Progress &pr) { *out = ttClean(dir, pr, *res, dest, how); pr.log(*res); },
+                 [this, res, out, vhsttx](bool ok) {
                      if (!ok) { status("cleaning failed"); return; }
-                     if (load_project(*out)) { status("cleaned: " + *res); set_text(b_squash, "Show as received"); layout(); }
+                     if (load_project(*out)) {
+                         status((vhsttx ? "squashed: " : "cleaned: ") + *res);
+                         set_text(b_squash, "Show as received"); set_text(b_vsquash, "Show as received"); layout();
+                     }
                  });
     }
     // restore damaged words: built-in dictionaries, the recording's own words, Yandex Speller;
@@ -706,7 +846,13 @@ struct TeletextWin : Window {
                 status("second set (ESC): " + CS2[id - M_CS2_0].second + " \xE2\x80\x94 saved in the project"); return 0;
             }
             if (id >= ID_ACT0 && id < ID_ACT0 + 6) { action(id - ID_ACT0); return 0; }
-            if (id >= ID_PAL0 && id < ID_PAL0 + 14) { int i = id - ID_PAL0; insert(i < 7 ? i + 1 : 0x10 + i - 6); return 0; }
+            if (id >= ID_PAL0 && id < ID_PAL0 + 14) {
+                int i = id - ID_PAL0;
+                // with the pencil on, a mosaic colour is the pencil's colour
+                if (checked(c_pencil) && i >= 7) { pen_colour = i - 6; pencil_label(); SetFocus(screen.hwnd); return 0; }
+                insert(i < 7 ? i + 1 : 0x10 + i - 6);
+                return 0;
+            }
             if (id >= ID_PAL2_0 && id < ID_PAL2_0 + 7) { static const int c[7] = {0x1d, 0x1c, 0x0d, 0x0c, 0x19, 0x1a, 0x18}; insert(c[id - ID_PAL2_0]); return 0; }
             switch (id) {
             case ID_SAVE: case M_SAVE: save(); break;
@@ -714,7 +860,8 @@ struct TeletextWin : Window {
             case M_EXPORT_FULL: do_export(true); break;
             case M_EXPORT_SRT: export_srt(); break;
             case M_PNG: save_png(); break;
-            case ID_SQUASH: case M_SQUASH: do_squash(); break;
+            case ID_SQUASH: case M_SQUASH: do_squash(false); break;
+            case ID_VSQUASH: case M_VSQUASH: do_squash(true); break;
             case ID_WORDS: case M_WORDS: do_words(); break;
             case M_OPEN_FOLDER: if (has_project) open_path(P.outdir); break;
             case M_CLOSE: PostMessageW(hwnd, WM_CLOSE, 0, 0); break;
@@ -725,6 +872,7 @@ struct TeletextWin : Window {
             case ID_PREV: step(-1); break; case ID_NEXT: step(1); break;
             case ID_VPREV: step_ver(-1); break; case ID_VNEXT: step_ver(1); break;
             case ID_REVEAL: case ID_TV: case ID_CODES: draw(); break;
+            case ID_PENCIL: status(checked(c_pencil) ? "pencil: left button draws the mosaic pixels in its colour (the M buttons choose it, Ctrl+click or the middle button takes it from the page), right button erases anything; Ctrl+Z undoes a stroke" : "pencil off: click a character and type"); SetFocus(screen.hwnd); break;
             case ID_FULL: ver = 0; draw(); break;
             }
             return 0;
@@ -755,15 +903,32 @@ LRESULT Screen::proc(UINT m, WPARAM w, LPARAM l)
         return 0;
     }
     case WM_ERASEBKGND: return 1;
-    case WM_LBUTTONDOWN: {
-        SetFocus(hwnd);
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MOUSEMOVE: {
         if (!app->has_project) return 0;
         RECT r; GetClientRect(hwnd, &r);
+        if (checked(app->c_pencil)) {
+            if (m == WM_LBUTTONDOWN && (w & MK_CONTROL)) { SetFocus(hwnd); app->pick_colour(GET_X_LPARAM(l), GET_Y_LPARAM(l), r.right, r.bottom); return 0; }
+            if (m == WM_MOUSEMOVE) {
+                SetCursor(LoadCursor(nullptr, IDC_CROSS));
+                if (!app->stroke) return 0;
+            } else { SetFocus(hwnd); SetCapture(hwnd); app->stroke = true; app->stroke_saved = false; }
+            bool on = m == WM_LBUTTONDOWN || (m == WM_MOUSEMOVE && (w & MK_LBUTTON));
+            app->pencil_at(GET_X_LPARAM(l), GET_Y_LPARAM(l), r.right, r.bottom, on);
+            return 0;
+        }
+        if (m != WM_LBUTTONDOWN) return 0;
+        SetFocus(hwnd);
         app->cursor_r = std::min(24, (int)(GET_Y_LPARAM(l) * 25 / std::max(1L, r.bottom)));
         app->cursor_c = std::min(39, (int)(GET_X_LPARAM(l) * 40 / std::max(1L, r.right)));
         app->draw();
         return 0;
     }
+    case WM_MBUTTONDOWN:   // the pencil's colour from the page
+        if (app->has_project && checked(app->c_pencil)) { RECT r; GetClientRect(hwnd, &r); app->pick_colour(GET_X_LPARAM(l), GET_Y_LPARAM(l), r.right, r.bottom); }
+        return 0;
+    case WM_LBUTTONUP: case WM_RBUTTONUP: if (app->stroke) { app->stroke = false; ReleaseCapture(); } return 0;
+    case WM_CAPTURECHANGED: app->stroke = false; return 0;
+    case WM_SETCURSOR: if (checked(app->c_pencil) && LOWORD(l) == HTCLIENT) { SetCursor(LoadCursor(nullptr, IDC_CROSS)); return TRUE; } break;
     case WM_SETFOCUS: case WM_KILLFOCUS: InvalidateRect(hwnd, nullptr, FALSE); return 0;
     case WM_GETDLGCODE: return DLGC_WANTALLKEYS | DLGC_WANTCHARS | DLGC_WANTARROWS;
     case WM_KEYDOWN: if (!(GetKeyState(VK_CONTROL) & 0x8000)) app->on_key(w); return 0;
@@ -832,6 +997,7 @@ void teletext_window(HWND owner, const ResultPtr &r)
 {
     auto *w = new TeletextWin; w->R = r;
     w->create(L"TRTeletext", "Teletext \xE2\x80\x94 " + file_name(*r), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, S(owner, 1320), S(owner, 920), owner);
+    fit_large(w->hwnd);
     if (w->hwnd) ShowWindow(w->hwnd, SW_SHOW);
 }
 }

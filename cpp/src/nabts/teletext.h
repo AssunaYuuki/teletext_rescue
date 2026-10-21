@@ -51,3 +51,8 @@ using Over = std::map<std::pair<int, int>, std::string>;   // поправки X
 std::vector<Cell> level1_cells(const Rows &rows, const Charset &t, const Charset *t2, const Over *over,
                                bool *has_flash = nullptr, bool *has_box = nullptr);
 std::map<int, std::string> row_texts(const Rows &rows, const Charset &t, const Charset *t2, const Over *over);
+// Russian teletext writes English names with the Latin letters of the same codes (no ESC to a second set):
+// how much more the word looks English read in Latin than Russian read in Cyrillic (mean log probability
+// of its letter pairs, abc_pairs.inc), -99 when the Russian dictionary knows it or a letter is outside
+// both alphabets; enKnown: the English / German dictionary knows the Latin reading (words.cpp)
+double latin_score(const std::u32string &cyr, const std::u32string &lat, bool *enKnown);

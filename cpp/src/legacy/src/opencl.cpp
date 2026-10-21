@@ -188,8 +188,9 @@ void need() { std::lock_guard<std::mutex> lk(mu); init(); if (!ok) throw std::ru
 }
 
 namespace gpu {
+bool g_allowed = true;   // TeletextRescue: false when the user chose the processor
 bool available() {
-    if (getenv("TR_NO_GPU")) return false;
+    if (getenv("TR_NO_GPU") || !g_allowed) return false;
     std::lock_guard<std::mutex> lk(mu); init(); return ok;
 }
 std::string device_name() { available(); return name; }

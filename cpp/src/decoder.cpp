@@ -1,16 +1,24 @@
 #include "decoder.h"
 #include "ui/util.h"
 #include "jtes.h"
+#include "jtesrx.h"
 #include "flac.h"
 #include "colour.h"
 #include "tvinorpak.h"
+#include "tviftr3.h"
+#include "tvtime.h"
 #include "rescache.h"
 #include "slicer.h"
+#include "live.h"
+#include "legacy_bridge.h"
+#include "ttpages.h"
+#include "teletext.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <set>
 #include "fastdata_core.h"
@@ -86,6 +94,20 @@ bool looksLikeTestSignal(const std::vector<uint8_t>& probe, int probeN, const Vb
 }
 
 } // namespace
+
+static const char* const kForceName[] = {
+    "Automatic", "Nothing (skip the line)", "Captions / XDS / StarSight (32 x fH)", "Silent Radio (80 x fH)",
+    "Nielsen AMOL I (64 x fH)", "Gemstar 2x / 1x", "TV-Inform fT1 (111 x fH)", "TV-Inform fT2 (222 x fH)",
+    "5.7 Mbit/s: NABTS / WST 525 / 2D", "Teletext WST 625 (old engine)", "VITC time code", "Test signal (VITS)",
+    "TV-Inform packets, Norpak (55 55 E7, 5.73 Mbit/s)", "TV-Inform fT3, RTR: file transfer (444 x fH, header FB AC)"};
+static const char* const kForceKey[] = {"auto", "none", "cc", "sr", "amol", "gemstar", "tvi1", "tvi2", "fast", "wst", "vitc", "test", "norpak", "tvi3"};
+const char* lineForceName(LineForce f) { return (int)f < (int)LineForce::Count ? kForceName[(int)f] : "?"; }
+const char* lineForceKey(LineForce f) { return (int)f < (int)LineForce::Count ? kForceKey[(int)f] : "?"; }
+LineForce lineForceFromKey(const std::string& k)
+{
+    for (int i = 0; i < (int)LineForce::Count; i++) if (k == kForceKey[i]) return (LineForce)i;
+    return LineForce::Count;
+}
 
 // How convincingly a geometry fits: the best line's share of frames where a
 // 608-style run-in (captions are on nearly every NTSC recording) is found.
@@ -214,30 +236,6 @@ static bool decodeTs(const std::string& path, const DecodeOptions& opt, DecodeRe
     return true;
 }
 
-// fТ1 bits read at fТ2 come in equal pairs. Share of equal pairs at the better of the two phases.
-static double tviPairShare(const std::vector<uint8_t>& w, int nbits, int* phase = nullptr)
-{
-    auto bit = [&](int k) { return (w[k / 8] >> (k % 8)) & 1; };
-    double best = 0;
-    for (int p = 0; p < 2; p++) {
-        int eq = 0, n = 0;
-        for (int k = p; k + 1 < nbits; k += 2, n++) eq += bit(k) == bit(k + 1);
-        double r = n ? (double)eq / n : 0;
-        if (r > best) { best = r; if (phase) *phase = p; }
-    }
-    return best;
-}
-// one bit of each pair: fТ2 bytes -> fТ1 bytes (bit 0 sent first)
-static std::vector<uint8_t> tviCollapse(const std::vector<uint8_t>& w, int nbits)
-{
-    int ph = 0;
-    tviPairShare(w, nbits, &ph);
-    std::vector<uint8_t> o((nbits / 2 + 7) / 8, 0);
-    for (int k = 0; ph + 2 * k < nbits && k < nbits / 2; k++)
-        if ((w[(ph + 2 * k) / 8] >> ((ph + 2 * k) % 8)) & 1) o[k / 8] |= 1 << (k % 8);
-    return o;
-}
-
 // 625-line recordings: the engine of the original Teletext Rescue reads them as it always did
 // (WST PAL teletext with its tape decoder, VPS, WSS, Nagravision/Syster, SECAM identification,
 // test signals) and keeps its results in "<recording>_vbi". Its line map fills the lines ours left.
@@ -248,8 +246,13 @@ static bool runLegacy(DecodeResult& res, const DecodeOptions& opt, const std::st
     if (opt.progress) opt.progress(0, "625 lines: teletext, VPS, Syster (Teletext Rescue engine)");
     LegacyReport L;
     std::string e;
-    if (!legacyRun(src, opt.again, [&](const std::string& s) { if (opt.progress) opt.progress(0, s); },
-                   [&](const std::string& s) { note("  " + s); }, opt.cancel, L, e)) {
+    // lines set by hand: teletext / 55 55 E7 packets go to the old engine, all others are not its lines
+    std::map<int, std::string> force;
+    for (auto& kv : opt.lineForce)
+        if (kv.second != LineForce::Auto)
+            force[kv.first] = kv.second == LineForce::Teletext625 ? "WST PAL teletext" : (kv.second == LineForce::Fast || kv.second == LineForce::Norpak) ? "NABTS" : "empty";
+    if (!legacyRun(src, opt.again || !force.empty(), [&](const std::string& s) { if (opt.progress) opt.progress(0, s); },
+                   [&](const std::string& s) { note("  " + s); }, opt.cancel, L, e, force, opt.gpu)) {
         if (opt.cancel && *opt.cancel) { err = "cancelled"; return false; }
         note("Teletext Rescue engine: " + e);
         return true;
@@ -260,13 +263,17 @@ static bool runLegacy(DecodeResult& res, const DecodeOptions& opt, const std::st
     // them (pilot test), so where the old engine reads such packets, every fТ2 guess on these lines
     // is the same packet signal (ORT 2002: lines 7 and 321 too)
     auto gostPk = [](int tv) { return (tv >= 7 && tv <= 9) || (tv >= 320 && tv <= 322); };
+    // 625 lines: 55 55 E7 packets on any line are ТВ-информ with Norpak equipment (ORT 2001, sample.vbi:
+    // lines 17-19 / 331-333); NABTS itself never ran on 625-line TV
     bool norpak = false;
-    for (auto& l : L.lines) norpak |= l.kind == "NABTS" && gostPk(l.tvLine);
+    std::set<int> pkLines;
+    for (auto& l : L.lines)
+        if (l.kind == "NABTS") { norpak = true; pkLines.insert(l.tvLine); }
     if (norpak)
         for (size_t i = 0; i < res.lines.size();) {
             LineInfo& li = res.lines[i];
             int tv = li.field == 2 ? li.lineNo + 313 : li.lineNo;
-            if (li.mode == MODE_TVINFORM && li.tviRate == 1 && gostPk(tv)) {
+            if (li.mode == MODE_TVINFORM && li.tviRate == 1 && (gostPk(tv) || pkLines.count(tv))) {
                 int ln = li.lineNo, fl = li.field;
                 res.tvinform.erase(std::remove_if(res.tvinform.begin(), res.tvinform.end(), [&](const TviStream& t) {
                                        return !t.words.empty() && t.words[0].lineNo == ln && t.words[0].field == fl;
@@ -283,13 +290,16 @@ static bool runLegacy(DecodeResult& res, const DecodeOptions& opt, const std::st
         // ТВ-информ guess: NRZ teletext sliced at fТ2 also passes the pilot test (1.vbi, NTV)
         // The old engine does not know ТВ-информ and calls its lines "NABTS" or "datacast"
         // (ORT 1999/2002), so those never win. Teletext only beats an fТ2 line it reads more
-        // surely than we do (fТ1 lines are too slow to be mistaken); VPS, WSS, Syster always win.
+        // surely than we do (fТ1 lines are too slow to be mistaken); WSS, Syster always win. "VPS" is only
+        // the old engine's 5 MHz clock guess on line 16: an fТ2 line we slice in most frames stays ТВ-информ
+        // (ORT 2001, sample.vbi line 16: 85%, no VPS start code; NTV+ VPS line: 32%)
         bool wst = l.kind.find("WST") != std::string::npos;
-        bool fixedSvc = l.kind.rfind("VPS", 0) == 0 || l.kind.rfind("WSS", 0) == 0 || l.kind.find("Syster") != std::string::npos;
+        bool vps = l.kind.rfind("VPS", 0) == 0;
+        bool fixedSvc = vps || l.kind.rfind("WSS", 0) == 0 || l.kind.find("Syster") != std::string::npos;
         if (wst || fixedSvc)
             for (size_t i = 0; i < res.lines.size(); i++)
                 if (res.lines[i].index == l.row && res.lines[i].mode == MODE_TVINFORM &&
-                    (fixedSvc || (res.lines[i].tviRate == 1 && l.signal >= res.lines[i].detectRate))) {
+                    ((fixedSvc && !(vps && res.lines[i].detectRate >= 0.75)) || (wst && res.lines[i].tviRate == 1 && l.signal >= res.lines[i].detectRate))) {
                     int ln = res.lines[i].lineNo, fl = res.lines[i].field;
                     res.tvinform.erase(std::remove_if(res.tvinform.begin(), res.tvinform.end(), [&](const TviStream& t) {
                                            return !t.words.empty() && t.words[0].lineNo == ln && t.words[0].field == fl;
@@ -301,6 +311,9 @@ static bool runLegacy(DecodeResult& res, const DecodeOptions& opt, const std::st
         bool have = false;
         for (auto& li : res.lines) have |= li.index == l.row;
         if (have) continue;
+        // numbered from the field sync: the old engine's guesses on sync and picture lines (test signal,
+        // "interference", "data at ...": the broad and equalising pulses) are dropped
+        if (tvNotVbi(g, l.row) && (l.kind.rfind("test signal", 0) == 0 || l.kind.rfind("interference", 0) == 0 || l.kind.rfind("data at", 0) == 0)) continue;
         LineInfo li;
         li.index = l.row;
         li.field = l.tvLine > 313 ? 2 : 1;
@@ -309,11 +322,11 @@ static bool runLegacy(DecodeResult& res, const DecodeOptions& opt, const std::st
         li.detectRate = l.signal;
         li.kind = l.kind;
         if (li.kind.rfind("test signal", 0) == 0) { li.mode = MODE_TEST; li.kind = "Test signal (VITS)"; }
-        // 625 lines: 55 55 E7 packets (NABTS packet format) on lines 7-9 / 320-322 are ТВ-информ,
+        // 625 lines: 55 55 E7 packets (NABTS packet format) are ТВ-информ (lines 7-9 / 320-322, ORT 2001 17-19 / 331-333),
         // sent with Norpak equipment (GOST R 50822-95 lines; NABTS as a teletext service was never
         // used on Russian TV): ORT 1999 test transmission, ORT 2002 beacon
-        if ((li.kind.find("NABTS") != std::string::npos || li.kind.find("Didon") != std::string::npos || li.kind.find("TV-Inform") != std::string::npos) &&
-            ((l.tvLine >= 7 && l.tvLine <= 9) || (l.tvLine >= 320 && l.tvLine <= 322)))
+        if (li.kind.find("NABTS") != std::string::npos ||
+            ((li.kind.find("Didon") != std::string::npos || li.kind.find("TV-Inform") != std::string::npos) && gostPk(l.tvLine)))
             li.kind = "TV-Inform packets (Norpak, 55 55 E7)";
         (void)per;
         res.lines.push_back(li);
@@ -331,6 +344,10 @@ static bool runLegacy(DecodeResult& res, const DecodeOptions& opt, const std::st
                         TviStream ts;
                         ts.rate = -1; ts.nbits = 0;
                         ts.report = tn.report;
+                        for (auto& f : tn.files)
+                            if (!f.path.empty()) ts.files.push_back(f.path);
+                        ts.fileInfo = tn.files;
+                        ts.beacons = tn.beacons;
                         res.tvinform.erase(std::remove_if(res.tvinform.begin(), res.tvinform.end(), [](const TviStream& t) { return t.rate < 0; }), res.tvinform.end());
                         res.tvinform.push_back(std::move(ts));
                         r.note = fmt("%lld bundles corrected", (long long)tn.bundlesOk) + (tn.testPackets ? fmt(", %lld test-pattern packets", (long long)tn.testPackets) : "");
@@ -347,6 +364,103 @@ static bool runLegacy(DecodeResult& res, const DecodeOptions& opt, const std::st
     return true;
 }
 
+// 27 MHz captures of our own live window (SAA7231 / SAA713x, 1440 samples): the old engine resamples
+// them to the bt8x8 layout and may read no teletext at all, while the live decoder (run-in by
+// correlation, then the channel-fitting MLSE at the place it found) reads the same lines well
+// (capture_2026-10-15_003002: 0 pages vs 135). So when the lines carry WST and no pages came,
+// the recording goes through the live decoder and its .t42 makes the pages.
+static void liveTeletext(DecodeResult& res, const DecodeOptions& opt, const std::string& path,
+                         const std::function<void(const std::string&)>& note)
+{
+    const VbiGeometry& g = res.geom;
+    if (g.lineSamples * g.lineRate < 26e6 || g.lineSamples * g.lineRate > 28e6) return;
+    int wst = 0;
+    for (auto& li : res.lines) wst += li.kind.find("WST") != std::string::npos;
+    if (!wst && res.teletext.pages > 0) return;
+    if (!wst) {   // the engine knew no line at all (ntv111.vbi: "Unknown recording format"): a quick look the live way
+        int64_t fb0 = g.fileFrameBytes();
+        FILE* f0 = _wfopen(widen(path).c_str(), L"rb");
+        int64_t n0 = 0;
+        if (f0 && fb0 > 0) { _fseeki64(f0, 0, SEEK_END); n0 = _ftelli64(f0) / fb0; }
+        if (f0) fclose(f0);
+        LiveReadStats q;
+        liveReadTeletext(path, g, std::min<int64_t>(n0, 1500), false, {}, opt.cancel, q, std::max<int64_t>(0, n0 / 2 - 750));
+        if (q.packets < 200) return;
+    }
+    // rows 1-24 that came at least twice exactly the same (address and text), of all different rows: the old
+    // engine's tape decoder re-decides every byte among the code words, so its stream has a valid address
+    // even on noise - repeats tell the rows read from the noise
+    auto confirmed = [](const Bytes& s, size_t& different) {
+        std::map<std::string, int> seen;
+        for (size_t i = 0; i + 42 <= s.size(); i += 42) {
+            int a = ham::dec[s[i]], b = ham::dec[s[i + 1]];
+            if (a < 0 || b < 0) continue;
+            int row = (a >> 3) | (b << 1);
+            if (row >= 1 && row <= 24) seen[std::string((const char*)&s[i], 42)]++;
+        }
+        size_t n = 0;
+        for (auto& kv : seen) n += kv.second >= 2;
+        different = seen.size();
+        return n;
+    };
+    // a tape the tape decoder reads badly (tvinfoorm.vbi: 876 confirmed rows in 207 773 different ones; the
+    // live way 2 982 in 12 680): the live way is tried as well and the stream with more confirmed rows kept
+    size_t oldConf = 0;
+    if (!res.teletext.project.empty()) {
+        Bytes os;
+        try { os = read_file(path_join(res.teletext.project, "stream.t42")); } catch (...) {}
+        size_t diff = 0;
+        oldConf = confirmed(os, diff);
+        if (diff == 0 && res.teletext.pages > 0) return;   // no stream to compare with: keep the pages
+        if (diff && oldConf >= 0.2 * diff) return;          // a clean stream
+    }
+    int64_t fb = g.fileFrameBytes();
+    FILE* fi = _wfopen(widen(path).c_str(), L"rb");
+    if (!fi || fb <= 0) { if (fi) fclose(fi); return; }
+    _fseeki64(fi, 0, SEEK_END);
+    int64_t n = _ftelli64(fi) / fb;
+    fclose(fi);
+    if (opt.maxFrames > 0) n = std::min<int64_t>(n, opt.maxFrames);
+    std::string dir = path_join(legacyReportDir(opt.sourcePath.empty() ? path : opt.sourcePath), "teletext");
+    make_dirs(dir);
+    // in batches on the device chosen (graphics card / processor), not frame by frame on the processor
+    LiveReadStats rs;
+    Bytes st = liveReadTeletext(path, g, n, opt.gpu, opt.progress, opt.cancel, rs);
+    {
+        std::string ls;
+        for (int l : rs.lines) ls += (ls.empty() ? "" : ", ") + std::to_string(lineNoOf(g, l)) + (fieldOf(g, l) == 2 ? "/f2" : "");
+        note("teletext: lines " + (ls.empty() ? std::string("-") : ls) + ", " + std::to_string(rs.packets) + " packets (" +
+             std::to_string(rs.mended) + " headers with a mended address), read on " + (rs.onGpu ? "the graphics card" : "the processor"));
+    }
+    try { write_file(path_join(dir, "live.t42"), st); } catch (...) {}
+    if (st.size() < 42 * 50) return;
+    if (!res.teletext.project.empty()) {
+        size_t diff = 0, liveConf = confirmed(st, diff);
+        note("teletext: rows that came twice the same - tape decoder " + std::to_string(oldConf) + ", read the live way " + std::to_string(liveConf));
+        if (liveConf < 1.2 * oldConf) { note("teletext: the tape decoder's pages are kept"); return; }
+        note("teletext: the pages are built from the packets read the live way");
+        res.teletext = TtResult();
+    }
+    std::string terr;
+    if (ttBuild(st, false, dir, path, res.teletext, note, terr)) {
+        res.teletext.system = "625-line WST";
+        note("teletext: " + std::to_string(res.teletext.pages) + " pages, " + std::to_string(res.teletext.subpages) + " versions (live decoder)");
+    } else
+        note("teletext: no pages (" + terr + ")");
+}
+
+// the original program's engine guesses only Latin or Russian: Polish, Czech, Turkish ... pages are guessed again
+template <class Note> static void recheckCharset(DecodeResult& res, Note& note)
+{
+    try {
+        std::string cs = ttRecheckCharset(res.teletext.project);
+        if (cs.empty()) return;
+        std::string name = cs;
+        for (auto& cn : CHARSET_NAMES) if (cn.first == cs) name = cn.second;
+        note("teletext: character set " + name + " (guessed again from the words of the pages)");
+    } catch (...) {}
+}
+
 // as in the original program: the report goes to "<recording>_vbi/report.txt" (the old engine's
 // report.json and service files sit next to it)
 static void saveReport(const DecodeResult& res, const DecodeOptions& opt, const std::string& path)
@@ -355,7 +469,7 @@ static void saveReport(const DecodeResult& res, const DecodeOptions& opt, const 
         std::string dir = legacyReportDir(opt.sourcePath.empty() ? path : opt.sourcePath);
         make_dirs(dir);
         write_text(path_join(dir, "report.txt"), summarize(res));
-        saveResults(opt.sourcePath.empty() ? path : opt.sourcePath, res);
+        if (opt.maxFrames <= 0) saveResults(opt.sourcePath.empty() ? path : opt.sourcePath, res);   // a part of the recording is no result to keep
     } catch (...) {}
 }
 
@@ -391,6 +505,30 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
     VbiFormat format = opt.force;
     std::string formatLog;
     const std::string notes = capture_notes(path);   // e.g. "8bit, little-endian, 2048x32@25Hz"
+    // ТВ-информ fТ3 (RTR 2001): the line header FB AC is found only in the right layout of the file size
+    auto tvi3Layout = [&](VbiFormat c) {
+        VbiFile cf;
+        std::string cerr;
+        if (!cf.open(path, cerr, c)) return 0;
+        const VbiGeometry& cg = cf.geom();
+        const int pn = (int)std::min<int64_t>(cg.frames, 40);
+        if (pn < 10) return 0;
+        std::vector<uint8_t> pr((size_t)pn * cg.frameBytes()), one;
+        for (int i = 0; i < pn; i++) {
+            cf.read(cg.frames * i / pn, 1, one);
+            if (one.size() >= (size_t)cg.frameBytes()) std::copy(one.begin(), one.begin() + cg.frameBytes(), pr.begin() + (size_t)i * cg.frameBytes());
+        }
+        int lines = 0;
+        for (int l = 0; l < cg.linesPerFrame; l++)
+            lines += tvi3TestLine(pr.data(), pn, (size_t)cg.frameBytes(), (size_t)l * cg.lineBytes, cg.fmt, cg.validSamples, cg.lineSamples * (float)cg.lineRate) * 10 >= pn * 3;
+        return lines;
+    };
+    // our own recordings name their layout in <recording>.info ("format cx23885-pal, ...")
+    if (format == VbiFormat::Unknown && notes.rfind("format ", 0) == 0) {
+        std::string k = notes.substr(7, notes.find_first_of(", \r\n", 7) - 7);
+        VbiFormat nf = formatFromKey(k);
+        if (nf != VbiFormat::Unknown) { format = nf; formatLog += "layout named by the recording (.info): " + k + "\n"; }
+    }
     if (format == VbiFormat::Unknown) {
         // several chips share frame sizes (e.g. 1440 x 24 and 720 x 48 bytes),
         // so let the signal decide
@@ -402,6 +540,13 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
         // the capture notes name the field rate: 25 Hz = 625 lines, 30 Hz = 525 lines
         bool want625 = notes.find("@25") != std::string::npos || notes.find("PAL") != std::string::npos ||
                        notes.find("SECAM") != std::string::npos;
+        // a recording of ours without .info: <recording>.lines holds its first line; a number past 300 is
+        // the field-2 numbering of a 625-line driver (AVerMedia SAA7134: 313 -> 312)
+        if (FILE* lf = _wfopen(widen(path + ".lines").c_str(), L"rb")) {
+            int first = 0;
+            if (fscanf(lf, "%d", &first) == 1 && first > 300) { want625 = true; formatLog += "first line in .lines past 300: 625 lines\n"; }
+            fclose(lf);
+        }
         bool want525 = notes.find("@30") != std::string::npos || notes.find("@29") != std::string::npos ||
                        notes.find("NTSC") != std::string::npos;
         if (want625 != want525) {
@@ -434,9 +579,103 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
                 legacyPick = true;
             }
         }
+        // Japanese teletext tapes captured at 27 MHz (GV-USB2, Hauppauge): no 608 captions, and a 720-sample layout
+        // of the same frame size passes too ([NHK]-2001-10-13.vbi went to em28xx): the JTES receiver decides
+        if (best < 0.8 && !want625 && format != VbiFormat::Cx23885 &&
+            std::find(cands.begin(), cands.end(), VbiFormat::Cx23885) != cands.end()) {
+            VbiFile jf;
+            std::string jerr;
+            JtesRecRead jr;
+            std::unique_ptr<Slicer> js;   // the processor or the GPU, as chosen
+            if (opt.gpu) js = makeGpuSlicer(jerr);
+            if (!js) js = makeCpuSlicer(opt.threads);
+            if (jf.open(path, jerr, VbiFormat::Cx23885) && jtesProbeRecording(jf, *js, opt.cancel, jr)) {
+                formatLog += "Japanese teletext found in the 1440-sample layout: " + jr.why + "\n";
+                format = VbiFormat::Cx23885;
+                legacyPick = true;
+            }
+        }
+        if (!want525) {
+            // a layout of another frame size shifts the rows frame by frame but still finds the fТ3 lines on its
+            // rows (test3/part2.vbi: 1440 x 36 over a 1440 x 32 file): the one the file size is a whole number
+            // of frames of goes first
+            int best3 = 0;
+            bool bestExact = false;
+            VbiFormat f3 = VbiFormat::Unknown;
+            std::error_code fec;
+            const uintmax_t fsize = std::filesystem::file_size(std::filesystem::u8path(path), fec);
+            for (VbiFormat c : cands) {
+                if (!formatGeometry(c).pal) continue;
+                int n3 = tvi3Layout(c);
+                const int64_t fb = formatGeometry(c).fileFrameBytes();
+                const bool exact = !fec && fb > 0 && fsize % (uintmax_t)fb == 0;
+                if (n3) formatLog += fmt("format candidate %s: %d lines with the ТВ-информ fТ3 header%s\n", formatKey(c), n3, exact ? "" : " (file size not a whole number of its frames)");
+                if (n3 && (exact > bestExact || (exact == bestExact && n3 > best3))) { best3 = n3; f3 = c; bestExact = exact; }
+            }
+            // one header-like line in a layout the file does not divide into is chance (NHK 1996 4fsc u16 tape:
+            // saa713x-pal, 1 line - took it over 4fsc16 and lost 289 of 1418 pages)
+            if (f3 != VbiFormat::Unknown && !bestExact && best3 < 3) {
+                formatLog += "not taking " + std::string(formatKey(f3)) + " for fТ3: too few lines and not its frame size\n";
+                f3 = VbiFormat::Unknown;
+            }
+            if (f3 != VbiFormat::Unknown) {
+                formatLog += "taking " + std::string(formatKey(f3)) + ": its lines carry ТВ-информ fТ3\n";
+                format = f3;
+                legacyPick = true;
+            }
+        }
+        // SECAM tapes through a 1440-sample chip (CX23103 / CX231xx, SAA7113: K021-1): the 525-line layout of the
+        // same file size wins on caption-like lines, but the colour identification of lines 7-15 is only where the
+        // 625-line layout puts it - a SECAM picture decides for that layout
+        if (!legacyPick && !want525 && format != VbiFormat::Unknown && !formatGeometry(format).pal)
+            for (VbiFormat c : cands) {
+                if (!formatGeometry(c).pal) continue;
+                VbiFile cf;
+                std::string cerr;
+                if (!cf.open(path, cerr, c)) continue;
+                ColourInfo ci = detectColour(cf);
+                if (ci.system == "SECAM" && ci.secamLines >= 3) {
+                    formatLog += "SECAM line identification in the 625-line layout " + std::string(formatKey(c)) + ": taking it (" + ci.why + ")\n";
+                    format = c;
+                    legacyPick = true;
+                    break;
+                }
+            }
         if (!legacyPick && format != VbiFormat::Unknown && !formatGeometry(format).pal && pal != VbiFormat::Unknown && best < 0.5 && !want525) {
             formatLog += "no 608 captions: taking the 625-line layout " + std::string(formatKey(pal)) + "\n";
             format = pal;
+        }
+        // 625-line layouts of one file size (ntv111.vbi: 9 013 153 792 bytes = 137 529 bttv frames = 195 597 SAA713x
+        // frames) that captions cannot tell apart: the teletext read the live way on a minute from the middle decides.
+        // A capture stopped mid-frame leaves a part of a frame at the end (ntv111.vbi: 44 032 bytes after the last
+        // SAA713x frame), so every 625-line layout is tried here, not only the ones the size divides
+        // (also when a 525-line layout won without clear captions: a SECAM tape through a CX23103 / SAA7113 at
+        // 1440 x 18 lines has the ТВ-информ fТ1 carrier on line 19, which passes for captions in 1440 x 12)
+        // (not when only the lines are looked at - VBI lines opens at once; the layout can be changed there)
+        if (!opt.probeOnly && (best < 0.5 || (best < 0.9 && !legacyPick && !formatGeometry(format).pal)) && !want525) {
+            std::vector<VbiFormat> tries;
+            for (const char* k : {"bttv-pal", "cx88-pal", "cx23885-pal", "em28xx-pal", "saa7134-pal", "saa713x-pal", "ivtv-pal", "tbc-pal"}) {
+                VbiFormat c = formatFromKey(k);
+                if (c != VbiFormat::Unknown && size >= formatGeometry(c).fileFrameBytes() * 1500) tries.push_back(c);
+            }
+            size_t bestP = 0;
+            VbiFormat bf = VbiFormat::Unknown;
+            for (VbiFormat c : tries) {
+                VbiGeometry cg = formatGeometry(c);
+                if (tries.size() < 2 || cg.fileFrameBytes() <= 0) continue;
+                int64_t nf = size / cg.fileFrameBytes();
+                LiveReadStats rs;
+                liveReadTeletext(path, cg, 1500, false, {}, opt.cancel, rs, nf / 2);
+                // a wrong frame length lets the teletext drift over all the lines (cx23885-pal on ntv111: 36 lines),
+                // the right one keeps it on a few: packets per line found decide
+                size_t per = rs.packets / std::max<size_t>(1, rs.lines.size());
+                formatLog += fmt("format candidate %s: %zu teletext packets on %zu lines in a minute from the middle\n", formatKey(c), rs.packets, rs.lines.size());
+                if (rs.packets >= 200 && per > bestP) { bestP = per; bf = c; }
+            }
+            if (bestP > 0 && bf != format) {
+                formatLog += "taking " + std::string(formatKey(bf)) + ": its lines read as teletext\n";
+                format = bf;
+            }
         }
     }
     VbiFile vf;
@@ -450,7 +689,9 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
     res.colourWhy = colour.why;
     res.captureNotes = notes;
     // everything the decoder learns goes to the report and, live, to the GUI
-    auto note = [&](const std::string& m) {
+    static const bool timing = getenv("TR_TIMING") != nullptr;   // each line with the seconds since the start
+    auto note = [&](const std::string& m0) {
+        const std::string m = timing ? fmt("[%6.2f] ", now() - t0) + m0 : m0;
         res.log.push_back(m);
         if (opt.log) opt.log(m);
     };
@@ -467,6 +708,11 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
         if (b > a) note(formatLog.substr(a, b - a));
     }
     auto progress = [&](double f, const std::string& s) { if (opt.progress) opt.progress(f, s); };
+    // only open the recording (VBI lines window without decoding): format, geometry, colour system
+    if (opt.probeOnly) {
+        res.totalSeconds = now() - t0;
+        return true;
+    }
 
     std::unique_ptr<Slicer> slicer;
     if (opt.gpu) {
@@ -481,6 +727,15 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
     int64_t frames = g.frames;
     if (opt.maxFrames > 0 && opt.maxFrames < frames) frames = opt.maxFrames;
 
+    // lines set by hand: the decoder takes that signal there and looks for nothing else
+    res.lineForce = opt.lineForce;
+    auto forced = [&](int l) { auto it = opt.lineForce.find(l); return it == opt.lineForce.end() ? LineForce::Auto : it->second; };
+    auto lineName = [&](int l) {
+        return "line " + std::to_string(lineNoOf(g, l)) + " field " + std::to_string(fieldOf(g, l));
+    };
+    for (auto& kv : opt.lineForce)
+        if (kv.second != LineForce::Auto && kv.first >= 0 && kv.first < g.linesPerFrame)
+            note(lineName(kv.first) + ": set by hand to " + lineForceName(kv.second));
     // --- probe: which lines carry which signal ---------------------------
     progress(0, "Looking at the recording: what each line carries");
     note("finding lines with a signal");
@@ -508,19 +763,28 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
             rate[m] = (double)hits / probeN;
         }
         int m = rate[1] > rate[0] ? 1 : 0;
-        if (rate[m] < 0.75) continue;
+        const LineForce fc = forced(l);
+        if (fc == LineForce::Captions) m = MODE_CC;
+        else if (fc == LineForce::SilentRadio) m = MODE_SILENT_RADIO;
+        else if (fc != LineForce::Auto) continue;
+        if (fc == LineForce::Auto && rate[m] < 0.75) continue;
         // median start-bit position: the anchor that prevents bit slips
         std::vector<float> pos;
         for (int i = 0; i < probeN; i++) {
             const float* o = &out[((size_t)i * all.size() + l * 2 + m) * kSliceOut];
             if (detected(o, m)) pos.push_back(o[1]);
         }
+        if (pos.empty())   // set by hand, no clean run-in in the probe: where the slicer saw the line start
+            for (int i = 0; i < probeN; i++) {
+                const float* o = &out[((size_t)i * all.size() + l * 2 + m) * kSliceOut];
+                if (o[0] > 0) pos.push_back(o[1]);
+            }
+        if (pos.empty()) { note(lineName(l) + ": set by hand, but no signal to slice there"); continue; }
         std::nth_element(pos.begin(), pos.begin() + pos.size() / 2, pos.end());
         float anchor = pos[pos.size() / 2];
         LineInfo li;
         li.index = l;
-        li.field = l < g.linesPerFrame / 2 ? 1 : 2;
-        li.lineNo = g.firstLine + l % (g.linesPerFrame / 2);
+        lineOf(g, l, li.lineNo, li.field);
         li.mode = m;
         li.detectRate = rate[m];
         res.lines.push_back(li);
@@ -533,10 +797,11 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
     }
     // --- AMOL I (Nielsen): 48 bits at 64 x fH ---------------------------
     std::vector<LineInfo> amolLines;
-    for (int l = 0; l < g.linesPerFrame && !g.pal; l++) {
+    for (int l = 0; l < g.linesPerFrame; l++) {
+        if (g.pal && forced(l) != LineForce::Amol) continue;
         bool used = false;
         for (auto& j : jobs) used |= j.line == l;
-        if (used) continue;
+        if (used || (forced(l) != LineForce::Auto && forced(l) != LineForce::Amol)) continue;
         int hits = 0;
         for (int i = 0; i < probeN; i++) {
             uint64_t bits;
@@ -544,11 +809,10 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
             hits += amolSlice(&probe[(size_t)i * g.frameBytes() + (size_t)l * g.lineBytes], g.fmt, g.validSamples,
                               g.lineSamples, bits, q);
         }
-        if (hits * 2 < probeN) continue;
+        if (hits * 2 < probeN && forced(l) != LineForce::Amol) continue;
         LineInfo li;
         li.index = l;
-        li.field = l < g.linesPerFrame / 2 ? 1 : 2;
-        li.lineNo = g.firstLine + l % (g.linesPerFrame / 2);
+        lineOf(g, l, li.lineNo, li.field);
         li.mode = MODE_AMOL;
         li.detectRate = (double)hits / probeN;
         li.kind = "AMOL (Nielsen)";
@@ -560,7 +824,9 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
     }
     // --- Gemstar 2x: frame code 10011101101 + 32 bits at 64 x fH ----------
     std::vector<LineInfo> gemLines;
-    for (int l = 0; l < g.linesPerFrame && !g.pal; l++) {
+    for (int l = 0; l < g.linesPerFrame; l++) {
+        if (g.pal && forced(l) != LineForce::Gemstar) continue;
+        if (forced(l) != LineForce::Auto && forced(l) != LineForce::Gemstar) continue;
         bool used = false;
         for (auto& j : jobs) used |= j.line == l;
         for (auto& a : amolLines) used |= a.index == l;
@@ -572,11 +838,10 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
             hits += gemstarSlice2x(&probe[(size_t)i * g.frameBytes() + (size_t)l * g.lineBytes], g.fmt, g.validSamples,
                                    g.lineSamples, w, q) && q > 0.2f;
         }
-        if (hits * 4 < probeN) continue;
+        if (hits * 4 < probeN && forced(l) != LineForce::Gemstar) continue;
         LineInfo li;
         li.index = l;
-        li.field = l < g.linesPerFrame / 2 ? 1 : 2;
-        li.lineNo = g.firstLine + l % (g.linesPerFrame / 2);
+        lineOf(g, l, li.lineNo, li.field);
         li.mode = MODE_GEMSTAR;
         li.detectRate = (double)hits / probeN;
         li.kind = "Gemstar";
@@ -584,6 +849,34 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
         char b[160];
         snprintf(b, sizeof b, "  line %d field %d: Gemstar 2x/1x (VCR Plus+ / Guide Plus+ data)   signal %3.0f%%", li.lineNo, li.field,
                  li.detectRate * 100);
+        note(b);
+    }
+    // --- VITC time code: 90 bits at 115 / 116 x fH, a CRC on every line ---
+    std::vector<LineInfo> vitcLines;
+    for (int l = 0; l < g.linesPerFrame; l++) {
+        if (forced(l) != LineForce::Auto && forced(l) != LineForce::Vitc) continue;
+        bool used = false;
+        for (auto& j : jobs) used |= j.line == l;
+        for (auto& a : amolLines) used |= a.index == l;
+        for (auto& a : gemLines) used |= a.index == l;
+        if (used) continue;
+        int hits = 0;
+        for (int i = 0; i < probeN; i++) {
+            VitcCode c;
+            float q;
+            hits += vitcSlice(&probe[(size_t)i * g.frameBytes() + (size_t)l * g.lineBytes], g.fmt, g.validSamples, g.lineSamples, g.pal, c, q);
+        }
+        if (hits * 10 < probeN * 3 && forced(l) != LineForce::Vitc) continue;
+        LineInfo li;
+        li.index = l;
+        lineOf(g, l, li.lineNo, li.field);
+        li.mode = MODE_VITC;
+        li.detectRate = (double)hits / probeN;
+        li.kind = "VITC time code";
+        vitcLines.push_back(li);
+        char b[160];
+        snprintf(b, sizeof b, "  line %d field %d: VITC time code (90 bits at %d x fH)   signal %3.0f%%", li.lineNo, li.field,
+                 g.pal ? 116 : 115, li.detectRate * 100);
         note(b);
     }
     // --- ТВ-информ (GOST R 50822-95): NRZ at fТ2 = 3.46875 MHz, 180 bits,
@@ -601,56 +894,54 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
     // while an fТ1 line would also pass at fТ2. A clock needs at least ~6 samples/bit; a lower
     // sample rate (e.g. a 910-sample TBC decode) cannot tell ТВ-информ from NTSC datacast.
     for (int l = 0; l < g.linesPerFrame; l++) {
-        bool used = false;
-        for (auto& j : jobs) used |= j.line == l;
+        bool used = false, capJob = false;
+        for (auto& j : jobs) capJob |= j.line == l;
         for (auto& a : amolLines) used |= a.index == l;
         for (auto& a : gemLines) used |= a.index == l;
-        if (used) continue;
-        int rate = -1, hits = 0;
-        for (int r = 0; r < 2 && rate < 0; r++) {
-            if (tviT(r) < 6.0f) continue;
-            int h = 0;
-            float q;
-            std::vector<uint8_t> w;
-            int sig = 0, pre = 0;
-            for (int i = 0; i < probeN; i++) {
-                const uint8_t* p = &probe[(size_t)i * g.frameBytes() + (size_t)l * g.lineBytes];
-                sig += lineSwing(p, g.fmt, g.validSamples) >= 0.10f;
-                if (!tviSlice(p, g.fmt, g.validSamples, tviT(r), kTviBits[r], w, q)) continue;
-                h++;
-                auto idle = [](uint8_t v) { return v == 0x55 || v == 0xAA; };
-                int nIdle = 0;
-                bool lead = false;
-                for (size_t k = 0; k < w.size(); k++) {
-                    nIdle += idle(w[k]);
-                    if (k < 3 && k + 1 < w.size() && idle(w[k]) && idle(w[k + 1])) lead = true;
-                }
-                pre += lead || nIdle >= 4;
+        for (auto& a : vitcLines) used |= a.index == l;
+        const LineForce fc = forced(l);
+        // 625 lines: the fТ1 idle carrier (1010 at 1.73 MHz) also passes the caption-rate test
+        // (live SECAM capture 2026, Channel 1 line 19), so a caption line is tried here too
+        if (capJob && !(g.pal && fc == LineForce::Auto)) used = true;
+        if (used || (fc != LineForce::Auto && fc != LineForce::TviT1 && fc != LineForce::TviT2 && fc != LineForce::TviT3)) continue;
+        // a Russian SECAM service: on 525 lines only when set by hand (NHK 2001 line 21 is no ТВ-информ)
+        if (!g.pal && fc == LineForce::Auto) continue;
+        // fТ3 (RTR 2001): the header FB AC after the run-in is on every line, idle or not
+        if ((g.pal && fc == LineForce::Auto && !capJob) || fc == LineForce::TviT3) {
+            const int h3 = tvi3TestLine(probe.data(), probeN, (size_t)g.frameBytes(), (size_t)l * g.lineBytes, g.fmt, g.validSamples, fs);
+            if (h3 * 10 >= probeN * 3 || (fc == LineForce::TviT3 && h3 > 0)) {
+                LineInfo li;
+                li.index = l;
+                lineOf(g, l, li.lineNo, li.field);
+                li.mode = MODE_TVINFORM;
+                li.detectRate = (double)h3 / probeN;
+                li.kind = "TV-Inform fТ3, RTR (file transfer, 6.94 Mbit/s)";
+                li.tviRate = 2;
+                tviLines.push_back(li);
+                tviRates.push_back(2);
+                tviPairs.push_back(0);
+                char b[200];
+                snprintf(b, sizeof b, "  line %d field %d: ТВ-информ fТ3 (GOST R 50822-95, 6.9375 MHz, header FB AC)   signal %3.0f%%", li.lineNo,
+                         li.field, li.detectRate * 100);
+                note(b);
+                continue;
             }
-            // >= 60% of the probes that carry a signal slice with a pilot (the service may be on for only
-            // part of a recording), and real ТВ-информ lines start with the 0101 idle carrier / 55 55 sync
-            // (ORT: 5F 55 55.., ТВЦ: 55 55 27); a tape's own line signal at a similar rate does not (Piglet's Big Movie, UK VHS)
-            if (sig * 10 >= probeN && h * 10 >= sig * 6 && pre * 10 >= h) { rate = r; hits = h; }
         }
+        const TviLineTest tt = tviTestLine(probe.data(), probeN, (size_t)g.frameBytes(), (size_t)l * g.lineBytes, g.fmt, g.validSamples, fs,
+                                           fc == LineForce::TviT1 ? 0 : fc == LineForce::TviT2 ? 1 : -1, capJob);
+        const int rate = tt.rate, hits = tt.hits;
+        const bool pairs = tt.pairs;
         if (rate < 0) continue;
-        // an fТ1 line that the fТ1 pass missed (strong colour burst in the window, ТВЦ line 19)
-        // reads at fТ2 with every bit doubled: then it is fТ1, read at fТ2 and halved
-        bool pairs = false;
-        if (rate == 1) {
-            int dbl = 0, ok = 0;
-            float q;
-            std::vector<uint8_t> w;
-            for (int i = 0; i < probeN; i++)
-                if (tviSlice(&probe[(size_t)i * g.frameBytes() + (size_t)l * g.lineBytes], g.fmt, g.validSamples, tviT(1), kTviBits[1], w, q)) {
-                    ok++;
-                    dbl += tviPairShare(w, kTviBits[1]) >= 0.90;
-                }
-            pairs = ok && dbl >= 0.8 * ok;
+        if (capJob) {
+            jobs.erase(std::remove_if(jobs.begin(), jobs.end(), [&](const SliceJob& j) { return j.line == l; }), jobs.end());
+            res.lines.erase(std::remove_if(res.lines.begin(), res.lines.end(), [&](const LineInfo& li) {
+                                return li.index == l && (li.mode == MODE_CC || li.mode == MODE_SILENT_RADIO);
+                            }), res.lines.end());
+            note(lineName(l) + ": the caption-rate signal is the ТВ-информ idle carrier");
         }
         LineInfo li;
         li.index = l;
-        li.field = l < g.linesPerFrame / 2 ? 1 : 2;
-        li.lineNo = g.firstLine + l % (g.linesPerFrame / 2);
+        lineOf(g, l, li.lineNo, li.field);
         li.mode = MODE_TVINFORM;
         li.detectRate = (double)hits / probeN;
         li.kind = "TV-Inform";
@@ -675,7 +966,10 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
             for (auto& a : amolLines) used |= a.index == l;
             for (auto& a : gemLines) used |= a.index == l;
             for (auto& a : tviLines) used |= a.index == l;
-            if (used) continue;
+            for (auto& a : vitcLines) used |= a.index == l;
+            if (forced(l) == LineForce::Test) { testLines.push_back(l); continue; }
+            if (used || (forced(l) != LineForce::Auto && forced(l) != LineForce::Fast)) continue;
+            if (forced(l) == LineForce::Fast && !g.pal) { cand.push_back(l); continue; }
             int sig = 0;
             for (int i = 0; i < probeN; i++) {
                 float info[4];
@@ -695,11 +989,12 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
                 std::vector<const uint8_t*> ptr;
                 for (int f = 0; f < got; f++) ptr.push_back(&cbuf[(size_t)f * g.frameBytes() + (size_t)l * g.lineBytes]);
                 FastCalib c = fdCalibrate(ptr, g);
-                if (!c.ok || c.syncRate < 0.35) {
+                if (!c.ok || (c.syncRate < 0.35 && forced(l) != LineForce::Fast)) {
                     char b[128];
                     snprintf(b, sizeof b, "line index %d: no 5.7 Mbit/s sync (best %.0f%%)", l, c.syncRate * 100);
                     note(b);
-                    if (looksLikeTestSignal(probe, probeN, g, l)) testLines.push_back(l);
+                    if (forced(l) == LineForce::Fast) note(lineName(l) + ": set by hand to 5.7 Mbit/s, but no packet sync found");
+                    else if (looksLikeTestSignal(probe, probeN, g, l)) testLines.push_back(l);
                     continue;
                 }
                 FastJob fj;
@@ -710,8 +1005,7 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
                 fastJobs.push_back(fj);
                 LineInfo li;
                 li.index = l;
-                li.field = l < g.linesPerFrame / 2 ? 1 : 2;
-                li.lineNo = g.firstLine + l % (g.linesPerFrame / 2);
+                lineOf(g, l, li.lineNo, li.field);
                 li.mode = MODE_FAST;
                 li.detectRate = c.syncRate;
                 li.kind = c.kind == 'N' ? "NABTS" : c.kind == 'W' ? "WST teletext" : "Encrypted datacast (5.7 Mbit/s, framing 2D)";
@@ -732,11 +1026,14 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
     for (auto& a : gemLines) { gemLine.push_back(res.lines.size()); res.lines.push_back(a); }
     std::vector<size_t> tviLine; // index into res.lines
     for (auto& a : tviLines) { tviLine.push_back(res.lines.size()); res.lines.push_back(a); }
+    std::vector<size_t> vitcLine; // index into res.lines
+    for (auto& a : vitcLines) { vitcLine.push_back(res.lines.size()); res.lines.push_back(a); }
     for (int l : testLines) {
+        // numbered from the field sync: the sync and the picture lines are no test signals
+        if (tvNotVbi(g, l)) continue;
         LineInfo li;
         li.index = l;
-        li.field = l < g.linesPerFrame / 2 ? 1 : 2;
-        li.lineNo = g.firstLine + l % (g.linesPerFrame / 2);
+        lineOf(g, l, li.lineNo, li.field);
         li.mode = MODE_TEST;
         li.detectRate = 1;
         li.kind = "Test signal (VITS)";
@@ -745,9 +1042,14 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
     std::vector<std::vector<AmolWord>> amolWords(amolLine.size());
     std::vector<std::vector<GemstarWord>> gemWords(gemLine.size());
     std::vector<std::vector<TviWord>> tviWords(tviLine.size());
-    if (jobs.empty() && fastJobs.empty() && amolLine.empty() && gemLine.empty() && tviLine.empty()) {
+    std::vector<std::unique_ptr<Tvi3Slicer>> tvi3(tviLine.size());   // fТ3 lines: MLSE slicer each
+    for (size_t a = 0; a < tviLine.size(); a++)
+        if (tviRates[a] == 2) tvi3[a] = std::make_unique<Tvi3Slicer>(fs);
+    if (jobs.empty() && fastJobs.empty() && amolLine.empty() && gemLine.empty() && tviLine.empty() && vitcLine.empty()) {
         if (g.pal) {   // the old engine may still find teletext, VPS, Syster ...
             if (!runLegacy(res, opt, path, note, err)) return false;
+            liveTeletext(res, opt, path, note);
+            recheckCharset(res, note);
             res.totalSeconds = now() - t0;
             saveReport(res, opt, path);
             return true;
@@ -827,6 +1129,7 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
     note(mainMsg);
     progress(0, mainMsg);
     std::vector<uint8_t> buf;
+    std::vector<VitcCode> vitcAll;
     double sliceTime = 0;
     for (int64_t f0 = 0; f0 < frames; f0 += chunk) {
         if (opt.cancel && *opt.cancel) { err = "cancelled"; return false; }
@@ -881,6 +1184,11 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
         }
         for (size_t a = 0; a < tviLine.size(); a++) {
             const LineInfo& li = res.lines[tviLine[a]];
+            if (tvi3[a]) {
+                for (int f = 0; f < got; f++)
+                    tvi3[a]->add(&buf[(size_t)f * g.frameBytes() + (size_t)li.index * g.lineBytes], g.fmt, g.validSamples, f0 + f, li.lineNo, li.field);
+                continue;
+            }
             for (int f = 0; f < got; f++) {
                 TviWord w;
                 if (!tviSlice(&buf[(size_t)f * g.frameBytes() + (size_t)li.index * g.lineBytes], g.fmt, g.validSamples,
@@ -891,6 +1199,19 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
                 w.lineNo = li.lineNo;
                 w.field = li.field;
                 tviWords[a].push_back(std::move(w));
+            }
+        }
+        for (size_t a = 0; a < vitcLine.size(); a++) {
+            const LineInfo& li = res.lines[vitcLine[a]];
+            for (int f = 0; f < got; f++) {
+                VitcCode c;
+                float q;
+                if (!vitcSlice(&buf[(size_t)f * g.frameBytes() + (size_t)li.index * g.lineBytes], g.fmt, g.validSamples, g.lineSamples, g.pal, c, q))
+                    continue;
+                c.frame = f0 + f;
+                c.lineNo = li.lineNo;
+                c.field = li.field;
+                vitcAll.push_back(c);
             }
         }
         sliceTime += now() - ts;
@@ -983,16 +1304,46 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
         if (before != res.fastPackets.size())
             note("5.7 Mbit/s: " + std::to_string(before - res.fastPackets.size()) + " packets of a kind foreign to their line dropped");
     }
+    // --- Japanese teletext in a 27 MHz 8-bit capture (GV-USB2, Hauppauge USB-Live2): read by the JTES Decoder
+    // receiver (jtesrx.cpp) instead of the general 5.7 Mbit/s reading, which misses most of these packets
+    JtesRecRead jtesRx;
+    bool jtesOwn = false;
+    if (opt.probeOnly) {}
+    else if (opt.jtesHow && !opt.jtesHow->slots.empty()) { jtesRx = *opt.jtesHow; jtesOwn = true; }
+    else if (opt.jtesProbe) {
+        // JTES lines look like 'E' (NABTS sync, foreign header) to the first reading: only they and their neighbours
+        std::vector<int> eSlots;
+        for (int l = 0; l < g.linesPerFrame; l++) {
+            int ln, fl;
+            lineOf(g, l, ln, fl);
+            auto it = lineKind.find({ln, fl});
+            if (it != lineKind.end() && it->second == 'E') eSlots.push_back(l % (g.linesPerFrame / 2));
+        }
+        if (!eSlots.empty() && jtesProbeRecording(vf, *slicer, opt.cancel, jtesRx, eSlots)) {
+            jtesOwn = true;
+            if (opt.jtesFound) *opt.jtesFound = jtesRx;
+        }
+    }
+    std::set<std::pair<int, int>> jtesLines;
+    if (jtesOwn) {
+        note(jtesRx.why);
+        for (int s : jtesRx.slots)
+            for (int l : {s, s + 12}) {
+                int ln, fl;
+                lineOf(g, l, ln, fl);
+                jtesLines.insert({ln, fl});
+            }
+    }
     // --- 5.7 Mbit/s: second reading with a channel model fitted to every line
     if (!lineKind.empty() && !getenv("TR_FIRST_MLSE")) {
         std::vector<FastLineJob> sj;
         for (auto& fj : fastJobs) {
             FastLineJob j;
             j.index = fj.line;
-            j.field = fj.line < g.linesPerFrame / 2 ? 1 : 2;
-            j.lineNo = g.firstLine + fj.line % (g.linesPerFrame / 2);
+            lineOf(g, fj.line, j.lineNo, j.field);
             auto it = lineKind.find({j.lineNo, j.field});
             if (it == lineKind.end() || !strchr("NWXE", it->second)) continue;
+            if (jtesLines.count({j.lineNo, j.field})) continue;   // read by the JTES receiver below
             j.kind = it->second;
             if (j.kind == 'X') { // the line's service bytes (3 % of its packets or more)
                 std::map<int, int> sv;
@@ -1016,7 +1367,8 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
             note(msg);
             double ts = now();
             std::vector<std::pair<int, int>> rejected;
-            auto pk = fdSecondPass(vf, sj, opt.threads, opt.cancel, [&](double x) { progress(x, msg); }, note, &rejected);
+            auto pk = fdSecondPass(vf, sj, opt.threads, opt.cancel, [&](double x) { progress(x, msg); }, note, &rejected,
+                                   opt.gpu && res.slicerName.rfind("GPU", 0) == 0);
             if (opt.cancel && *opt.cancel) { err = "cancelled"; return false; }
             std::set<std::pair<int, int>> redone(rejected.begin(), rejected.end());
             for (auto& p : pk) redone.insert({p.lineNo, p.field});
@@ -1037,6 +1389,56 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
             char b[120];
             snprintf(b, sizeof b, "5.7 Mbit/s second reading: %.1f s", now() - ts);
             note(b);
+        }
+    }
+    if (jtesOwn) {
+        const std::string msg = "Japanese teletext: reading the lines with the JTES receiver";
+        note(msg);
+        double ts = now();
+        JtesRxStats st;
+        std::vector<FastPacket> pk;
+        std::string jerr;
+        if (!jtesReadRecording(vf, jtesRx, frames, *slicer, opt.cancel, [&](double x) { progress(x, msg); }, pk, jerr, &st)) {
+            err = "Japanese teletext receiver: " + jerr;
+            return false;
+        }
+        if (opt.cancel && *opt.cancel) { err = "cancelled"; return false; }
+        note("JTES receiver on " + res.slicerName);
+        note(fmt("JTES receiver: %lld lines read, %lld packets (%lld at once, %lld refined, %lld by a wide timing search), %lld idle; %.1f s",
+                 (long long)st.scanned, (long long)pk.size(), (long long)st.found, (long long)st.refined, (long long)st.wide,
+                 (long long)st.idle, now() - ts));
+        std::map<std::pair<int, int>, int64_t> per;
+        for (auto& p : pk) per[{p.lineNo, p.field}]++;
+        // the receiver's lines replace whatever the general reading made of them
+        res.fastPackets.erase(std::remove_if(res.fastPackets.begin(), res.fastPackets.end(),
+                                             [&](const FastPacket& p) { return jtesLines.count({p.lineNo, p.field}) > 0; }),
+                              res.fastPackets.end());
+        res.fastPackets.insert(res.fastPackets.end(), pk.begin(), pk.end());
+        std::stable_sort(res.fastPackets.begin(), res.fastPackets.end(), [](const FastPacket& a, const FastPacket& b) {
+            if (a.frame != b.frame) return a.frame < b.frame;
+            if (a.field != b.field) return a.field < b.field;
+            return a.lineNo < b.lineNo;
+        });
+        for (auto& kv : per) {
+            if (kv.second * 100 < frames) continue;   // under 1 % of the frames: a stray packet, not a JTES line
+            lineKind[kv.first] = 'E';
+            LineInfo* li = nullptr;
+            for (auto& x : res.lines)
+                if (x.lineNo == kv.first.first && x.field == kv.first.second) li = &x;
+            if (!li) {
+                res.lines.push_back(LineInfo());
+                li = &res.lines.back();
+                for (int l = 0; l < g.linesPerFrame; l++) {
+                    int ln, fl;
+                    lineOf(g, l, ln, fl);
+                    if (ln == kv.first.first && fl == kv.first.second) li->index = l;
+                }
+                li->lineNo = kv.first.first;
+                li->field = kv.first.second;
+            }
+            li->mode = MODE_FAST;
+            li->detectRate = std::min(1.0, (double)kv.second / std::max<int64_t>(1, frames));
+            li->kind = "Japanese teletext (JTES)";
         }
     }
     if (!res.fastPackets.empty()) {
@@ -1119,7 +1521,22 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
         note("Gemstar, line " + std::to_string(gs.lineNo) + " field " + std::to_string(gs.field) + ": " + std::to_string(gs.messages.size()) + " messages");
         res.gemstar.push_back(std::move(gs));
     }
+    {   // fТ3: one stream over all its lines (the data runs line after line, field 1 then field 2)
+        TviStream t3;
+        t3.rate = 2;
+        t3.nbits = kTviBits[2];
+        for (size_t a = 0; a < tviLine.size(); a++) {
+            if (!tvi3[a]) continue;
+            auto w = tvi3[a]->finish();
+            note("ТВ-информ fТ3, line " + std::to_string(res.lines[tviLine[a]].lineNo) + " field " +
+                 std::to_string(res.lines[tviLine[a]].field) + ": " + std::to_string(w.size()) + " lines with the header");
+            t3.words.insert(t3.words.end(), w.begin(), w.end());
+        }
+        std::stable_sort(t3.words.begin(), t3.words.end(), [](const TviWord& x, const TviWord& y) { return x.frame != y.frame ? x.frame < y.frame : x.field < y.field; });
+        if (!t3.words.empty()) res.tvinform.push_back(std::move(t3));
+    }
     for (size_t a = 0; a < tviLine.size(); a++) {
+        if (tvi3[a]) continue;
         TviStream tvi;
         tvi.rate = tviPairs[a] ? 0 : tviRates[a];
         tvi.nbits = kTviBits[tvi.rate];
@@ -1155,9 +1572,11 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
         }
         bool textField[3] = {false, false, false};
         std::vector<uint8_t> per[3], perValid[3];
+        std::vector<int64_t> perFrame[3];   // per byte pair
         for (size_t i = 0; i < s.soft.bytes.size(); i++) {
             per[s.field[i]].push_back(s.soft.bytes[i]);
             perValid[s.field[i]].push_back(s.valid[i]);
+            if (!(i & 1) && i / 2 < s.frame.size()) perFrame[s.field[i]].push_back(s.frame[i / 2]);
         }
         // XDS lives in field 2 only; when it turns up in the first stored
         // field, the capture has the fields the other way round
@@ -1189,13 +1608,13 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
                 snprintf(hdr, sizeof hdr, "--- line %d field 2: XDS ---", s.lineNo);
                 res.xds.push_back(hdr);
                 ccDecodeXds(per[fl], res.xds);
-                ccDecodeCaptions(per[fl], res.captions, 3);
+                ccDecodeCaptions(per[fl], res.captions, 3, &perFrame[fl], &res.captionCues);
                 setKind(fl, "XDS / CC3");
                 note("XDS, line " + std::to_string(s.lineNo) + " field 2");
             } else {
                 snprintf(hdr, sizeof hdr, "--- line %d field %d: captions ---", s.lineNo, logical);
                 res.captions.push_back(hdr);
-                ccDecodeCaptions(per[fl], res.captions, logical == 1 ? 1 : 3);
+                ccDecodeCaptions(per[fl], res.captions, logical == 1 ? 1 : 3, &perFrame[fl], &res.captionCues);
                 setKind(fl, "Captions");
                 note("captions, line " + std::to_string(s.lineNo) + " field " + std::to_string(logical));
             }
@@ -1234,11 +1653,46 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
         for (auto& t : res.tvinform) for (auto& w : t.words) w.field = 3 - w.field;
         for (auto& p : res.fastPackets) p.field = 3 - p.field;
     }
+    // VITC: one code per frame (the first line that read it), then the captions get their times
+    if (!vitcAll.empty()) {
+        std::stable_sort(vitcAll.begin(), vitcAll.end(), [](const VitcCode& a, const VitcCode& b) { return a.frame < b.frame; });
+        for (auto& c : vitcAll)
+            if (res.vitc.empty() || res.vitc.back().frame != c.frame) res.vitc.push_back(c);
+        res.vitcReport = vitcReport(res.vitc, g.pal, g.pal ? 25.0 : 30000.0 / 1001.0);
+        for (auto& l : res.vitcReport) note(l);
+    }
+    std::stable_sort(res.captionCues.begin(), res.captionCues.end(), [](const CaptionCue& a, const CaptionCue& b) { return a.frame < b.frame; });
+    if (!res.captionCues.empty())
+        note(std::string("captions: times from ") + (res.vitc.empty() ? "the place in the recording (no VITC time code)" : "the VITC time code of the tape"));
     for (auto& a : res.amol) amolBuildReport(a);
     gemstarGuide(res.gemstar);
     for (auto& a : res.gemstar) gemstarBuildReport(a);
-    for (auto& a : res.tvinform) tviBuild(a);
+    // a ТВ-информ guess that is the time code line (ORT 2001, sample.vbi line 6: sliced at fТ2 it passes)
+    if (g.pal)
+        for (auto& li : res.lines) {
+            if (li.mode != MODE_TVINFORM || !tvTimeProbe(vf, li.index)) continue;
+            TvTimeCode tc;
+            if (!tvTimeDecode(vf, li.index, opt.maxFrames, tc, opt.cancel)) continue;
+            int ln = li.lineNo, fl = li.field;
+            res.tvinform.erase(std::remove_if(res.tvinform.begin(), res.tvinform.end(), [&](const TviStream& t) {
+                                   return !t.words.empty() && t.words[0].lineNo == ln && t.words[0].field == fl;
+                               }), res.tvinform.end());
+            li.mode = MODE_TEST + 1;
+            li.kind = "Time code (1 MHz burst + 25 symbols a second)";
+            res.timeCode = tc.report;
+            for (auto& l : tc.report) note(l);
+            break;
+        }
+    for (auto& a : res.tvinform) {
+        if (a.rate != 2) { tviBuild(a); continue; }
+        // broadcast order of the fields (a capture may store field 2 first)
+        std::stable_sort(a.words.begin(), a.words.end(), [](const TviWord& x, const TviWord& y) { return x.frame != y.frame ? x.frame < y.frame : x.field < y.field; });
+        tvi3Build(a, legacyReportDir(opt.sourcePath.empty() ? path : opt.sourcePath), g.pal ? 25.0 : 30000.0 / 1001.0);
+        for (auto& l : a.report) note(l);
+    }
     if (g.pal && !runLegacy(res, opt, path, note, err)) return false;
+    if (g.pal) liveTeletext(res, opt, path, note);
+    recheckCharset(res, note);
     res.totalSeconds = now() - t0;
     saveReport(res, opt, path);
     return true;
@@ -1263,13 +1717,18 @@ std::vector<std::string> headline(const DecodeResult& r)
         std::string t = linesOf([](const LineInfo& li) { return li.mode == MODE_TVINFORM || li.kind.rfind("TV-Inform", 0) == 0; });
         std::string pk2 = linesOf([](const LineInfo& li) { return li.kind.rfind("TV-Inform packets", 0) == 0; });
         std::string pk = linesOf([](const LineInfo& li) { return li.kind.find("NABTS") != std::string::npos || li.kind.find("Didon") != std::string::npos; });
+        // the rate does not name the channel: fТ1 / fТ2 came on ORT, ТВЦ and RTR (test2, 2026 capture), fТ3 on RTR
+        bool f3 = false, f12 = false;
+        for (auto& li : r.lines)
+            if (li.mode == MODE_TVINFORM) (li.tviRate == 2 ? f3 : f12) = true;
+        std::string who = f3 && f12 ? "fТ1-fТ2 and fТ3" : f3 ? "fТ3 file transfer, as on RTR" : "fТ1-fТ2";
         if (t.empty() && !pk.empty())
             h.push_back("TV-Inform (\xD0\xA2\xD0\x92-\xD0\xB8\xD0\xBD\xD1\x84\xD0\xBE\xD1\x80\xD0\xBC): no GOST R 50822-95 lines; "
                         "packet datacast with 55 55 E7 sync on lines " + pk + " (possibly \xD0\xA2\xD0\x92-\xD0\xB8\xD0\xBD\xD1\x84\xD0\xBE\xD1\x80\xD0\xBC in packet form)");
         else
         h.push_back(t.empty() ? "TV-Inform (\xD0\xA2\xD0\x92-\xD0\xB8\xD0\xBD\xD1\x84\xD0\xBE\xD1\x80\xD0\xBC): none"
                               : "TV-Inform (\xD0\xA2\xD0\x92-\xD0\xB8\xD0\xBD\xD1\x84\xD0\xBE\xD1\x80\xD0\xBC): YES, lines " + t +
-                                    " (GOST R 50822-95 datacast; ORT / Channel 1)" + std::string(pk2.empty() ? "" : "; in packets 55 55 E7 on lines " + pk2));
+                                    " (GOST R 50822-95 datacast; " + who + ")" + std::string(pk2.empty() ? "" : "; in packets 55 55 E7 on lines " + pk2));
     }
     std::string tt = linesOf([](const LineInfo& li) { return li.kind.find("WST") != std::string::npos || li.kind == "Teletext stream" || li.kind == "DVB teletext"; });
     if (!tt.empty() || !r.teletext.project.empty())
@@ -1307,6 +1766,8 @@ std::string summarize(const DecodeResult& r)
         s.insert(e + 2, "Unpacked from: " + r.source + "\r\n");
     }
     for (auto& l : headline(r)) s += l + "\r\n";
+    for (auto& l : r.vitcReport) s += l + "\r\n";
+    for (auto& l : r.timeCode) s += l + "\r\n";
     s += "\r\n";
     auto air = onAirSummary(r);
     if (!air.empty()) {
@@ -1318,8 +1779,8 @@ std::string summarize(const DecodeResult& r)
     for (auto& li : r.lines) {
         snprintf(b, sizeof b, "  line %2d field %d  %-13s %3.0f%%  %s\r\n", li.lineNo, li.field,
                  li.mode == MODE_CC ? "32xfH (608)" : li.mode == MODE_FAST ? (r.geom.pal ? "444xfH (MLSE)" : "364xfH (MLSE)")
-                 : li.mode == MODE_AMOL ? "64xfH (AMOL)" : li.mode == MODE_GEMSTAR ? "64/32xfH" : li.mode == MODE_TVINFORM ? (li.tviRate == 0 ? "111xfH" : "222xfH")
-                 : li.mode == MODE_TEST ? "-"
+                 : li.mode == MODE_AMOL ? "64xfH (AMOL)" : li.mode == MODE_GEMSTAR ? "64/32xfH" : li.mode == MODE_TVINFORM ? (li.tviRate == 0 ? "111xfH" : li.tviRate == 1 ? "222xfH" : "444xfH (fТ3)")
+                 : li.mode == MODE_TEST ? "-" : li.mode == MODE_VITC ? (r.geom.pal ? "116xfH (VITC)" : "115xfH (VITC)")
                  : li.kind.rfind("TV-Inform packets", 0) == 0 ? "366xfH (5.73)"
                  : li.kind.find("WST") != std::string::npos ? "444xfH"
                  : li.mode == MODE_SILENT_RADIO ? "80xfH" : "-",

@@ -48,9 +48,41 @@ struct VbiGeometry {
     int64_t frames = 0;
     int storedPerField = 0;  // lines stored per field in the file (0 = linesPerFrame / 2)
     int skipLines = 0;       // stored lines before the first used one, per field
+    // TV line (625: 1..625) of stored index 0 of each half of the frame, found from the field sync pulses
+    // the file holds (sample.vbi: 622 / 309, the capture started before line 1); 0 = the format's numbering
+    int tvFirst[2] = {0, 0};
     int frameBytes() const { return lineBytes * linesPerFrame; }   // a frame in memory (used lines)
     int64_t fileFrameBytes() const { return (int64_t)lineBytes * (storedPerField ? 2 * storedPerField : linesPerFrame); }
 };
+
+// TV line of stored line l (625 lines: 1..625; 525: 1..525)
+inline int tvLineOf(const VbiGeometry& g, int l)
+{
+    int half = g.linesPerFrame / 2, h = l < half ? 0 : 1, total = g.pal ? 625 : 525;
+    if (g.tvFirst[h] > 0) return (g.tvFirst[h] - 1 + l % half) % total + 1;
+    return g.firstLine + l % half + (h ? (g.pal ? 313 : 263) : 0);
+}
+// field (1 / 2) and line number within it (field 2: TV line - 313 / 263) of stored line l
+inline void lineOf(const VbiGeometry& g, int l, int& lineNo, int& field)
+{
+    int tv = tvLineOf(g, l), half2 = g.pal ? 313 : 263;
+    field = tv > half2 ? 2 : 1;
+    lineNo = tv > half2 ? tv - half2 : tv;
+}
+inline int lineNoOf(const VbiGeometry& g, int l) { int n, f; lineOf(g, l, n, f); return n; }
+inline int fieldOf(const VbiGeometry& g, int l) { int n, f; lineOf(g, l, n, f); return f; }
+// a stored line inside the field sync (625: 623-625, 1-5, 311-318) or in the picture (23-310, 336-622)
+inline bool tvNotVbi(const VbiGeometry& g, int l)
+{
+    if (!g.pal || !g.tvFirst[0]) return false;
+    int tv = tvLineOf(g, l);
+    return tv >= 623 || tv <= 5 || (tv >= 311 && tv <= 318) || (tv >= 23 && tv <= 310) || (tv >= 336 && tv <= 622);
+}
+
+// one field's stored lines (count lines of lineBytes, samples used): the TV line of the first of them, found from
+// the broad pulses of the field sync among them (625: lines 1-3 / 313-315, 525: 4-6 / 266-269); 0 = no field sync
+// there. For a card left free running (no vertical lock) the window rolls through the frame.
+int fieldSyncFirst(const uint8_t* lines, int count, int lineBytes, int samples, int fmt, bool pal);
 
 const char* formatName(VbiFormat f);
 const char* formatKey(VbiFormat f);        // short name for --format
@@ -71,6 +103,7 @@ public:
     const std::string& path() const { return path_; }
 
 private:
+    void numberBySync();
     FILE* f_ = nullptr;
     VbiGeometry g_;
     std::string path_;

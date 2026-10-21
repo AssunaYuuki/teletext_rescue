@@ -283,7 +283,7 @@ uint64_t flac_to_raw(const std::string &in, const std::string &out, Progress &pr
     });
     if (!err.empty()) throw std::runtime_error(err);
     if (badFrames)
-        pr.log(fmt("FLAC: %llu damaged frames skipped (%llu samples, %.2f%% of the recording, left as zeros) â the file itself is damaged there",
+        pr.log(fmt("FLAC: %llu damaged frames skipped (%llu samples, %.2f%% of the recording, left as zeros) \xE2\x80\x94 the file itself is damaged there",
                    (unsigned long long)badFrames, (unsigned long long)badSamples, total ? 100.0 * badSamples / total : 0.0));
     pr.log(fmt("FLAC unpacked: %llu bytes (%u-bit samples)", (unsigned long long)bytes, I.bps));
     return bytes;

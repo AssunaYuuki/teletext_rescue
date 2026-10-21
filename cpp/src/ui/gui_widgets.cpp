@@ -1,5 +1,6 @@
 #include "gui.h"
 #include <set>
+#include <cstring>
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -283,6 +284,15 @@ void blit(HDC dc, const Image &im, int x, int y, int w, int h, bool smooth) {
     StretchDIBits(dc, x, y, w, h, 0, 0, im.w, im.h, im.px.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
 }
 
+void fit_large(HWND h) {
+    MONITORINFO mi{}; mi.cbSize = sizeof mi;
+    if (!h || !GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi)) return;
+    RECT r; GetWindowRect(h, &r);
+    int W = mi.rcWork.right - mi.rcWork.left, H = mi.rcWork.bottom - mi.rcWork.top;
+    int w = std::min(W, std::max((int)(r.right - r.left), W * 92 / 100)), hh = std::min(H, std::max((int)(r.bottom - r.top), H * 92 / 100));
+    MoveWindow(h, mi.rcWork.left + (W - w) / 2, mi.rcWork.top + (H - hh) / 2, w, hh, FALSE);
+}
+
 // ---------------------------------------------------------------- диалоги
 static std::string run_file_dialog(HWND owner, const std::string &title, const std::vector<std::pair<std::string, std::string>> &filters,
                                    bool save, bool folder, const std::string &def_name, const std::string &ext, const std::string &start) {
@@ -299,7 +309,11 @@ static std::string run_file_dialog(HWND owner, const std::string &title, const s
     for (auto &f : filters) { store.push_back(W(f.first)); store.push_back(W(f.second)); }
     for (size_t i = 0; i < filters.size(); i++) spec.push_back({store[2 * i].c_str(), store[2 * i + 1].c_str()});
     if (!spec.empty()) dlg->SetFileTypes((UINT)spec.size(), spec.data());
-    if (!def_name.empty()) dlg->SetFileName(W(def_name).c_str());
+    if (!def_name.empty()) {
+        std::string nm = def_name;   // "line 8/f2", "12:30": characters a file name cannot hold
+        for (char &c : nm) if (strchr("\\/:*?\"<>|", c) || (unsigned char)c < 32) c = '_';
+        dlg->SetFileName(W(nm).c_str());
+    }
     if (!ext.empty()) dlg->SetDefaultExtension(W(ext).c_str());
     if (!start.empty()) {
         IShellItem *si = nullptr;
@@ -320,8 +334,8 @@ static std::string run_file_dialog(HWND owner, const std::string &title, const s
 std::string open_file(HWND owner, const std::string &title, const std::vector<std::pair<std::string, std::string>> &filters) {
     return run_file_dialog(owner, title, filters, false, false, "", "", "");
 }
-std::string save_file(HWND owner, const std::string &title, const std::string &def_name, const std::string &ext) {
-    return run_file_dialog(owner, title, {{ext + " files", "*." + ext}}, true, false, def_name, ext, "");
+std::string save_file(HWND owner, const std::string &title, const std::string &def_name, const std::string &ext, const std::string &start) {
+    return run_file_dialog(owner, title, {{ext + " files", "*." + ext}}, true, false, def_name, ext, start);
 }
 std::string pick_folder(HWND owner, const std::string &title, const std::string &start) {
     return run_file_dialog(owner, title, {}, false, true, "", "", start);
