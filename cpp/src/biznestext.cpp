@@ -971,10 +971,16 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
             for (size_t k = 0; k < txtIn.size(); k++) if (txtIn[k] < 0) un.push_back((long)k);
             Image im;
             PcxRepair info;
+            // the picture's size is in its 128-byte header: a byte lost there makes the size itself unsure; lines
+            // with a byte lost are not whole, whatever the decoding made of them
+            bool headBad = !un.empty() && un.front() < 128;
             if (pcxDecode(bin, un, im, false, &info)) {
-                w.check = info.note() + (info.lines ? fmt(" (%.0f%%)", 100.0 * info.linesGood / info.lines) : std::string());
+                w.check = fmt("PCX %dx%d%s", info.width, info.height, headBad ? " (header damaged: the size may be wrong)" : "");
+                if (!un.empty()) w.check += fmt("; %zu bytes lost, the picture is not whole", un.size());
+                else if (info.linesGood < info.lines) w.check += fmt("; %d of %d lines whole", info.linesGood, info.lines);
+                else w.check += "; every line whole";
                 w.checkOk = info.lines > 0 && info.linesGood == info.lines && !info.repaired && un.empty();
-            } else w.check = "PCX: does not decode";
+            } else w.check = headBad ? "PCX: header damaged, does not decode" : "PCX: does not decode";
         } else if (isText) {
             w.check = bad ? fmt("text: %ld bytes did not read", bad) : "text: every byte read";
             w.checkOk = bad == 0;
