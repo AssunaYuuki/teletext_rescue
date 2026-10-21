@@ -19,7 +19,8 @@ struct Json {
     Json(long v) : t(Num), n((double)v) {}
     Json(long long v) : t(Num), n((double)v) {}
     Json(unsigned v) : t(Num), n(v) {}
-    Json(size_t v) : t(Num), n((double)v) {}
+    Json(unsigned long v) : t(Num), n((double)v) {}        // size_t is one of these three on every system
+    Json(unsigned long long v) : t(Num), n((double)v) {}
     Json(double v) : t(Num), n(v) {}
     Json(const char *v) : t(Str), s(v) {}
     Json(const std::string &v) : t(Str), s(v) {}
