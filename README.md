@@ -61,7 +61,8 @@ trcli recording.vbi --again             # decode again instead of opening the sa
 - **Found files and texts**: files sent in the signal are put together and checked. **Бизнес-Текст**
   (NTV, 1994-96): the catalogue, the cipher of both years broken, files decrypted; every file shows how
   much of it was read (%) and whether it checks — ARJ archives are unpacked in memory and every CRC-32
-  compared (a damaged archive, which other unpackers refuse, is still unpacked as far as it goes), PCX pictures
+  compared (a damaged archive, which other unpackers refuse, is still unpacked as far as it goes, and two receptions of the same file - another
+  recording or live session - are put together: **Combine with another reception**), PCX pictures
   decoded line by line. **TV-Inform** (Channel 1, RTR): Norpak and fT3 data
   channels, files (a Hydromet fax map, newspaper PDFs), WMO bulletins, the inserter's texts.
 - **Japanese teletext** from 27 MHz captures (GV-USB2, Hauppauge) as JTES Decoder reads them, on the

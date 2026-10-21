@@ -237,6 +237,7 @@ struct FindsWin : Window {
             hd.add(hwnd, 502, "Folder", 80);
             hd.add(hwnd, 503, "Save text\xE2\x80\xA6", 110);
             hd.add(hwnd, 504, "Rotate", 80);
+            hd.add(hwnd, 505, "Combine with another reception\xE2\x80\xA6", 250);
             lst = listview(hwnd, 10, {{"Kind", 100}, {"Name", 170}, {"Short name", 100}, {"Type", 130}, {"Size", 80}, {"Status", 280},
                                       {"Service", 230}, {"Where", 170}, {"When", 150}});
             // the text wraps at the window's edge (an EDIT made with ES_AUTOHSCROLL never wraps)
@@ -274,6 +275,18 @@ struct FindsWin : Window {
             if (id == 501 && hasF) open_find(f->path);
             else if (id == 502 && hasF) open_path(f->path.substr(0, f->path.find_last_of("\\/")));
             else if (id == 504) { rot = !rot; shownPath.clear(); show(); }
+            else if (id == 505 && hasF) {
+                // the same file received another time (another recording / live session of the same broadcast):
+                // each copy fills what the other did not read; an archive is chosen by its CRCs
+                std::string mine = f->path, ext = mine.substr(mine.find_last_of('.') + 1);
+                std::string other = open_file(hwnd, "The same file from another reception", {{"The same file", "*." + ext}, {"All files", "*.*"}});
+                if (other.empty() || other == mine) return 0;
+                auto out = std::make_shared<std::string>();
+                run_task(hwnd, "Combining two receptions", [mine, other, out](Progress &pr) {
+                    pr.log("putting the two copies together and checking them (an archive can take a minute)");
+                    pr.log(combineReceptions(mine, {other}, *out));
+                }, [out](bool ok) { if (ok && !out->empty()) open_path(out->substr(0, out->find_last_of("\\/"))); });
+            }
             else if (id == 503 && f) {
                 const Find keep = *f;   // live: the timer replaces items while the dialog is open
                 f = &keep;

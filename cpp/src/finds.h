@@ -34,7 +34,11 @@ struct Find {
 // refresh: made again (the file was written again with more blocks); unread = positions of the bytes that did not
 // come or did not read (a PCX picture is put together again around them)
 std::string openableCopy(const std::string& path, bool refresh = false, const std::vector<long>* unread = nullptr);
-std::string fileTypeOf(const std::string& path, const std::string& name);   // "TIFF image, fax G4", "ARJ archive", ...
+std::string fileTypeOf(const std::string& path, const std::string& name);
+// the same file from other receptions (another recording or live session of the same broadcast) put together with
+// this one (combineCopies of arjcheck.h): <file>_combined/<name> next to it, an ARJ archive also unpacked there
+// (<name>_files), combined.txt = the log returned; outPath = the combined file
+std::string combineReceptions(const std::string& path, const std::vector<std::string>& others, std::string& outPath);   // "TIFF image, fax G4", "ARJ archive", ...
 // what is being done now ("«Бизнес-Текст»: decrypting and writing AKC.C01 (3 of 19)"), for a progress window
 using FindStatus = std::function<void(const std::string&)>;
 // the finds of a recording: the ones prepareFinds made, else made now (and the «Бизнес-Текст» files written again)

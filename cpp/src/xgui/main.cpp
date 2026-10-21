@@ -518,6 +518,18 @@ static void main_window()
                 ImGui::EndMenu();
             }
             ImGui::MenuItem("Keep StarSight schedules from packets that fail the CRC", nullptr, &g_unverified);
+            // a found file (Бизнес-Текст, TV-Inform) received twice: each copy fills what the other did not read
+            if (ImGui::MenuItem("Combine two receptions of a found file\xE2\x80\xA6"))
+                open_file_dialog("A found file (first reception)", "*", [](std::string a) {
+                    open_file_dialog("The same file from another reception", "*", [a](std::string b) {
+                        if (b.empty() || b == a) return;
+                        run_task("Combining two receptions", [a, b](Task &t) {
+                            std::string out, log = combineReceptions(a, {b}, out);
+                            std::lock_guard<std::mutex> l(t.mu);
+                            t.log.push_back(log);
+                        }, [](bool) {});
+                    });
+                });
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Help")) {

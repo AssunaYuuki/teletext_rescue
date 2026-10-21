@@ -384,6 +384,105 @@ std::string arjExtract(const ArjCheck& c, const std::string& dir)
     return list;
 }
 
+std::vector<uint8_t> combineCopies(const std::vector<std::vector<uint8_t>>& C, std::string& log)
+{
+    char b[200];
+    if (C.empty()) return {};
+    const size_t n = C[0].size();
+    for (auto& c : C) if (c.size() != n) { log += "the copies are not of one size\n"; return {}; }
+    std::vector<uint8_t> M(n, 0);
+    std::vector<size_t> diff, single;
+    std::vector<std::vector<uint8_t>> cand(n);
+    size_t filled = 0;
+    for (size_t i = 0; i < n; i++) {
+        int cnt[256] = {0}, read = 0;
+        for (auto& c : C) if (c[i]) { cnt[c[i]]++; read++; }
+        if (!read) continue;
+        int best = 0;
+        for (int v = 1; v < 256; v++) {
+            if (cnt[v]) cand[i].push_back((uint8_t)v);
+            if (cnt[v] > cnt[best]) best = v;
+        }
+        M[i] = (uint8_t)best;
+        if (C[0][i] == 0) filled++;
+        if (cand[i].size() > 1) diff.push_back(i);
+        else if (read == 1) single.push_back(i);
+    }
+    snprintf(b, sizeof b, "%zu copies of %zu bytes: %zu bytes the first did not read taken from the others, %zu read differently\n",
+             C.size(), n, filled, diff.size());
+    log += b;
+    if (n < 4 || M[0] != 0x60 || M[1] != 0xEA) return M;   // not an ARJ archive: the vote is all there is
+
+    auto score = [&](const std::vector<uint8_t>& d) {
+        ArjCheck k = arjCheck(d);
+        long s = k.headerOk ? 500000 : 0;
+        for (auto& e : k.files) s += (e.ok ? 1000000 : (long)e.got) + (e.why.find("header CRC") == std::string::npos ? 100000 : 0);
+        return s;
+    };
+    log += "ARJ as voted: " + arjCheck(M).summary() + "\n";
+    // inside each file of the archive (one header 60 EA to the next): every combination of the differing bytes
+    std::vector<size_t> hdr;
+    for (size_t i = 0; i + 1 < n; i++) if (M[i] == 0x60 && M[i + 1] == 0xEA) hdr.push_back(i);
+    hdr.push_back(n);
+    for (size_t h = 0; h + 1 < hdr.size(); h++) {
+        std::vector<size_t> in;
+        for (size_t i : diff) if (i >= hdr[h] && i < hdr[h + 1]) in.push_back(i);
+        if (in.empty()) continue;
+        double combos = 1;
+        for (size_t i : in) combos *= cand[i].size();
+        long best = score(M);
+        std::vector<uint8_t> bestM = M;
+        if (combos <= (1 << 16)) {
+            std::vector<size_t> pick(in.size(), 0);
+            for (;;) {
+                for (size_t k = 0; k < in.size(); k++) M[in[k]] = cand[in[k]][pick[k]];
+                long s = score(M);
+                if (s > best) { best = s; bestM = M; }
+                size_t k = 0;
+                while (k < in.size() && ++pick[k] == cand[in[k]].size()) pick[k++] = 0;
+                if (k == in.size()) break;
+            }
+            M = bestM;
+        } else   // too many: one byte at a time
+            for (size_t i : in)
+                for (uint8_t v : cand[i]) {
+                    uint8_t keep = M[i];
+                    M[i] = v;
+                    long s = score(M);
+                    if (s > best) best = s; else M[i] = keep;
+                }
+        snprintf(b, sizeof b, "bytes %zu-%zu: %zu read differently, %.0f combinations tried\n", hdr[h], hdr[h + 1], in.size(), std::min(combos, 65536.0));
+        log += b;
+    }
+    // a byte only one copy read may be wrong in it: all 256 values, while a file does not check yet
+    long s0 = score(M);
+    for (int pass = 0; pass < 3; pass++) {
+        bool changed = false;
+        for (size_t i : single) {
+            ArjCheck k = arjCheck(M);
+            if (k.good() == (int)k.files.size() && k.headerOk && !k.files.empty()) break;
+            uint8_t keep = M[i], bv = keep;
+            long bs = s0;
+            for (int v = 0; v < 256; v++) {
+                if (v == keep) continue;
+                M[i] = (uint8_t)v;
+                long s = score(M);
+                if (s > bs) { bs = s; bv = (uint8_t)v; }
+            }
+            M[i] = bv;
+            if (bs > s0) {
+                s0 = bs;
+                changed = true;
+                snprintf(b, sizeof b, "byte %zu read by one copy only: %02X -> %02X\n", i, keep, bv);
+                log += b;
+            }
+        }
+        if (!changed) break;
+    }
+    log += "combined: " + arjCheck(M).summary() + "\n";
+    return M;
+}
+
 std::string ArjCheck::summary() const
 {
     if (!archive) return "not an ARJ archive (its start did not come through)";

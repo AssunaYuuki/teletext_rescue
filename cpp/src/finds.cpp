@@ -1,4 +1,5 @@
 #include "finds.h"
+#include "arjcheck.h"
 #include "ttdata.h"
 #include "biznestext.h"
 #include "decoder.h"
@@ -380,6 +381,31 @@ bool sameExt(const std::string& path, const std::string& ext)
     return lower(path.substr(dot)) == ext;
 }
 }  // namespace
+
+std::string combineReceptions(const std::string& path, const std::vector<std::string>& others, std::string& outPath)
+{
+    std::vector<Bytes> copies{read_file(path)};
+    for (auto& o : others) copies.push_back(read_file(o));
+    std::string log = "combined: " + path + "\n";
+    for (auto& o : others) log += "    with: " + o + "\n";
+    Bytes m = combineCopies(copies, log);
+    if (m.empty()) return log;
+    std::string name = path.substr(path.find_last_of("\\/") + 1);
+    std::string dir = path_join(path.substr(0, path.find_last_of("\\/")), name + "_combined");
+    make_dirs(dir);
+    outPath = path_join(dir, name);
+    write_file(outPath, m);
+    if (m.size() >= 4 && m[0] == 0x60 && m[1] == 0xEA) {
+        ArjCheck c = arjCheck(m);
+        log += "\nunpacked into " + name + "_files:\n" + arjExtract(c, path_join(dir, name + "_files"));
+    } else {
+        std::vector<long> un;
+        for (size_t i = 0; i < m.size(); i++) if (!m[i]) un.push_back((long)i);
+        openableCopy(outPath, true, &un);
+    }
+    write_file(path_join(dir, "combined.txt"), log.data(), log.size());
+    return log;
+}
 
 std::string openableCopy(const std::string& path, bool refresh, const std::vector<long>* unread)
 {

@@ -28,3 +28,10 @@ ArjCheck arjCheck(const std::vector<uint8_t>& data);
 // "NAME  size  ok / CRC wrong / N of M bytes" for the report
 std::string arjExtract(const ArjCheck& c, const std::string& dir);
 uint32_t crc32Arj(const uint8_t* p, size_t n, uint32_t crc = 0);
+
+// Two or more receptions of the same file (each the file's size; 0 = a byte not read) made into one: a byte one copy
+// did not read comes from the others, where they read it differently the commonest value. An ARJ archive is chosen by
+// its own checks: inside each of its files every combination of the copies' differing bytes is tried, and a byte
+// only one copy read is tried with all 256 values; the choice that makes its files check (or unpack further) is kept.
+// log: what was done, line by line. Empty result: the copies are not of one size.
+std::vector<uint8_t> combineCopies(const std::vector<std::vector<uint8_t>>& copies, std::string& log);
