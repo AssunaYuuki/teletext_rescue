@@ -386,7 +386,11 @@ void norpakFiles(TviNorpak& o, const std::string& outDir)
             if (ft > 116444736000000000ULL) {
                 time_t t = (time_t)((ft - 116444736000000000ULL) / 10000000ULL);
                 struct tm g;
+#ifdef _WIN32
                 gmtime_s(&g, &t);
+#else
+                gmtime_r(&t, &g);
+#endif
                 f.time = fmt("%04d-%02d-%02d %02d:%02d:%02d UTC", g.tm_year + 1900, g.tm_mon + 1, g.tm_mday, g.tm_hour, g.tm_min, g.tm_sec);
             }
             f.size = u32(d + 32);

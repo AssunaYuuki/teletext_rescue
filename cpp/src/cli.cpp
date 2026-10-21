@@ -17,11 +17,11 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include "live.h"
 #ifdef _WIN32
 #include <windows.h>
 #include <objbase.h>
 #include "capture.h"
-#include "live.h"
 
 // trcli --replay <rec.vbi> [--format key]: a recording through the live decoder -> <rec>.t42 and
 // <rec>.raw.t42 (every packet with a good address, binary rows included)

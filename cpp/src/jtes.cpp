@@ -17,7 +17,7 @@
 namespace {
 
 // ---------------------------------------------------------------- (272,190) difference-set cyclic code
-typedef unsigned __int128 u128;
+#include "u128.h"
 const int N = 272, R = 82;
 u128 genPoly()
 {

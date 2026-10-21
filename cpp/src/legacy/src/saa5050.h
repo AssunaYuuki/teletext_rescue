@@ -1,4 +1,5 @@
 // Знакогенератор SAA5050: клетка 12 × 20 со сглаживанием, как в микросхеме.
+// (the original engine's copy, compiled inside namespace legacy; kept different from ours for #pragma once)
 #pragma once
 #include <array>
 #include <cstdint>

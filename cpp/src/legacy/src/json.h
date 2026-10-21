@@ -1,4 +1,5 @@
 // Небольшой JSON: значение, разбор, вывод (UTF-8 как есть, как ensure_ascii=False).
+// (the original engine's copy, compiled inside namespace legacy; kept different from ours for #pragma once)
 #pragma once
 #include <string>
 #include <utility>

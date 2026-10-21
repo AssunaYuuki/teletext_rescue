@@ -1,4 +1,5 @@
 // Страницы телетекста: версии, ряды, служебные данные; чтение и запись pages.json.
+// (the original engine's copy, compiled inside namespace legacy; kept different from ours for #pragma once)
 #pragma once
 #include "json.h"
 #include "teletext.h"
