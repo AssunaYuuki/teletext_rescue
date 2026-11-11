@@ -4,6 +4,7 @@
 #include "silent_radio.h"
 #include "syster.h"
 #include <complex>
+#include <atomic>
 
 const double FSC_NTSC = 315e6 / 88;
 static const std::vector<std::pair<std::string, double>> RATES = {
@@ -105,6 +106,13 @@ void Rec::number_by_sync() {
 
 void Rec::line(int u, int r, float *out) const {
     uint64_t off = ((uint64_t)u * rec_lines + r) * rec_len * bytes_per;
+    // a line past the end of the file (a trailing part of a unit, or a row outside the unit) reads as blank
+    if (u < 0 || r < 0 || r >= rec_lines || off + (uint64_t)ns * bytes_per > mf->size()) {
+        static std::atomic<int> told{0};
+        if (getenv("TR_DEBUG") && told++ < 5) fprintf(stderr, "Rec::line: %s u %d of %d, row %d of %d - outside the file\n", fmt.c_str(), u, n, r, rec_lines);
+        std::fill(out, out + ns, 0.0f);
+        return;
+    }
     const u8 *p = mf->data() + off;
     if (bytes_per == 1) for (int i = 0; i < ns; i++) out[i] = p[i];
     else for (int i = 0; i < ns; i++) out[i] = (float)((p[2 * i] | (p[2 * i + 1] << 8)) / scale);
@@ -874,9 +882,7 @@ static double wst_start_by_spread(const Rec &R) {
     return starts.empty() ? -1e9 : median(starts);
 }
 
-void wst_to_bt8x8(const Rec &R, const std::string &out, Progress &pr) {
-    const double BT_FS = 35468950.0, BT_START = 110;   // где у bt8x8 начинается вступление (замер по пяти записям)
-    bool fld = R.unit == "field";
+double wst_start(const Rec &R, Progress &pr) {
     // положение вступления в записи источника
     std::vector<double> pos;
     for (int r : R.rows) {
@@ -932,27 +938,34 @@ void wst_to_bt8x8(const Rec &R, const std::string &out, Progress &pr) {
         pos.assign(1, std::max(0.0, bySpread));
     }
     if (pos.empty()) throw std::runtime_error("no teletext run-in found on any line of the recording");
-    double src0 = median(pos), k = R.fs / BT_FS;
+    return median(pos);
+}
+
+void wst_to_bt8x8(const Rec &R, const std::string &out, Progress &pr, double start, int first1, int first2, int per) {
+    const double BT_FS = 35468950.0, BT_START = BT8X8_WST_START;   // где у bt8x8 начинается вступление (замер по пяти записям)
+    bool fld = R.unit == "field";
+    double src0 = std::isnan(start) ? wst_start(R, pr) : start, k = R.fs / BT_FS;
     pr.log(fmt("%s: teletext starts at sample %.1f; resampling %.2f MHz -> 35.47 MHz (bt8x8 layout)", R.fmt.c_str(), src0, R.fs / 1e6));
     // строка ТВ -> запись источника (у форматов «по полю» поле B пронумеровано как поле A)
     std::map<int, int> by_tv; for (auto &kv : R.tv) by_tv[kv.second] = kv.first;
     int frames = fld ? R.n / 2 : R.n;
     FILE *f = ufopen(out, "wb");
     if (!f) throw std::runtime_error("cannot write " + out);
-    std::vector<u8> fr(65536);
+    int lpf = 2 * per;
+    std::vector<u8> fr((size_t)lpf * 2048);
     std::vector<float> y(R.ns);
     for (int q = 0; q < frames; q++) {
         std::fill(fr.begin(), fr.end(), 0);
-        for (int b = 0; b < 32; b++) {
-            int tvl = b < 16 ? 7 + b : 320 + b - 16, u = q, key = tvl;
-            if (fld) { u = 2 * q + (b >= 16); if (b >= 16) key = tvl - 313; }
+        for (int b = 0; b < lpf; b++) {
+            int tvl = b < per ? first1 + b : first2 + b - per, u = q, key = tvl;
+            if (fld) { u = 2 * q + (b >= per); if (b >= per) key = tvl - 313; }
             auto it = by_tv.find(key);
             if (it == by_tv.end()) continue;
             R.line(u, it->second, y.data());
             u8 *d = fr.data() + b * 2048;
             for (int j = 0; j < 2044; j++) d[j] = (u8)std::clamp(lround(cubic(src0 + (j - BT_START) * k, y.data(), R.ns)), 0L, 255L);
         }
-        uint32_t c = (uint32_t)q; memcpy(fr.data() + 65532, &c, 4);
+        uint32_t c = (uint32_t)q; memcpy(fr.data() + fr.size() - 4, &c, 4);
         if (fwrite(fr.data(), 1, fr.size(), f) != fr.size()) { fclose(f); throw std::runtime_error("cannot write " + out); }
         if (q % 500 == 0) pr.progress(q, frames, "converting to the bt8x8 layout");
     }

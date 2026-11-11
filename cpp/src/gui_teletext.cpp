@@ -387,7 +387,7 @@ struct TeletextWin : Window {
         const Charset &t = P.table(&pg);
         Over x = P.fitted(s.rows, P.overlay(pg, &s), t);
         RenderOpts o; o.reveal = checked(c_reveal); o.flash_on = flash_on; o.tv = checked(c_tv); o.codes = checked(c_codes); o.cursor_r = cursor_r; o.cursor_c = cursor_c;
-        return render_teletext(s.rows, t, P.table2(), &x, o, &last_flash, &last_box);
+        return render_teletext(s.rows, t, P.table2(&pg), &x, o, &last_flash, &last_box);
     }
     void draw(bool keep_flash = false)
     {
@@ -520,7 +520,7 @@ struct TeletextWin : Window {
             return sec;
         };
         auto code_in = [&](const Charset *t) { if (!t) return -1; auto rev = charset_reverse(*t); auto it = rev.find((char32_t)ch); return it == rev.end() ? -1 : it->second; };
-        const Charset *t2 = P.table2();
+        const Charset *t2 = P.table2(&page());
         bool sec = t2 && in_second(cursor_c);
         int code = code_in(sec ? t2 : &t1);
         if (code >= 0) { if (set_char(code)) move(0, 1); return; }
@@ -603,8 +603,24 @@ struct TeletextWin : Window {
     {
         if (cur.empty()) return;
         set_flofs();
-        try { P.save_state(pages, edited); dirty = false; status("saved to " + P.rel(P.edited_path) + fmt(" (pages changed: %zu)", edited.size())); }
+        try { P.save_state(pages, edited); dirty = false; status("saved to " + P.rel(P.edited_path) + fmt(" (pages changed: %zu)", edited.size()) + save_t42()); }
         catch (std::exception &e) { ask(hwnd, "Save", e.what(), MB_ICONERROR); }
+    }
+    // the edited pages as a stream too: "<recording> edit.t42" next to the recording (the recording itself is never
+    // replaced), else in the project folder
+    std::string save_t42()
+    {
+        int n = 0;
+        Bytes t42 = P.to_t42(pages, n);
+        std::string name = basename(stem_path(R->path));
+        if (name.size() > 5 && name.compare(name.size() - 5, 5, " edit") == 0) name.resize(name.size() - 5);   // an edit opened again
+        name += " edit.t42";
+        for (const std::string &dir : {R->path.substr(0, R->path.find_last_of("\\/")), P.outdir}) {
+            std::string out = path_join(dir, name);
+            try { write_atomic(out, std::string(t42.begin(), t42.end())); return fmt(" and %d packets to ", n) + out; }
+            catch (...) {}
+        }
+        return "; " + name + " could not be written";
     }
     void do_export(bool full)
     {

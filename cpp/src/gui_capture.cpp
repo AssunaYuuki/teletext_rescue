@@ -11,6 +11,7 @@
 #include "linecolour.h"
 #include "decoder.h"
 #include "rescache.h"
+#include "slicer.h"
 #include <climits>
 #include <ctime>
 #include <windowsx.h>
@@ -37,9 +38,20 @@ std::function<void(const std::string &)> &open_recording_hook()
 }
 
 namespace {
+// what decodes a recording: the graphics card (OpenCL) or the processor — the same choice the main window's
+// "Decode on: graphics card or processor…" remembers. In the live window it is used for the full decode of the
+// session (Save pages) and of the recording
+bool gpuOn()
+{
+    Json st = load_state();
+    int dev = st["device"].is_null() ? 0 : (int)st["device"].integer();   // -1 = the processor was chosen
+    std::string name;
+    uint64_t mem = 0;
+    return dev != -1 && gpuDeviceInfo(name, mem);
+}
 enum {
     ID_DEVICE = 700, ID_INPUT, ID_STD, ID_CHANNEL, ID_TUNE, ID_START, ID_RECORD, ID_DECODE,
-    ID_PAGE, ID_PREV, ID_NEXT, ID_SUBPREV, ID_SUBNEXT, ID_CHARSET, ID_REVEAL, ID_WATCH, ID_PICTURE, ID_FINDS, ID_VPS, ID_NABTS, ID_JTES, ID_SSLIVE, ID_GEMLIVE, ID_SERVICES, ID_SOUND, ID_MUTE, ID_TESTFILE,
+    ID_PAGE, ID_PREV, ID_NEXT, ID_SUBPREV, ID_SUBNEXT, ID_CHARSET, ID_REVEAL, ID_WATCH, ID_GPU, ID_PICTURE, ID_FINDS, ID_VPS, ID_NABTS, ID_JTES, ID_SSLIVE, ID_GEMLIVE, ID_SERVICES, ID_SOUND, ID_MUTE, ID_TESTFILE,
     ID_SAVE, ID_SYNCUP, ID_SYNCDN, ID_LINES, ID_SYNC0, ID_HSYNC, ID_VSYNC, ID_LAYOUT,
 };
 constexpr int kAutoSub = INT_MIN;   // subShown: the subpage received last
@@ -82,6 +94,8 @@ struct CaptureWin : Window {
     Header hd;
     HWND c_dev = nullptr, c_input = nullptr, c_std = nullptr, c_cs = nullptr, e_chan = nullptr, b_tune = nullptr, l_chan = nullptr;
     HWND b_start = nullptr, b_watch = nullptr, b_rec = nullptr, b_decode = nullptr, e_page = nullptr, b_prev = nullptr, b_next = nullptr, b_sp = nullptr, b_sn = nullptr;
+    HWND b_gpu = nullptr;                        // GPU: the teletext lines decoded on the graphics card
+    bool gpuWanted = true;                       // as the GPU button says (kept in the state file)
     std::string vpsShown;
     // the services menu (VPS / WSS, NABTS, Japanese, StarSight, Gemstar): its items as they read now and if they open
     HWND b_services = nullptr;
@@ -131,6 +145,16 @@ struct CaptureWin : Window {
     ULONGLONG widenAt = 0;
     bool widenFailed = false, linesByHand = false;
     std::vector<std::pair<RECT, int>> lineHits;   // line bands of the VBI raster -> line index
+    std::string gpuText;                         // the GPU button's text as it was last put there
+    // what the card is doing with the teletext lines: off, learning the model from the processor, reading them
+    void gpu_label()
+    {
+        if (!b_gpu) return;
+        std::string t = !gpuWanted ? "\xE2\x9A\xA1  GPU: off"
+                      : dec.gpuActive() ? "\xE2\x9A\xA1  GPU: reading"
+                                        : "\xE2\x9A\xA1  GPU: learning";
+        if (t != gpuText) { gpuText = t; set_text(b_gpu, t); }
+    }
     std::string note;                    // shown after the status (saving, VBI window)
     std::atomic<bool> saving{false};
     std::string lastStatus;
@@ -196,7 +220,17 @@ struct CaptureWin : Window {
         combo_fill(c_input, {}, -1);
         if (i < 0 || i >= (int)devs.size()) { set_status("No capture card."); return; }
         std::string err;
-        if (!cap.open(i, err)) { set_status("Cannot open " + devs[i].name + ": " + err); return; }
+        if (!cap.open(i, err)) {
+            set_status("Cannot open " + devs[i].name + ": " + err);
+            // the driver opens the card only for an elevated process (Behold SAA7231): the program again, as administrator
+            if (err == kCaptureAccessDenied && !IsUserAnAdmin() &&
+                ask(hwnd, "Capture", devs[i].name + ": the driver of this card lets only a program run as administrator open it.\n\nStart TeletextRescue again as administrator?", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                wchar_t exe[MAX_PATH];
+                GetModuleFileNameW(nullptr, exe, MAX_PATH);
+                if ((INT_PTR)ShellExecuteW(nullptr, L"runas", exe, nullptr, nullptr, SW_SHOWNORMAL) > 32) PostMessageW(g_main, WM_CLOSE, 0, 0);
+            }
+            return;
+        }
         auto in = cap.inputs();
         Json st = load_state();
         int want = st["capture_input"].is_null() ? -1 : (int)st["capture_input"].integer();
@@ -416,6 +450,7 @@ struct CaptureWin : Window {
             if (!cap.run(err)) { set_status("Cannot start: " + err); return; }
         }
         dec.reset(cap.geom());
+        dec.setGpu(gpuWanted);     // the teletext lines on the graphics card, as the GPU button in the header says
         dec.setLineOffset(numShift);   // Sync's numbering stays across a restart
         dec.setManual(false);   // a test file is decoded like the card's signal; a line set by hand (right click) still wins
         vbi_note();
@@ -552,18 +587,37 @@ struct CaptureWin : Window {
         std::filesystem::path dir = std::filesystem::u8path(where) / std::filesystem::u8path(std::string("live_") + ts);
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
+        if (!std::filesystem::is_directory(dir, ec)) {
+            // Windows не пустил в выбранную папку (чаще всего «Защита от подмены»): пишем рядом с записями,
+            // иначе на Рабочем столе — сессия не должна пропадать из-за прав
+            std::string name = std::string("live_") + ts;
+            std::vector<std::filesystem::path> alt;
+            if (!folder().empty()) alt.push_back(std::filesystem::u8path(folder()) / std::filesystem::u8path(name));
+            if (const char *up = getenv("USERPROFILE")) alt.push_back(std::filesystem::u8path(up) / "Desktop" / std::filesystem::u8path(name));
+            bool okDir = false;
+            for (auto &a : alt) {
+                std::error_code e2;
+                std::filesystem::create_directories(a, e2);
+                if (std::filesystem::is_directory(a, e2)) { dir = a; okDir = true; break; }
+            }
+            if (!okDir) { note = "cannot create the folder " + dir.u8string() + ": " + ec.message(); return; }
+            note = "the folder " + where + " is closed for writing, saving to " + dir.u8string();
+        }
         std::string t42 = (dir / "live.t42").u8string();
         FILE *f = _wfopen(widen(t42).c_str(), L"wb");
         if (!f) { note = "cannot write " + t42; return; }
         fwrite(pk.data(), 1, pk.size(), f);
         fclose(f);
         saving = true;
-        note = fmt("saving %zu packets \xE2\x86\x92 ", pk.size() / 42) + dir.u8string() + " \xE2\x80\xA6";
+        const bool gpu = gpuOn();
+        note = fmt("saving %zu packets \xE2\x86\x92 ", pk.size() / 42) + dir.u8string() +
+               (gpu ? "  (the graphics card) \xE2\x80\xA6" : "  (the processor) \xE2\x80\xA6");
         EnableWindow(b_save, FALSE);
         HWND h = hwnd;
         std::string out = dir.u8string();
-        std::thread([h, t42, out] {
+        std::thread([h, t42, out, gpu] {
             DecodeOptions opt;
+            opt.gpu = gpu;
             DecodeResult r;
             std::string err;
             bool ok = false;
@@ -571,7 +625,7 @@ struct CaptureWin : Window {
                 ok = decodeFile(t42, opt, r, err);
                 if (ok) { Progress pr; exportResult(r, out, pr); }
             } catch (std::exception &e) { ok = false; err = e.what(); }
-            auto *msg = new std::string(ok ? out : err);
+            auto *msg = new std::string(ok ? out + "\t" + r.slicerName : err);
             if (!PostMessageW(h, WM_SAVED, ok, (LPARAM)msg)) delete msg;
         }).detach();
     }
@@ -582,10 +636,13 @@ struct CaptureWin : Window {
         std::string m = *msg;
         delete msg;
         if (!ok) { note = "saving failed: " + m; return; }
+        std::string who;                       // what read it: the graphics card or the processor
+        size_t tab = m.find('\t');
+        if (tab != std::string::npos) { who = m.substr(tab + 1); m.resize(tab); }
         std::filesystem::path dir = std::filesystem::u8path(m), html = dir / "teletext" / "output.html";
         std::error_code ec;
         bool page = std::filesystem::exists(html, ec);
-        note = "saved \xE2\x86\x92 " + (page ? html : dir).u8string();
+        note = "saved \xE2\x86\x92 " + (page ? html : dir).u8string() + (who.empty() ? std::string() : "   (" + who + ")");
         ShellExecuteW(hwnd, L"open", (page ? html : dir).wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     }
     // Lines...: the VBI lines asked of the card, e.g. 5-22 when data sits above line 7 (a shifted tape).
@@ -968,11 +1025,10 @@ struct CaptureWin : Window {
         RECT ras{rLines.left, top, rLines.right - labW, rLines.bottom};
         if (L > 0 && g.lineBytes > 0 && g.validSamples > 0 && !snap.frame.empty() && (int)snap.frame.size() >= g.frameBytes()) {
             int n = g.validSamples, W = std::max(1, (int)(ras.right - ras.left));
-            // lines 23 / 336 from the picture are not shown (WSS is still read from them)
-            int extra = 0;
-            int sh = 0, rowsAll = L + extra;
+            // the card's own lines only: line 23 / 336 of the picture are still read for WSS, but not shown
+            int rowsAll = std::max(1, L);
             int lh = std::max(1, (int)(ras.bottom - ras.top) / rowsAll), gap = lh >= 6 ? 1 : 0;
-            int y0 = ras.top + sh * lh;
+            int y0 = ras.top;
             int saved = SaveDC(dc);
             IntersectClipRect(dc, ras.left, ras.top, rLines.right, ras.top + rowsAll * lh);
             fill(dc, RECT{ras.left, ras.top, rLines.right, ras.top + rowsAll * lh}, BG);
@@ -993,29 +1049,8 @@ struct CaptureWin : Window {
                     for (int r = 0; r < lh - gap; r++) im.px[(size_t)(l * lh + r) * W + x] = c;
                 }
             }
-            for (int k = 0; k < extra; k++) {   // the picture's rows, levels stretched to their own range
-                const auto &pr = snap.picRow[k];
-                if (pr.empty()) continue;
-                int pn = (int)pr.size();
-                int plo = *std::min_element(pr.begin(), pr.end()), phi = std::max(plo + 8, (int)*std::max_element(pr.begin(), pr.end()));
-                for (int x = 0; x < W; x++) {
-                    int a0 = (int)((int64_t)x * pn / W), a1 = std::max(a0 + 1, (int)((int64_t)(x + 1) * pn / W));
-                    int s = 0; for (int i = a0; i < a1 && i < pn; i++) s += pr[i];
-                    int v = std::clamp((s / (a1 - a0) - plo) * 255 / (phi - plo), 0, 255);
-                    uint32_t c = (uint32_t)v << 16 | v << 8 | v;
-                    for (int r = 0; r < lh - gap; r++) im.px[(size_t)((L + k) * lh + r) * W + x] = c;
-                }
-            }
             blit(dc, im, ras.left, y0, W, rowsAll * lh, false);
             HFONT fs = font(hwnd, lh >= S(hwnd, 17) ? 9 : lh >= S(hwnd, 13) ? 8 : 7);
-            for (int k = 0; k < extra; k++) {
-                int y = y0 + (L + k) * lh;
-                bool wss = snap.picWss[k];
-                RECT sw{ras.right + S(hwnd, 6), y, ras.right + S(hwnd, 12), y + std::max(2, lh - gap)};
-                fill(dc, sw, wss ? service_colour("WSS") : PANEL);
-                std::string t = std::string(k ? "336" : "23") + "  from the picture" + (wss ? "  WSS read" : "  (no WSS on it yet)");
-                if (lh >= S(hwnd, 10)) text_out(dc, ras.right + S(hwnd, 16), y + lh / 2 - S(hwnd, 7), t, wss ? ACCENT2 : DIM, fs);
-            }
             lineHits.clear();
             for (auto &l : snap.lines) {
                 int y = y0 + l.index * lh;
@@ -1051,8 +1086,15 @@ struct CaptureWin : Window {
             int i = combo_sel(c_cs);
             cs = i > 0 ? kCharsets[i].first : !snap.charset.empty() ? snap.charset : guess_charset(one, 0);
         }
+        // the clock in the header goes on with the signal, as on a TV, also over a page received earlier
+        if (snap.hasClock && rows.count(0)) for (int k = 32; k < 40; k++) if (snap.clock[k - 32] >= 0x20) rows[0][k] = snap.clock[k - 32];
+        // ESC switches to the second set of the chip: Latin on a Cyrillic page (names, addresses), and back
+        const Charset *t1 = &charset_table(cs, national);
+        const Charset *t2 = cs.rfind("cyr", 0) == 0 ? &charset_table("latin", 0) : nullptr;
+        // a page whose rows start in Latin (national option 0 on Ostankino / ORT 1993-96): the sets the other way round
+        if (pg && t2 && rows_start_latin({&rows}, *t1, *t2, pg->national == 0)) std::swap(t1, t2);
         RenderOpts o; o.reveal = reveal; o.flash_on = (GetTickCount() / 500) % 3 != 2;
-        Image ti = render_teletext(rows, charset_table(cs, national), nullptr, nullptr, o);
+        Image ti = render_teletext(rows, *t1, t2, nullptr, o);
         int pw = rPage.right - rPage.left, ph = rPage.bottom - rPage.top;
         double sc = std::min((double)pw / ti.w, (double)ph / ti.h);
         int dw = (int)(ti.w * sc), dh = (int)(ti.h * sc);
@@ -1102,6 +1144,12 @@ struct CaptureWin : Window {
         if (!on_air().empty()) s += "   \xC2\xB7   on air " + on_air();
         s += fmt("   \xC2\xB7   %lld frames", (long long)snap.frames);
         s += fmt("   \xC2\xB7   teletext %.0f packets/s", snap.packetsPerSecond);
+        // who reads the teletext lines: the graphics card once its channel model is learnt (seconds after the first
+        // teletext lines), the processor before that or without a card
+        if (snap.packetsPerSecond > 0 || dec.gpuActive())
+            s += dec.gpuActive() ? fmt("   \xC2\xB7   on the graphics card (%lld frames)", (long long)dec.gpuFrames())
+                 : gpuOn() ? std::string("   \xC2\xB7   on the processor until the graphics card has the channel model")
+                           : std::string("   \xC2\xB7   on the processor (no graphics card with OpenCL)");
         std::string ch = !snap.service.empty() ? snap.service : snap.channel;
         if (ch.empty() && !snap.vps.empty()) ch = snap.vps.substr(0, snap.vps.find(" \xC2\xB7 ")) + " (VPS)";
         if (ch.empty() && snap.ni < 0 && snap.list.size() >= 20) s += "   \xC2\xB7   channel: not sent in the teletext (no 8/30, no name in the headers)";
@@ -1133,6 +1181,9 @@ struct CaptureWin : Window {
             b_decode = hd.add(hwnd, ID_DECODE, "Decode the recording", 170);
             b_rec = hd.add(hwnd, ID_RECORD, "\xE2\x97\x8F  Record", 150);
             b_watch = hd.add(hwnd, ID_WATCH, "\xF0\x9F\x91\x81  Just watch", 130);
+            // no GPU button: the graphics card always reads the teletext lines when there is one (the status line
+            // says which reads)
+            gpuWanted = true;
             hd.add(hwnd, ID_TESTFILE, "Test file\xE2\x80\xA6", 110);
             b_start = hd.add(hwnd, ID_START, "\xE2\x96\xB6  Start", 110);
             DragAcceptFiles(hwnd, TRUE);
@@ -1159,7 +1210,7 @@ struct CaptureWin : Window {
             b_sp = button(hwnd, ID_SUBPREV, "sub \xE2\x97\x80");
             b_sn = button(hwnd, ID_SUBNEXT, "sub \xE2\x96\xB6");
             b_reveal = button(hwnd, ID_REVEAL, "Reveal", BTN_CHECK);
-            status = label(hwnd, ""); set_label_colour(status, MUTED);
+            status = label(hwnd, ""); set_label_colour(status, MUTED); buffer_label(status);   // it changes 5 times a second
             b_lines = button(hwnd, ID_LINES, "Lines\xE2\x80\xA6");
             b_save = button(hwnd, ID_SAVE, "\xF0\x9F\x92\xBE  Save pages");
             b_finds = button(hwnd, ID_FINDS, "\xF0\x9F\x93\x81  Found (0)");
@@ -1240,7 +1291,7 @@ struct CaptureWin : Window {
         case WM_DRAWITEM: if (draw_item(l)) return TRUE; break;
         case WM_TIMER:
             // pages, lines and the status 5 times a second; the picture comes with WM_VIDEO
-            if (w == 1) { refresh(); update_status(); check_finds(); check_widen(); }
+            if (w == 1) { refresh(); update_status(); check_finds(); check_widen(); gpu_label(); }
             return 0;
         case WM_RBUTTONUP: {
             POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
@@ -1351,6 +1402,17 @@ struct CaptureWin : Window {
             case ID_MUTE: toggle_mute(); break;
             case ID_START: if (cap.running()) stop(); else start(); break;
             case ID_WATCH: if (!cap.running()) start(false); break;
+            case ID_GPU: {   // the teletext lines on the graphics card (OpenCL) or on the processor
+                gpuWanted = !gpuWanted;
+                dec.setGpu(gpuWanted);
+                { Json st = load_state(); st["live_gpu"] = gpuWanted ? 1.0 : 0.0; save_state(st); }
+                gpuText.clear(); gpu_label();
+                note = gpuWanted
+                     ? "GPU: the teletext lines go to the graphics card (the processor reads until it has learnt the model)"
+                     : "GPU: the teletext lines are read on the processor";
+                lastStatus.clear(); update_status();
+                break;
+            }
             case ID_TESTFILE: test_file(open_file(hwnd, "VBI recording to play live", {{"VBI recording", "*.vbi;*.tbc"}, {"All files", "*.*"}})); break;
             case ID_RECORD: toggle_record(); break;
             case ID_DECODE: decode_recording(); break;
@@ -1383,7 +1445,9 @@ struct CaptureWin : Window {
 void capture_window(HWND owner, bool start, const std::string& testFile)
 {
     auto *w = new CaptureWin;
-    w->create(L"TRCapture", "Capture card \xE2\x80\x94 live", WS_OVERLAPPEDWINDOW, S(owner, 1400), S(owner, 900), owner);
+    // WS_CLIPCHILDREN: the window repaints itself 5 times a second (pages, lines); without it every repaint covered
+    // the buttons, boxes and labels, which then drew themselves again - all the text flickered
+    w->create(L"TRCapture", "Capture card \xE2\x80\x94 live", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, S(owner, 1400), S(owner, 900), owner);
     if (!w->hwnd) return;
     fit_large(w->hwnd);
     ShowWindow(w->hwnd, SW_SHOW);

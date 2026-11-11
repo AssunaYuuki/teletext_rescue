@@ -2,6 +2,7 @@
 #include "mlse.h"
 #include "vbidecode.h"
 #include <array>
+#include <algorithm>
 #include <map>
 #include <set>
 
@@ -295,7 +296,44 @@ double syster_check(const Rec &R, int row, const std::vector<int> &uu) {
     return round(1000.0 * ok / std::max(1, n)) / 1000;
 }
 
-int syster_report(const Rec &R, const std::vector<int> &rows, const std::string &out_txt, Progress &pr) {
+int syster_report(const Rec &R, const std::vector<int> &rows0, const std::string &out_txt, Progress &pr) {
+    if (R.ntsc()) return 0;                                 // Syster is a 625-line (PAL) system
+    std::vector<int> rows = rows0;
+    // строки с данными ищем по самому сигналу: детектор относит вторую строку поля (16) к VPS, а поле 2
+    // повторяет то же самое на строках 328 и 329 — так в работу попадают все четыре строки, а не две.
+    // Сначала дешёвый отбор: MLSE по всем 32 строкам считается минутами, поэтому проверяем только те
+    // строки, где вообще есть быстрые переходы.
+    std::vector<int> detected;
+    {
+        std::vector<double> act(R.tv.size(), 0.0);
+        int nf = 0;
+        for (int u = 0; u < R.n && nf < 12; u += std::max(1, R.n / 12), nf++) {
+            for (int r = 0; r < (int)R.tv.size(); r++) {
+                auto y = R.line(u, r);
+                double s = 0;
+                for (size_t i = 600; i + 1 < y.size() && i < 1800; i++) s += std::abs((double)y[i + 1] - y[i]);
+                act[r] += s / 1200.0;
+            }
+        }
+        double mx = 0;
+        for (double a : act) mx = std::max(mx, a);
+        std::vector<int> uu;
+        for (int u = 0; u < R.n && uu.size() < 12; u += std::max(1, R.n / 12)) uu.push_back(u);
+        for (int r = 0; r < (int)R.tv.size(); r++)
+            if (mx > 0 && act[r] >= 0.3 * mx && syster_check(R, r, uu) >= 0.3) detected.push_back(r);
+    }
+    if (!detected.empty()) rows = detected;
+    // TR_SYSROWS=11,27 — debug: read these stored lines as well, whatever the detector called them
+    if (const char *e = getenv("TR_SYSROWS")) {
+        std::string s = e;
+        for (size_t p = 0; p < s.size();) {
+            size_t q = s.find(',', p); if (q == std::string::npos) q = s.size();
+            if (q > p) { int r = atoi(s.substr(p, q - p).c_str());
+                if (std::find(rows.begin(), rows.end(), r) == rows.end()) rows.push_back(r); }
+            p = q + 1;
+        }
+    }
+    if (rows.empty()) return 0;                             // ни строк детектора, ни данных в сигнале
     MlseModel M = model();
     MlseDecoder dec(M);
     std::vector<double> offs; std::vector<float> y(W);
@@ -359,7 +397,7 @@ int syster_report(const Rec &R, const std::vector<int> &rows, const std::string 
     for (auto &p : pk) { auto &q = per_line[p.line]; q.first++; if (p.ok) { q.second++; okn++; } nfix += p.fixed; }
     struct Block { int u; std::array<std::array<u8, 21>, 10> part; int have = 0; int recovered = 0; };
     std::vector<Block> blocks;
-    Block cur{}; int last = -1; bool open = false;
+    Block cur{}; bool open = false;
     auto close = [&]() {
         if (!open) return;
         for (int par = 0; par < 2; par++) {              // XOR-восстановление
@@ -371,13 +409,28 @@ int syster_report(const Rec &R, const std::vector<int> &rows, const std::string 
                 cur.part[miss] = x; cur.have |= 1 << miss; cur.recovered++;
             }
         }
+        // a block's five parts XOR to zero in each half; when that fails, the parts belong to two neighbouring
+        // blocks and the block must not be counted as complete
+        for (int par = 0; par < 2; par++) {
+            std::array<u8, 21> x{};
+            for (int i = par; i < 10; i += 2) for (int k = 0; k < 21; k++) x[k] ^= cur.part[i][k];
+            if (x != std::array<u8, 21>{}) { cur.have = 0; break; }
+        }
         blocks.push_back(cur); open = false;
     };
     for (auto &p : pk) {
         if (!p.ok) continue;
         int si = seq_index(p.d[1]); if (si < 0) continue;
-        if (!open || si <= last) { close(); cur = Block{}; cur.u = p.u; open = true; }
-        memcpy(cur.part[si].data(), &p.d[2], 21); cur.have |= 1 << si; last = si;
+        // Each line carries its own half of the block: line 15 the even parts 0,2,4,6,8 and line 329 the odd
+        // ones 1,3,5,7,9, each stepping by 4, so the ten parts of a block arrive in an order that is neither
+        // increasing nor cyclic. A part already in the block therefore ends it only when its data differs:
+        // the same bytes again are just a repeat of the reading.
+        if (open && (cur.have >> si & 1)) {
+            if (std::equal(cur.part[si].begin(), cur.part[si].end(), &p.d[2])) continue;
+            close(); cur = Block{}; cur.u = p.u; open = true;
+        }
+        if (!open) { cur = Block{}; cur.u = p.u; open = true; }
+        memcpy(cur.part[si].data(), &p.d[2], 21); cur.have |= 1 << si;
     }
     close();
     int full = 0, rec = 0;

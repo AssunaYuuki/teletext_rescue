@@ -21,7 +21,7 @@ static std::string tt_page_html(const Project &P, const Page &pg, const std::str
     for (size_t k = 0; k < pg.versions.size(); k++) {
         const Version &s = pg.versions[k];
         Over x = P.fitted(s.rows, P.overlay(pg, &s), t);
-        auto cells = level1_cells(s.rows, t, P.table2(), &x);
+        auto cells = level1_cells(s.rows, t, P.table2(&pg), &x);
         std::map<int, std::vector<const Cell *>> grid;
         for (auto &c : cells) {
             auto &g = grid[c.r];

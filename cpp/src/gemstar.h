@@ -66,6 +66,17 @@ struct GemstarClock {
     int year = 0, month = 0, day = 0, weekday = 0, hour = 0, minute = 0, zone = 0;
     int64_t frame = 0;
 };
+
+// One decoded guide message that carries text rather than a programme record:
+// an article from the magazine part of GUIDE Plus+ (film and video pages, book
+// list, help pages). Stored line by line so the window can show it as a text.
+struct GemstarText {
+    int type = 0;
+    size_t bytes = 0;
+    int64_t frame = 0;
+    std::vector<std::string> lines;
+    std::string title() const { return lines.empty() ? std::string() : lines.front(); }
+};
 GemstarClock gemstarClock(const GemstarPacket& p);
 
 struct GemstarStream {
@@ -81,6 +92,7 @@ struct GemstarStream {
     int64_t blocksGood = 0, blocksBad = 0; // Type B blocks whose chained checksum is right after decryption
     int keyYear = 0, keyMonth = 0;         // the date the Type B data was decrypted with
     std::vector<GemstarShow> shows;
+    std::vector<GemstarText> texts;        // guide messages that carry articles rather than programmes
     std::vector<std::string> guide;        // report lines: Type A headers, Type B messages, programmes
     std::vector<std::string> report;
 };

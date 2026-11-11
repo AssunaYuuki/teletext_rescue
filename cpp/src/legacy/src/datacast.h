@@ -5,4 +5,6 @@
 
 double datacast_check(const Rec &R, int row, int par);
 // lines — (запись, чётность или -1); пусто — найти по vbi_probe
-std::string datacast_export(const std::string &src, const std::string &out, std::vector<std::pair<int, int>> lines, Progress &pr);
+// format: the layout the rows are records of ("" = detect it)
+std::string datacast_export(const std::string &src, const std::string &out, std::vector<std::pair<int, int>> lines, Progress &pr,
+                            const std::string &format = "");

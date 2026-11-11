@@ -308,13 +308,15 @@ std::string vbi_unpacked(const std::string &src_in, Progress &pr) {
 
 // rows whose signal the user set by hand (TeletextRescue VBI lines window): row -> kind of the line map
 std::map<int, std::string> g_force_rows;
+// layout TeletextRescue already decided on (chosen by hand or detected): no detection of its own; "" = detect
+std::string g_force_format;
 
 Json vbi_auto(const std::string &src_in, bool again, Progress &pr) {
     std::string src = abspath(src_in), rep_dir = vbi_report_dir(src), orig = src;
     make_dirs(rep_dir);
     src = vbi_unpacked(src, pr);
     pr.step("Looking at the recording: format and what each line carries");
-    Json res = vbi_probe(src, pr);
+    Json res = vbi_probe(src, pr, 240, vbi_format(g_force_format) ? g_force_format : std::string());
     if (res["format"].is_null()) {
         pr.log("Unknown recording format");
         Json r = Json::object(); r["file"] = orig; r["format"] = Json(); r["results"] = Json::array();
@@ -341,23 +343,64 @@ Json vbi_auto(const std::string &src_in, bool again, Progress &pr) {
         try { fn(); } catch (Cancelled &) { throw; } catch (std::exception &e) { pr.log(std::string(what) + ": " + e.what()); }
     };
 
-    if (by.count("WST PAL teletext")) {
+    if (!R.ntsc() && by.count("WST PAL teletext")) {
         std::string out = path_join(rep_dir, "teletext");
         if (!exists(path_join(out, "pages.json")) || again) {
             // декодеры WST работают в сетке bt8x8 (32 × 2048, 35,47 МГц): другие чипы сначала пересчитываются в неё
             std::string vbi = src, tmp;
-            std::vector<int> wrows = rows_of(by["WST PAL teletext"]);
-            if (fmtname != "bt8x8-pal") {
-                pr.step("Converting the teletext lines to the bt8x8 layout");
+            // a line the probe took for teletext on a fraction of the others' signal is something else (Партнер-
+            // Телетекст 1999: line 330 at 28% against 82-91% is a test signal); fed to the decoder it spoils the
+            // templates
+            std::vector<const Json *> wl = by["WST PAL teletext"];
+            {
+                std::vector<double> sg; for (auto *L : wl) sg.push_back((*L)["signal"].num(0));
+                double ms = sg.empty() ? 0 : median(sg);
+                std::vector<const Json *> keep;
+                for (auto *L : wl)
+                    if ((*L)["signal"].num(0) >= 0.5 * ms) keep.push_back(L);
+                    else pr.log(fmt("  row %d: WST signal %.0f%% against %.0f%% on the others - left out of the teletext", (int)(*L)["row"].integer(), (*L)["signal"].num(0) * 100, ms * 100));
+                if (!keep.empty()) wl = keep;
+            }
+            std::vector<int> wrows = rows_of(wl);
+            // the bt8x8 window holds lines 7-22 / 320-335; teletext on 6, 318 or 319 (Партнер-Телетекст 1999:
+            // lines 6 and 318) widens it, else those rows of the pages are lost every time the page comes
+            int first1 = 7, first2 = 320, per = 16;
+            {
+                int lo1 = 7, hi1 = 22, lo2 = 320, hi2 = 335;
+                for (int r : wrows) {
+                    int tvl = R.tv.at(r);
+                    for (int t : {tvl, tvl + 313}) if (R.unit == "field" || t == tvl) {   // field formats: field B numbered as A
+                        if (t < 313) { lo1 = std::min(lo1, t); hi1 = std::max(hi1, t); } else { lo2 = std::min(lo2, t); hi2 = std::max(hi2, t); }
+                    }
+                }
+                if (lo1 < 7 || lo2 < 320 || hi1 > 22 || hi2 > 335) {
+                    first1 = lo1; first2 = lo2; per = std::max(hi1 - lo1, hi2 - lo2) + 1;
+                    pr.log(fmt("teletext also on lines outside 7-22 / 320-335: the window is lines %d-%d / %d-%d", first1, first1 + per - 1, first2, first2 + per - 1));
+                }
+            }
+            // a bt8x8 recording whose line window starts elsewhere than Linux bttv's (Windows WDM drivers: their own
+            // line start time) has the run-in away from where the decoders look for it (MLSE 90-135): its lines are
+            // moved to the bttv place the same way (a shift, same sampling); within 20 samples (4 bits) they read as they are
+            double start = NAN;
+            bool shiftBt = false;
+            if (fmtname == "bt8x8-pal") {
+                sub_try([&] { start = wst_start(R, pr); }, "teletext run-in");
+                shiftBt = !std::isnan(start) && fabs(start - BT8X8_WST_START) > 20;
+                if (!std::isnan(start))
+                    pr.log(fmt("bt8x8: teletext run-in at sample %.1f (Linux bttv: %.0f)%s", start, BT8X8_WST_START,
+                               shiftBt ? " - the lines are moved to the bttv place" : ""));
+            }
+            if (fmtname != "bt8x8-pal" || shiftBt || per != 16) {
+                pr.step(shiftBt ? "Centring the teletext lines (bt8x8 window shifted against Linux bttv)" : "Converting the teletext lines to the bt8x8 layout");
                 tmp = path_join(rep_dir, "teletext_bt8x8.tmp.vbi");
-                sub_try([&] { wst_to_bt8x8(R, tmp, pr); }, "conversion");
+                sub_try([&] { wst_to_bt8x8(R, tmp, pr, start, first1, first2, per); }, "conversion");
                 vbi = tmp;
                 std::set<int> br;
                 for (int r : wrows) {
                     int tvl = R.tv.at(r);
                     for (int t : {tvl, tvl + 313}) if (R.unit == "field" || t == tvl) {
-                        if (t >= 7 && t <= 22) br.insert(t - 7);
-                        if (t >= 320 && t <= 335) br.insert(16 + t - 320);
+                        if (t >= first1 && t < first1 + per) br.insert(t - first1);
+                        if (t >= first2 && t < first2 + per) br.insert(per + t - first2);
                     }
                 }
                 wrows.assign(br.begin(), br.end());
@@ -366,8 +409,8 @@ Json vbi_auto(const std::string &src_in, bool again, Progress &pr) {
                 // прежний результат не должен подменять новый, если декодер в этот раз не справится
                 if (again) { std::error_code ec; fs::remove(P(path_join(out, "pages.json")), ec); fs::remove(P(path_join(out, "project.json")), ec); }
                 pr.step("Decoding WST teletext into pages");
-                sub_try([&] { decode_vbi_project(vbi, out, 32, true, true, pr, &wrows); }, "teletext decoder");
-                if (!exists(path_join(out, "pages.json"))) {
+                sub_try([&] { decode_vbi_project(vbi, out, 2 * per, true, true, pr, &wrows); }, "teletext decoder");
+                if (!exists(path_join(out, "pages.json")) && per == 16) {   // the tape decoder reads the 32-line layout only
                     pr.step("Tape recording: reading WST with the wide-channel decoder (GPU)");
                     sub_try([&] { vhs_wst_project(vbi, out, wrows, pr); }, "tape decoder");
                 }
@@ -397,10 +440,13 @@ Json vbi_auto(const std::string &src_in, bool again, Progress &pr) {
         }
         if (exists(path_join(out, "pages.json"))) add("WST teletext (525 lines)", "teletext_project", out);
     }
-    if (by.count("Nagravision (Syster) access data")) {
+    {   // Syster: строки ищем и сами — детектор может не заметить слабый поток (Мир кино: строки 15/16 читаются,
+        // но метки нет, и разбор вообще не запускался)
+        std::vector<int> srows;
+        if (by.count("Nagravision (Syster) access data")) srows = rows_of(by["Nagravision (Syster) access data"]);
         std::string tp = path_join(rep_dir, "syster.txt");
         int n = 0;
-        sub_try([&] { n = syster_report(R, rows_of(by["Nagravision (Syster) access data"]), tp, pr); }, "Syster");
+        sub_try([&] { n = syster_report(R, srows, tp, pr); }, "Syster");
         if (exists(tp)) add("Nagravision (Syster) access data", "text", tp, fmt("%d lines with a correct CRC", n));
     }
     if (by.count("Japanese teletext (JTES)")) {
@@ -459,7 +505,7 @@ Json vbi_auto(const std::string &src_in, bool again, Progress &pr) {
         if (!exists(path_join(out, "index.html")) || again) {
             std::vector<std::pair<int, int>> ls;
             for (auto *L : kv.second) ls.push_back({(*L)["row"].integer(), (*L)["parity"].is_null() ? -1 : (*L)["parity"].integer()});
-            sub_try([&] { datacast_export(src, out, ls, pr); }, "datacast");
+            sub_try([&] { datacast_export(src, out, ls, pr, fmtname); }, "datacast");
         }
         if (exists(path_join(out, "index.html"))) add("Encrypted datacast (packets, addresses, schedule)", "html", path_join(out, "index.html"));
         break;

@@ -123,6 +123,42 @@ HWND label(HWND parent, const std::string &text, int id, DWORD extra) {
 }
 void set_label_colour(HWND h, COLORREF c) { g_label_col[h] = c; InvalidateRect(h, nullptr, TRUE); }
 
+// a label whose text changes several times a second (a status line): the STATIC control erases its background
+// and then draws the text, which flickers; this one draws the whole line in memory and puts it on at once
+static LRESULT CALLBACK lbl_sub(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
+    if (m == WM_ERASEBKGND) return 1;
+    if (m == WM_SETTEXT) {
+        LRESULT r = DefSubclassProc(h, m, w, l);
+        InvalidateRect(h, nullptr, FALSE);
+        return r;
+    }
+    if (m == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc; GetClientRect(h, &rc);
+        HDC mem = CreateCompatibleDC(dc);
+        HBITMAP bm = CreateCompatibleBitmap(dc, std::max(1L, rc.right), std::max(1L, rc.bottom));
+        HGDIOBJ ob = SelectObject(mem, bm);
+        // the colours the parent gives its labels (ctl_colour), the brush filling the background
+        HBRUSH br = (HBRUSH)SendMessageW(GetParent(h), WM_CTLCOLORSTATIC, (WPARAM)mem, (LPARAM)h);
+        FillRect(mem, &rc, br ? br : (HBRUSH)GetStockObject(BLACK_BRUSH));
+        HGDIOBJ of = SelectObject(mem, (HFONT)SendMessageW(h, WM_GETFONT, 0, 0));
+        SetBkMode(mem, TRANSPARENT);
+        int n = GetWindowTextLengthW(h);
+        std::wstring t((size_t)n + 1, 0);
+        GetWindowTextW(h, t.data(), n + 1);
+        t.resize((size_t)n);
+        DrawTextW(mem, t.c_str(), (int)t.size(), &rc, DT_LEFT | DT_TOP | DT_NOPREFIX | DT_WORDBREAK | DT_END_ELLIPSIS);
+        BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, of);
+        SelectObject(mem, ob); DeleteObject(bm); DeleteDC(mem);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    return DefSubclassProc(h, m, w, l);
+}
+void buffer_label(HWND h) { SetWindowSubclass(h, lbl_sub, 3, 0); InvalidateRect(h, nullptr, FALSE); }
+
 HWND edit(HWND parent, int id, const std::string &text, DWORD extra) {
     HWND h = CreateWindowExW(0, L"EDIT", W(text).c_str(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | extra, 0, 0, 10, 10, parent, (HMENU)(INT_PTR)id, g_inst, nullptr);
     SendMessageW(h, WM_SETFONT, (WPARAM)font(parent), TRUE);

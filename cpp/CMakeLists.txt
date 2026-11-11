@@ -33,7 +33,7 @@ set_source_files_properties(${LEGACY} PROPERTIES COMPILE_OPTIONS "-w")
 
 # OpenCL is loaded at run time (OpenCL.dll / libOpenCL / OpenCL.framework), no SDK needed.
 set(CORE
-  src/amol.cpp src/vitc.cpp src/gemstar.cpp src/gemguide.cpp src/jtes.cpp src/jtesrx.cpp src/tvinform.cpp src/tvinorpak.cpp src/tviftr3.cpp src/biznestext.cpp src/arjcheck.cpp src/finds.cpp src/pcxfix.cpp src/faxg4.cpp src/onair.cpp src/ttpages.cpp src/ttsquash.cpp src/vbirepair.cpp src/export.cpp
+  src/amol.cpp src/vitc.cpp src/gemstar.cpp src/gemguide.cpp src/jtes.cpp src/jtesrx.cpp src/tvinform.cpp src/tvinorpak.cpp src/tviftr3.cpp src/tvimeteo.cpp src/biznestext.cpp src/itsidl.cpp src/rar.cpp src/arjcheck.cpp src/finds.cpp src/pcxfix.cpp src/faxg4.cpp src/onair.cpp src/ttpages.cpp src/ttsquash.cpp src/vbirepair.cpp src/export.cpp
   src/decoder.cpp src/ttdata.cpp src/starsight.cpp src/textservices.cpp src/silentradio.cpp src/ssjson.cpp src/rescache.cpp src/colour.cpp src/legacy_bridge.cpp src/services.cpp src/linecolour.cpp
   src/live.cpp src/tvtime.cpp src/vbicodes.cpp
   src/flac.cpp src/vbifile.cpp src/slicer_cpu.cpp src/slicer_gpu.cpp src/fastdata.cpp src/fastmlse.cpp src/mlse.cpp

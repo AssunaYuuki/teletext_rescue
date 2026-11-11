@@ -442,13 +442,25 @@ void norpakFiles(TviNorpak& o, const std::string& outDir)
                         f.have, f.blocks) + (f.joined ? fmt(" (%d of them put together from damaged copies, CRC checked)", f.joined) : "") +
                     (f.path.empty() ? "" : "  -> " + f.path));
         if (!f.note.empty()) R.push_back("      " + f.note);
-        // index record: 6-byte entries 00 00, 01 AE / 01 AF, u16 (ORT 2002: 27 of them); not sums or CRCs of
-        // block groups, not times - shown as bytes
+        // index record: 6-byte big-endian numbers (ORT 2002: 27 of them, 01AED0A5..01AF5D84, unsorted, all
+        // different). Not sums or CRCs of block groups (sums of random data would spread far more), not times
+        // (they would span 10 s of the stream); close numbers like serial numbers - maybe the receivers the file
+        // was addressed to (not proved: the only file with this record)
         auto ix = index.find(f.id);
         if (ix != index.end() && !ix->second.empty()) {
+            const auto& v = ix->second;
             std::string m;
-            for (size_t k = 0; k < ix->second.size(); k++) m += fmt(k % 6 == 0 && k ? " %02X" : "%02X", ix->second[k]);
-            R.push_back(fmt("      index record (D5 F3 C9 01, not decoded), %zu bytes: ", ix->second.size()) + m);
+            if (v.size() % 6 == 0) {
+                for (size_t k = 0; k < v.size(); k += 6) {
+                    uint64_t n = 0;
+                    for (int j = 0; j < 6; j++) n = n << 8 | v[k + j];
+                    m += fmt(k ? " %llu" : "%llu", (unsigned long long)n);
+                }
+                R.push_back(fmt("      index record (D5 F3 C9 01): %zu numbers of 6 bytes, perhaps receivers the file was addressed to: ", v.size() / 6) + m);
+            } else {
+                for (size_t k = 0; k < v.size(); k++) m += fmt("%02X", v[k]);
+                R.push_back(fmt("      index record (D5 F3 C9 01, not decoded), %zu bytes: ", v.size()) + m);
+            }
         }
         if (!f.missing.empty()) {
             std::string m;

@@ -2,8 +2,8 @@
 ; Сначала: ninja в cppuild, затем strip TeletextRescue.exe и trcli.exe в dist\Teletext Rescue <версия>\n; Потом:   ISCC.exe setup.iss  -> dist\TeletextRescue-Setup-<версия>.exe
 
 #define AppName "Teletext Rescue"
-#define AppVersion "1.3"
-; ISCC /DArch=x86 setup.iss: the 32-bit build (dist\Teletext Rescue 1.3 x86)
+#define AppVersion "1.4"
+; ISCC /DArch=x86 setup.iss: the 32-bit build (dist\Teletext Rescue 1.4 x86)
 #ifndef Arch
 #define Arch "x64"
 #endif

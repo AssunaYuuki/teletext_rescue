@@ -4,9 +4,18 @@
 #include <atomic>
 #include <mutex>
 
+thread_local bool parallel_low = false;
+// set by a thread whose calls are small and many (the live decoder's card calls: 5 lines a frame): parallel_for runs
+// in that thread - starting 11-23 threads a call cost more processor time than the work itself
+thread_local bool parallel_serial = false;
+
 void parallel_for(size_t n, const std::function<void(size_t)> &fn, Progress *pr, size_t chunk) {
     unsigned nt = std::max(1u, std::thread::hardware_concurrency() > 1 ? std::thread::hardware_concurrency() - 1 : 1u);
+    const bool low = parallel_low;
+    if (low) nt = std::max(1u, nt / 3);
+    if (parallel_serial) nt = 1;
     if (n == 0) return;
+    if (nt > n) nt = (unsigned)n;   // no more threads than items
     if (nt == 1 || n < 2) { for (size_t i = 0; i < n; i++) { if (pr) pr->check(); fn(i); } return; }
     std::atomic<size_t> next{0};
     std::atomic<bool> stop{false};
@@ -15,6 +24,9 @@ void parallel_for(size_t n, const std::function<void(size_t)> &fn, Progress *pr,
     std::vector<std::thread> th;
     for (unsigned t = 0; t < nt; t++)
         th.emplace_back([&] {
+#ifdef _WIN32
+            if (low) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+#endif
             for (;;) {
                 size_t a = next.fetch_add(chunk);
                 if (a >= n || stop) return;

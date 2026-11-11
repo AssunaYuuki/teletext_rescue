@@ -343,6 +343,7 @@ Result Engine::decode(const float* y, int len, double lo, double hi, double step
         sc.push_back({s, off});
     }
     std::stable_sort(sc.begin(), sc.end(), [](auto& a, auto& b) { return a.first < b.first; });
+    if (sc.empty()) return res;                      // no start offset to try: sc[0] and bbits stay empty
     const int KT = std::max(1, std::min<int>(M.ntop, (int)sc.size()));
     double best = 1e300;
     std::vector<double> Y(NT * NP), bY, C, bC, pm(NT);

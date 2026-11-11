@@ -106,6 +106,20 @@ Image render_teletext(const Rows &rows, const Charset &t, const Charset *t2, con
     const int CW = 12, CH = 20;
     Image im(40 * CW, 25 * CH, o.tv ? 0x3C3C3C : 0);
     auto cs = level1_cells(rows, t, t2, over, has_flash, has_box);
+    // Непринятые строки остаются без ячеек и рисовались чёрным — на цветной странице это чёрные полосы.
+    // Заливаем их фоном ближайшей принятой строки, чтобы страница выглядела целой.
+    {
+        // фон страницы — самый частый цвет фона на принятых строках
+        int page_bg = 0, best = -1;
+        {
+            std::map<int, int> cnt;
+            for (auto &cell : cs) cnt[cell.bg] += cell.w;
+            for (auto &x : cnt) if (x.second > best) { best = x.second; page_bg = x.first; }
+        }
+        if (page_bg > 0)
+            for (int r = 0; r < 25; r++)
+                if (!rows.count(r)) im.fill(0, r * CH, 40 * CW, CH, COL[page_bg]);
+    }
     for (auto &cell : cs) {
         int x = cell.c * CW, y = cell.r * CH;
         if (o.tv && !cell.box) continue;

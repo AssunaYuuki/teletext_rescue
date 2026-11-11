@@ -50,5 +50,8 @@ private:
 
 // параллельный цикл на всех ядрах (кроме одного)
 void parallel_for(size_t n, const std::function<void(size_t)> &fn, Progress *pr = nullptr, size_t chunk = 1);
+// set in a thread: its parallel_for runs on a third of the cores at the lowest priority (the live decoder trains its
+// templates beside the capture, which must keep up with 25 frames a second)
+extern thread_local bool parallel_low;
 std::vector<u8> bits_lsb(const u8 *bytes, int n);
 void bytes_lsb(const u8 *bits, int nbytes, u8 *out);

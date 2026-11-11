@@ -111,8 +111,9 @@ LineForce lineForceFromKey(const std::string& k)
 
 // How convincingly a geometry fits: the best line's share of frames where a
 // 608-style run-in (captions are on nearly every NTSC recording) is found.
-static double formatScore(const std::string& path, VbiFormat f, Slicer& cpu)
+static double formatScore(const std::string& path, VbiFormat f, Slicer& cpu, double* captions = nullptr)
 {
+    if (captions) *captions = 0;
     VbiFile vf;
     std::string err;
     if (!vf.open(path, err, f)) return -1;
@@ -128,11 +129,23 @@ static double formatScore(const std::string& path, VbiFormat f, Slicer& cpu)
     std::vector<float> out;
     cpu.run(buf.data(), n, g, jobs, out, err);
     double best = 0;
+    // a run-in alone is not enough: both bytes of a 608 pair have odd parity. Half lines of a 1440-sample capture read
+    // as 720-sample lines turn Nielsen AMOL (64 x fH) into a caption-rate run-in (wcbs sample.vbi: em28xx 0.65 against
+    // cx23885 0.38), but what follows is not 7 bits + parity
+    auto oddPair = [](const float* o) {
+        int ones[2] = {0, 0};
+        for (int k = 0; k < 16; k++) ones[k / 8] += o[4 + k] > 0;
+        return (ones[0] & 1) && (ones[1] & 1);
+    };
     for (int l = 0; l < g.linesPerFrame && !g.pal; l++) { // 608 captions only exist in 525-line video
         int hits = 0;
-        for (int i = 0; i < n; i++) hits += detected(&out[((size_t)i * jobs.size() + l) * kSliceOut], MODE_CC);
+        for (int i = 0; i < n; i++) {
+            const float* o = &out[((size_t)i * jobs.size() + l) * kSliceOut];
+            hits += detected(o, MODE_CC) && oddPair(o);
+        }
         best = std::max(best, (double)hits / n);
     }
+    if (captions) *captions = best;
     if (best >= 0.8) return best;
     // no clear captions (625-line captures have none): try teletext-rate
     // sync on the busiest lines
@@ -188,7 +201,7 @@ static bool decodeStream(const std::string& path, const DecodeOptions& opt, Deco
         res.geom.pal = !is525;
         res.slicerName = is525 ? "525-line teletext stream (.t34)" : "625-line teletext stream (.t42)";
         if (opt.progress) opt.progress(0, "Building the teletext pages");
-        if (!ttBuild(st, is525, ttWorkDir(path), path, res.teletext, note, err)) return false;
+        if (!ttBuild(st, is525, ttPagesDir(path), path, res.teletext, note, err)) return false;
         res.teletext.system = is525 ? "525-line WST (.t34)" : "625-line WST (.t42)";
         note("teletext: " + std::to_string(res.teletext.pages) + " pages, " + std::to_string(res.teletext.subpages) + " versions");
         li.kind = "Teletext stream";
@@ -225,7 +238,7 @@ static bool decodeTs(const std::string& path, const DecodeOptions& opt, DecodeRe
     Bytes st;
     for (auto& p : pk) st.insert(st.end(), p.begin(), p.end());
     if (opt.progress) opt.progress(1, "Building the teletext pages");
-    if (!ttBuild(st, false, ttWorkDir(path), path, res.teletext, note, err)) return false;
+    if (!ttBuild(st, false, ttPagesDir(path), path, res.teletext, note, err)) return false;
     LineInfo li;
     li.kind = "DVB teletext";
     li.mode = MODE_TEST + 1;
@@ -252,7 +265,7 @@ static bool runLegacy(DecodeResult& res, const DecodeOptions& opt, const std::st
         if (kv.second != LineForce::Auto)
             force[kv.first] = kv.second == LineForce::Teletext625 ? "WST PAL teletext" : (kv.second == LineForce::Fast || kv.second == LineForce::Norpak) ? "NABTS" : "empty";
     if (!legacyRun(src, opt.again || !force.empty(), [&](const std::string& s) { if (opt.progress) opt.progress(0, s); },
-                   [&](const std::string& s) { note("  " + s); }, opt.cancel, L, e, force, opt.gpu)) {
+                   [&](const std::string& s) { note("  " + s); }, opt.cancel, L, e, force, opt.gpu, res.geom.format)) {
         if (opt.cancel && *opt.cancel) { err = "cancelled"; return false; }
         note("Teletext Rescue engine: " + e);
         return true;
@@ -556,14 +569,26 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
         }
         double best = -1, bestPal = -1;
         VbiFormat pal = VbiFormat::Unknown;
+        std::map<VbiFormat, double> scoreOf, capsOf;
         for (VbiFormat c : cands) {
-            double s = formatScore(path, c, *probeCpu);
+            double s = formatScore(path, c, *probeCpu, &capsOf[c]);
+            scoreOf[c] = s;
             char b[160];
             snprintf(b, sizeof b, "format candidate %s: 608 run-in score %.2f", formatKey(c), s);
             formatLog += std::string(b) + "\n";
             if (s > best + 0.05) { best = s; format = c; }
             if (formatGeometry(c).pal && s > bestPal) { bestPal = s; pal = c; }
         }
+        // captions with good parity on nearly every frame: a 525-line recording, whatever else its lines look like
+        // (January 1998 Whyy Test: 1.00, went to cx23885-pal on 3 lines of "alternating SECAM subcarriers")
+        const bool clearCaptions = best >= 0.9 && format != VbiFormat::Unknown && !formatGeometry(format).pal;
+        // the file holds a whole number of this layout's frames
+        std::error_code szec;
+        const uintmax_t fileSize = std::filesystem::file_size(std::filesystem::u8path(path), szec);
+        auto wholeFrames = [&](VbiFormat c) {
+            const int64_t fb = formatGeometry(c).fileFrameBytes();
+            return !szec && fb > 0 && fileSize % (uintmax_t)fb == 0;
+        };
         // The original Teletext Rescue's detector (line timing, sync, SECAM identification,
         // teletext coherence) knows 625-line captures well; our score above is a 608 run-in
         // count that random 625-line data can also reach (capture(1).vbi: 0.83). Its answer is
@@ -572,7 +597,10 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
         {
             std::string ln;
             VbiFormat lf = legacyDetectFormat(path, &ln);
-            if (lf != VbiFormat::Unknown && (formatGeometry(lf).pal || best < 0.8) &&
+            // its 525-line answer only when that layout reads about as well as the best one (channel surfing test
+            // data.vbi: it named em28xx-ntsc, whose half lines of a 1440-sample capture score far below cx23885)
+            const bool asGood = formatGeometry(lf).pal || !scoreOf.count(lf) || scoreOf[lf] >= best - 0.1;
+            if (lf != VbiFormat::Unknown && (formatGeometry(lf).pal || best < 0.8) && asGood && !clearCaptions &&
                 std::find(cands.begin(), cands.end(), lf) != cands.end()) {
                 formatLog += "format by the Teletext Rescue detector: " + ln + "\n";
                 format = lf;
@@ -580,8 +608,11 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
             }
         }
         // Japanese teletext tapes captured at 27 MHz (GV-USB2, Hauppauge): no 608 captions, and a 720-sample layout
-        // of the same frame size passes too ([NHK]-2001-10-13.vbi went to em28xx): the JTES receiver decides
-        if (best < 0.8 && !want625 && format != VbiFormat::Cx23885 &&
+        // of the same frame size passes too ([NHK]-2001-10-13.vbi went to em28xx): the JTES receiver decides. Found,
+        // it keeps the 525-line layout against the fТ3 search below (Betamax 1994 GV-USB2: 6 header-like lines in
+        // cx23885-pal took the file away from JTES)
+        bool jtesLayout = false;
+        if (best < 0.8 && !want625 &&
             std::find(cands.begin(), cands.end(), VbiFormat::Cx23885) != cands.end()) {
             VbiFile jf;
             std::string jerr;
@@ -593,9 +624,10 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
                 formatLog += "Japanese teletext found in the 1440-sample layout: " + jr.why + "\n";
                 format = VbiFormat::Cx23885;
                 legacyPick = true;
+                jtesLayout = true;
             }
         }
-        if (!want525) {
+        if (!want525 && !jtesLayout) {
             // a layout of another frame size shifts the rows frame by frame but still finds the fТ3 lines on its
             // rows (test3/part2.vbi: 1440 x 36 over a 1440 x 32 file): the one the file size is a whole number
             // of frames of goes first
@@ -618,6 +650,24 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
                 formatLog += "not taking " + std::string(formatKey(f3)) + " for fТ3: too few lines and not its frame size\n";
                 f3 = VbiFormat::Unknown;
             }
+            // nor a layout the file does not divide into when a 525-line one divides it exactly and reads well: in the
+            // wrong frame length the 5.7 Mbit/s lines of an NTSC capture drift over all the rows and some look like the
+            // fТ3 header (wcbs sample.vbi: 23 "fТ3 lines" in cx23885-pal, the NTSC layout is 22 109 whole frames)
+            // fТ3 runs on a few lines of a frame (RTR 2001: 5 of ~14); "fТ3" on most rows of a layout the file does not
+            // divide into is data drifting over the rows (wcbs sample.vbi: 23 of 36 in cx23885-pal, 21 of 32 in saa713x-pal)
+            if (f3 != VbiFormat::Unknown && !bestExact && best3 * 2 > formatGeometry(f3).linesPerFrame) {
+                formatLog += fmt("not taking %s for fТ3: %d of its %d rows, not its frame size - data drifting over the rows\n",
+                                 formatKey(f3), best3, formatGeometry(f3).linesPerFrame);
+                f3 = VbiFormat::Unknown;
+            }
+            if (f3 != VbiFormat::Unknown && !bestExact)
+                for (VbiFormat c : cands)
+                    if (!formatGeometry(c).pal && wholeFrames(c) && scoreOf[c] >= 0.5) {
+                        formatLog += "not taking " + std::string(formatKey(f3)) + " for fТ3: not its frame size, and " +
+                                     formatKey(c) + " divides the file and reads\n";
+                        f3 = VbiFormat::Unknown;
+                        break;
+                    }
             if (f3 != VbiFormat::Unknown) {
                 formatLog += "taking " + std::string(formatKey(f3)) + ": its lines carry ТВ-информ fТ3\n";
                 format = f3;
@@ -627,9 +677,10 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
         // SECAM tapes through a 1440-sample chip (CX23103 / CX231xx, SAA7113: K021-1): the 525-line layout of the
         // same file size wins on caption-like lines, but the colour identification of lines 7-15 is only where the
         // 625-line layout puts it - a SECAM picture decides for that layout
-        if (!legacyPick && !want525 && format != VbiFormat::Unknown && !formatGeometry(format).pal)
+        if (!legacyPick && !want525 && !clearCaptions && format != VbiFormat::Unknown && !formatGeometry(format).pal)
             for (VbiFormat c : cands) {
                 if (!formatGeometry(c).pal) continue;
+                if (wholeFrames(format) && !wholeFrames(c)) continue;   // see keep525 below
                 VbiFile cf;
                 std::string cerr;
                 if (!cf.open(path, cerr, c)) continue;
@@ -641,7 +692,13 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
                     break;
                 }
             }
-        if (!legacyPick && format != VbiFormat::Unknown && !formatGeometry(format).pal && pal != VbiFormat::Unknown && best < 0.5 && !want525) {
+        // (not into a layout the file does not divide into from one it divides exactly: an NTSC capture without captions -
+        // wcbs sample.vbi, NABTS and AMOL only - is 22 109 whole cx23885 frames and no whole number of cx23885-pal ones;
+        // teletext found in a minute from the middle still decides below)
+        const bool keep525 = format != VbiFormat::Unknown && pal != VbiFormat::Unknown && wholeFrames(format) && !wholeFrames(pal);
+        if (keep525 && !legacyPick && !formatGeometry(format).pal && best < 0.5 && !want525)
+            formatLog += std::string("no 608 captions, but the file is whole frames of ") + formatKey(format) + " and not of " + formatKey(pal) + ": keeping it\n";
+        if (!keep525 && !legacyPick && format != VbiFormat::Unknown && !formatGeometry(format).pal && pal != VbiFormat::Unknown && best < 0.5 && !want525) {
             formatLog += "no 608 captions: taking the 625-line layout " + std::string(formatKey(pal)) + "\n";
             format = pal;
         }
@@ -652,7 +709,10 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
         // (also when a 525-line layout won without clear captions: a SECAM tape through a CX23103 / SAA7113 at
         // 1440 x 18 lines has the ТВ-информ fТ1 carrier on line 19, which passes for captions in 1440 x 12)
         // (not when only the lines are looked at - VBI lines opens at once; the layout can be changed there)
-        if (!opt.probeOnly && (best < 0.5 || (best < 0.9 && !legacyPick && !formatGeometry(format).pal)) && !want525) {
+        // (not when the 525-line layout has captions whose bytes have good parity on half the frames or more: that is
+        // no carrier passing for captions - channel surfing test data.vbi spent a minute here for nothing)
+        const bool parityCaptions = format != VbiFormat::Unknown && !formatGeometry(format).pal && capsOf[format] >= 0.5;
+        if (!opt.probeOnly && (best < 0.5 || (best < 0.9 && !legacyPick && !formatGeometry(format).pal && !parityCaptions)) && !want525) {
             std::vector<VbiFormat> tries;
             for (const char* k : {"bttv-pal", "cx88-pal", "cx23885-pal", "em28xx-pal", "saa7134-pal", "saa713x-pal", "ivtv-pal", "tbc-pal"}) {
                 VbiFormat c = formatFromKey(k);
@@ -1311,15 +1371,19 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
     if (opt.probeOnly) {}
     else if (opt.jtesHow && !opt.jtesHow->slots.empty()) { jtesRx = *opt.jtesHow; jtesOwn = true; }
     else if (opt.jtesProbe) {
-        // JTES lines look like 'E' (NABTS sync, foreign header) to the first reading: only they and their neighbours
+        // JTES lines look like 'E' (NABTS sync, foreign header) to the first reading, on a weak GV-USB2 tape like
+        // 'X' (framing 2D: NHK 2001-10-18): only they and their neighbours
         std::vector<int> eSlots;
         for (int l = 0; l < g.linesPerFrame; l++) {
             int ln, fl;
             lineOf(g, l, ln, fl);
             auto it = lineKind.find({ln, fl});
-            if (it != lineKind.end() && it->second == 'E') eSlots.push_back(l % (g.linesPerFrame / 2));
+            if (it != lineKind.end() && (it->second == 'E' || it->second == 'X')) eSlots.push_back(l % (g.linesPerFrame / 2));
         }
-        if (!eSlots.empty() && jtesProbeRecording(vf, *slicer, opt.cancel, jtesRx, eSlots)) {
+        // a probe of a few hundred rows: on the processor (on the graphics card its small calls cost more than the work:
+        // tbs star wars test.vbi 2-4 s against 0.2 s); the reading of a JTES recording itself goes where chosen
+        std::unique_ptr<Slicer> probeSl = makeCpuSlicer(opt.threads);
+        if (!eSlots.empty() && jtesProbeRecording(vf, *probeSl, opt.cancel, jtesRx, eSlots)) {
             jtesOwn = true;
             if (opt.jtesFound) *opt.jtesFound = jtesRx;
         }
@@ -1473,7 +1537,7 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
         if (t34.size() >= 34 * 50) {
             progress(1.0, "WST teletext: building pages");
             std::string terr;
-            if (ttBuild(t34, true, ttWorkDir(path), path, res.teletext, note, terr))
+            if (ttBuild(t34, true, ttPagesDir(path), path, res.teletext, note, terr))
                 note("WST teletext: " + std::to_string(res.teletext.pages) + " pages, " + std::to_string(res.teletext.subpages) + " versions" +
                      (res.teletext.service.empty() ? "" : " (" + res.teletext.service + ")"));
             else
@@ -1518,6 +1582,15 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
         gs.field = res.lines[gemLine[a]].field;
         gs.words = std::move(gemWords[a]);
         gemstarDecode(gs);
+        if (const char *wf = getenv("TR_GSWORDS")) {          // отладка: слова для tools/gemstar/*.py
+            FILE *f = fopen(wf, "ab");
+            if (f) {
+                for (auto &w : gs.words)
+                    fprintf(f, "%s,%d,%d,%lld,%02X%02X%02X%02X\n", w.x2 ? "2x" : "1x", gs.lineNo, gs.field,
+                            (long long)w.frame, w.b[0], w.b[1], w.b[2], w.b[3]);
+                fclose(f);
+            }
+        }
         note("Gemstar, line " + std::to_string(gs.lineNo) + " field " + std::to_string(gs.field) + ": " + std::to_string(gs.messages.size()) + " messages");
         res.gemstar.push_back(std::move(gs));
     }
@@ -1600,7 +1673,17 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
         for (int fl = 1; fl <= 2; fl++) {
             if (per[fl].empty()) continue;
             double pr = ccParityRatio(per[fl], perValid[fl]);
-            if (pr < 0.85) continue;
+            if (pr < 0.85) {
+                // a recording that goes from channel to channel (channel surfing test data.vbi: 0.79 over all, ~1.0
+                // where a captioned channel is on): the good stretches are captions, the rest is blanked
+                std::vector<uint8_t> kept = per[fl];
+                double share = 0;
+                const int good = ccKeepGoodStretches(kept, perValid[fl], &share);
+                if (good < 3 || share < 0.1) continue;
+                note(fmt("line %d field %d: odd parity in %.0f%% of the bytes over all; captions taken from %d stretches "
+                         "of 4 s with good parity (%.0f%% of the recording)", s.lineNo, fl, pr * 100, good, share * 100));
+                per[fl] = std::move(kept);
+            }
             textField[fl] = true;
             char hdr[64];
             const int logical = fl == xdsField ? 2 : 1;
@@ -1645,6 +1728,8 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
                 }
         }
     }
+    if (int named = ssApplyChannelNames(res.db, res.path))
+        note(fmt("StarSight: %d channel names taken from starsight_channels.txt", named));
     if (res.fieldsSwapped) {
         // report fields as broadcast
         for (auto& li : res.lines) li.field = 3 - li.field;
@@ -1753,6 +1838,21 @@ std::vector<std::string> headline(const DecodeResult& r)
 
 std::string summarize(const DecodeResult& r)
 {
+    if (const char* dump = getenv("TR_NBDUMP")) {          // отладка: сырые 5.7 Мбит/с пакеты (NABTS и WST)
+        static bool done = false;
+        if (!done) {
+            done = true;
+            if (FILE* f = fopen(dump, "wb")) {
+                for (auto& p : r.fastPackets) {
+                    if (p.kind != 'N' && p.kind != 'W') continue;
+                    fprintf(f, "%lld %d %d %c ", (long long)p.frame, p.lineNo, p.field, p.kind);
+                    for (uint8_t b : p.bytes) fprintf(f, "%02X", b);
+                    fprintf(f, "\n");
+                }
+                fclose(f);
+            }
+        }
+    }
     std::string s;
     char b[512];
     snprintf(b, sizeof b, "File: %s\r\nFormat: %s, %lld frames (%.1f min)\r\nDecoder: %s, slicing %.2f s, total %.2f s\r\n\r\n",

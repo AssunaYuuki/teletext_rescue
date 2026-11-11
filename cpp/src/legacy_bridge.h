@@ -32,4 +32,5 @@ std::string legacyReportDir(const std::string& recording);
 bool legacyRun(const std::string& recording, bool again, const std::function<void(const std::string&)>& step,
                const std::function<void(const std::string&)>& log, std::atomic<bool>* cancel, LegacyReport& out, std::string& err,
                const std::map<int, std::string>& forceRows = {},   // row -> line-map kind set by hand ("empty" = nothing)
-               bool gpu = true);   // false: the engine's MLSE / templates on the processor only
+               bool gpu = true,    // false: the engine's MLSE / templates on the processor only
+               VbiFormat format = VbiFormat::Unknown);   // the layout already decided on (Unknown: the engine detects)

@@ -6,7 +6,8 @@
 namespace {
 
 constexpr uint32_t kMagic = 0x31435254;   // "TRC1"
-constexpr uint32_t kVersion = 22;          // bump when a saved structure changes
+constexpr uint32_t kVersion = 23;          // bump when a saved structure changes (23: layout choice and captions of
+                                            // channel-changing NTSC captures - results saved before are decoded again)
 
 // One archive type for both directions: R = reading.
 template <bool R> struct Ar {

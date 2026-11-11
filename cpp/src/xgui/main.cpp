@@ -16,6 +16,7 @@
 #include <cmath>
 #include <ctime>
 #include <deque>
+#include <set>
 #include <thread>
 
 namespace xg {
@@ -489,6 +490,10 @@ static void main_window()
     ImGuiViewport *vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);
     ImGui::SetNextWindowSize(vp->WorkSize);
+    // the start screen fills the main window of the system itself: with every other window kept in a window of its
+    // own (ConfigViewportsNoAutoMerge), it went into an undecorated window of its own too, and the main window stayed
+    // empty - clicked (macOS), that empty window covered all the others
+    ImGui::SetNextWindowViewport(vp->ID);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(40, 24));
     ImGui::Begin("##main", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_MenuBar | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoSavedSettings);
     ImGui::PopStyleVar();
@@ -911,6 +916,10 @@ int run()
             if (e.type == SDL_EVENT_QUIT) g_quit = true;
             if (e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED && e.window.windowID == SDL_GetWindowID(g_window)) g_quit = true;
             if (e.type == SDL_EVENT_DROP_FILE && e.drop.data) open_recording(e.drop.data);
+            // a window of the program that the user clicks comes to the front, as on Windows (macOS keeps the windows
+            // of one parent in the order they were attached: the one clicked stayed under the others)
+            if (e.type == SDL_EVENT_WINDOW_FOCUS_GAINED && e.window.windowID != SDL_GetWindowID(g_window))
+                if (SDL_Window *w = SDL_GetWindowFromID(e.window.windowID)) SDL_RaiseWindow(w);
         }
         if (SDL_GetWindowFlags(g_window) & SDL_WINDOW_MINIMIZED) SDL_Delay(15);   // the other windows still work
         ImGui_ImplOpenGL3_NewFrame();
@@ -928,6 +937,21 @@ int run()
         // the windows of their own: drawn by ImGui into theirs, then the main window's context again
         ImGui::UpdatePlatformWindows();
         ImGui::RenderPlatformWindowsDefault();
+        // a window just opened goes on top of the others (macOS attaches a new one right above the main window,
+        // under the windows opened before it)
+        {
+            static std::set<Uint32> shown;
+            std::set<Uint32> now;
+            ImGuiPlatformIO &pio = ImGui::GetPlatformIO();
+            for (int i = 1; i < pio.Viewports.Size; i++) {   // [0] is the main window
+                const Uint32 id = (Uint32)(intptr_t)pio.Viewports[i]->PlatformHandle;
+                if (!id) continue;
+                now.insert(id);
+                if (!shown.count(id))
+                    if (SDL_Window *w = SDL_GetWindowFromID(id)) SDL_RaiseWindow(w);
+            }
+            shown.swap(now);
+        }
         SDL_GL_MakeCurrent(g_window, g_gl);
         SDL_GL_SwapWindow(g_window);
     }

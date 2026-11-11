@@ -4,8 +4,10 @@
 #include "biznestext.h"
 #include "decoder.h"
 #include "faxg4.h"
+#include "itsidl.h"
 #include "pcxfix.h"
 #include "png.h"
+#include "rar.h"
 #include "tvinform.h"
 #include "util.h"
 #include <algorithm>
@@ -19,6 +21,34 @@ const char* const kBt = "\xD0\x91\xD0\xB8\xD0\xB7\xD0\xBD\xD0\xB5\xD1\x81-\xD0\x
 
 std::string lower(std::string s) { for (auto& c : s) c = (char)tolower((unsigned char)c); return s; }
 
+// a RAR archive unpacked into <path>_files (rar.cpp); the note for the find, "" when it is not a RAR archive
+std::string unpackRar(const std::string& path, const std::vector<uint8_t>& d, std::vector<std::string>* list = nullptr)
+{
+    if (d.size() < 7 || memcmp(d.data(), "Rar!", 4)) return "";
+    std::vector<RarEntry> es;
+    std::string err;
+    if (!rarExtract(d, es, err)) return "RAR: " + err;
+    int ok = 0, files = 0;
+    std::string dir = path + "_files", bad;
+    for (auto& e : es) {
+        if (e.dir) continue;
+        files++;
+        if (list) list->push_back(e.name + (e.ok ? "" : " - " + e.error));
+        if (!e.ok) { bad += (bad.empty() ? "" : ", ") + e.name + ": " + e.error; continue; }
+        std::string name;   // no way out of the folder
+        for (auto& part : split(e.name, '/'))
+            if (!part.empty() && part != "." && part != "..") name = name.empty() ? part : path_join(name, part);
+        if (name.empty()) continue;
+        try {
+            std::string out = path_join(dir, name);
+            make_dirs(dirname(out));
+            write_file(out, e.data.data(), e.data.size());
+            ok++;
+        } catch (...) {}
+    }
+    return fmt("RAR archive unpacked into %s_files: %d of %d files", basename(path).c_str(), ok, files) + (bad.empty() ? "" : "; not unpacked: " + bad);
+}
+
 std::string byExtension(const std::string& name)
 {
     std::string e = lower(name.substr(name.find_last_of('.') == std::string::npos ? name.size() : name.find_last_of('.') + 1));
@@ -30,6 +60,8 @@ std::string byExtension(const std::string& name)
     if (e == "exe" || e == "com") return "DOS program";
     if (e == "gif") return "GIF image";
     if (e == "pcx") return "PCX image";
+    if (e == "eml") return "e-mail message";
+    if (e == "htm" || e == "html" || e == "shtml") return "web page";
     return e.empty() ? "" : e + " file";
 }
 
@@ -161,6 +193,30 @@ void addTviFinds(std::vector<Find>& out, const TviStream& t, const std::string& 
             for (auto& l : y.text) y.size += l.size() + 1;
             out.push_back(y);
         }
+        if (!t.meteo.empty()) {
+            Find y;
+            y.kind = Find::Text;
+            int n = 0;
+            for (auto& l : t.meteo) n += l.rfind("      Аэродром", 0) == 0;
+            y.name = fmt("weather: WMO bulletins, %d METAR reports in Russian", n);
+            y.type = "text, UTF-8 (METAR / TAF / SYNOP)";
+            y.service = svc; y.where = where;
+            y.status = fmt("%zu lines", t.meteo.size());
+            y.text = t.meteo;
+            for (auto& l : y.text) y.size += l.size() + 1;
+            out.push_back(y);
+        }
+        if (!t.catalog.empty()) {
+            Find y;
+            y.kind = Find::Announced;
+            y.name = fmt("files of the inserter: %zu names", t.catalog.size());
+            y.type = "file list";
+            y.service = svc; y.where = where;
+            y.status = "contents not in the recording (sent on lines the capture does not keep)";
+            y.text = t.catalog;
+            for (auto& l : y.text) y.size += l.size() + 1;
+            out.push_back(y);
+        }
         return;
     }
     TviSummary s = tviSummarize(t);
@@ -184,7 +240,10 @@ void addBtFinds(std::vector<Find>& out, const BtCatalog& c, const std::string& w
 {
     std::vector<BtWritten> written;
     std::string keyNote;
-    if (!dir.empty() && c.hasData()) written = c.writeFiles(dir, keyNote, status);
+    // a folder that cannot be written (no rights, disk full) must not end the program: the catalogue is still listed
+    if (!dir.empty() && c.hasData())
+        try { written = c.writeFiles(dir, keyNote, status); }
+        catch (const std::exception& e) { keyNote = std::string("files not written: ") + e.what(); }
     addBtFinds(out, c, where, written, keyNote);
 }
 
@@ -222,13 +281,38 @@ void addBtFinds(std::vector<Find>& out, const BtCatalog& c, const std::string& w
             x.type = fileTypeOf(w.path, f.name);
             x.status = fmt("%.1f%% read%s; %d of %d blocks, %d of %d rows received", w.readPct, w.checkOk ? ", checks OK" : "", w.blocksHave,
                            std::max(w.blocks, w.blocksHave), w.rowsHave, w.rows) +
-                       (w.decrypted ? ", decrypted" : ", as sent (encrypted)") + (w.content.empty() ? "" : "; " + w.content) +
+                       (w.decrypted ? ", decrypted" : w.open ? ", sent open (not encrypted)" : ", as sent (encrypted)") + (w.content.empty() ? "" : "; " + w.content) +
                        (w.check.empty() ? "" : "; check: " + w.check);
             x.note = (w.text.empty() ? std::string("") : "text: " + w.text + "; ") + keyNote + "; " + x.note;
         }
         out.push_back(x);
     }
-    if (c.dataPackets()) {
+    // files the catalogue does not name: one file sent under several names, its copies voted together
+    for (auto& w : written) {
+        if (w.combinedOf.empty() || !w.rowsHave) continue;
+        Find x;
+        x.kind = Find::File;
+        x.name = w.name;
+        x.path = w.path;
+        x.unread = w.unread;
+        x.type = fileTypeOf(w.path, w.name);
+        x.service = svc;
+        x.where = where;
+        x.have = w.blocksHave;
+        x.blocks = w.blocks;
+        x.blockBytes = w.blockBytes;
+        std::string names;
+        for (auto& n : w.combinedOf) names += (names.empty() ? "" : ", ") + n;
+        x.status = fmt("%.1f%% read%s; one file sent as %s - all their copies voted together", w.readPct, w.checkOk ? ", checks OK" : "", names.c_str()) +
+                   (w.decrypted ? ", decrypted" : w.open ? ", sent open (not encrypted)" : ", as sent (encrypted)") + (w.check.empty() ? "" : "; check: " + w.check);
+        x.note = keyNote;
+        out.push_back(x);
+    }
+    // a few packets 8/31 with noise for text are teletext rows read with a wrong address (Ukrainian
+    // Партнер-Телетекст 1999: 7-12 of them, text "08,, ,,,"), not the «Бизнес-Текст» data channel
+    int alnum = 0;
+    for (unsigned char ch : c.dataText()) alnum += isalnum(ch) != 0;
+    if (c.dataPackets() >= 20 && alnum >= 8) {
         Find x;
         // not part of the receiver: a service descriptor sent in the signal with the channel data
         x.kind = Find::Text;
@@ -337,6 +421,162 @@ std::vector<Find> findsCompute(const DecodeResult& r, const FindStatus& status)
         std::string dir = !r.teletext.project.empty() ? path_join(dirname(r.teletext.project), "biznestext_files") : stem + "_biznestext_files";
         addBtFinds(out, c, (w.empty() ? "teletext lines" : w) + (merged.empty() ? "" : "; with " + merged), dir, status);
         addTtDataFinds(out, ttDataPagesOf(t42), w.empty() ? "teletext lines" : w);
+        ItsIdl its = itsIdlOf(t42);
+        if (its.found()) {
+            // the packets X/31 are ITS data channels: the «Бизнес-Текст» descriptor made of them is noise
+            out.erase(std::remove_if(out.begin(), out.end(), [](const Find& f) { return f.type == "service information, packets 8/31 (independent data lines)"; }),
+                      out.end());
+            Find x;
+            x.kind = Find::Text;
+            int64_t keys = 0, open = 0, enc = 0;
+            std::set<uint32_t> rx;
+            for (auto& kv : its.channels()) {
+                auto& t = kv.second.types;
+                if (t.count("key")) keys += t.at("key");
+                if (t.count("open")) open += t.at("open");
+                if (t.count("encrypted")) enc += t.at("encrypted");
+                rx.insert(kv.second.receivers.begin(), kv.second.receivers.end());
+            }
+            x.name = "ITS data channels (packets X/31)" + std::string(keys ? fmt(": keys for %zu subscribers' receivers", rx.size()) : "");
+            x.type = "data broadcasting, packets X/31 (independent data lines, format A)";
+            x.service = "IBS of ITS (ТЕЛЕИНФ / TV-Inform St Petersburg)";
+            x.where = w.empty() ? "teletext lines" : w;
+            x.status = fmt("%lld packets with right CRC; %lld key, %lld open, %lld encrypted messages", (long long)its.good(), (long long)keys,
+                           (long long)open, (long long)enc);
+            x.text = its.report();
+            x.note = "the encrypted data needs the subscriber's hardware key; the keys go to each receiver by its number";
+            out.push_back(x);
+        }
+        if (its.itvFound()) {
+            // InterTVNet: the files, written next to the teletext folder of the results
+            std::string idir = !r.teletext.project.empty() ? path_join(dirname(r.teletext.project), "intertvnet_files") : stem + "_intertvnet_files";
+            const std::string svc = "InterTVNet (TV-Inform St Petersburg, packets 8/31 with BCH)";
+            std::string where = w.empty() ? "teletext lines" : w;
+            // where VbiDump.ax puts a file (under C:\IBS\ROOT\): kinds 1 and 2 in S<service>\ - the service number is
+            // never set there, so always S0 -; kind 3 in the folder the access list gives its resource (BDA_ACL_GetResource;
+            // VbiDump drops a file whose resource is not listed or not open to its card, here all are kept, unknown
+            // ones in R<n>)
+            ItvAcl acl;
+            for (auto& f : its.itvFiles())
+                if (f.resource == 0 && f.name == "aclinfo.dat" && f.complete) acl = itvAclOf(f.data);
+            auto folder = [&](int kind, int res) {
+                if (kind < 3) return std::string("S0");
+                std::string d = acl.folderOf(res);
+                return d.empty() ? fmt("R%d", res) : d;
+            };
+            for (auto& f : its.itvFiles()) {
+                Find x;
+                x.kind = Find::File;
+                x.name = f.name;
+                x.service = svc;
+                x.where = where;
+                x.size = f.size;
+                x.status = f.complete ? (f.copies > 1 ? fmt("complete (%d copies)", f.copies) : "complete") : fmt("%zu of %u bytes", f.data.size(), f.size);
+                if (!f.data.empty()) {
+                    bool aclFile = f.resource == 0 && f.name == "aclinfo.dat" && f.kind >= 3;   // VbiDump only reads it
+                    std::string p = path_join(path_join(idir, aclFile ? "acl" : folder(f.kind, f.resource)), f.complete ? f.name : f.name + ".part");
+                    try {
+                        make_dirs(dirname(p));
+                        write_file(p, f.data.data(), f.data.size());
+                        x.path = p;
+                    } catch (...) {}
+                    if (f.complete && !x.path.empty() && f.name.rfind(".@") == std::string::npos) {   // not a piece
+                        std::string n = unpackRar(x.path, f.data, &x.text);
+                        if (!n.empty()) x.note = n;
+                    }
+                }
+                x.type = f.resource == 0 && f.name == "aclinfo.dat" ? "access list (resources, their groups, subscribers' cards)"
+                                                                    : (x.path.empty() ? "data" : fileTypeOf(x.path, f.name));
+                size_t pc = f.name.rfind(".@");
+                if (pc != std::string::npos && pc > 0 && pc + 2 < f.name.size() && f.name.find_first_not_of("0123456789", pc + 2) == std::string::npos)
+                    x.type = "piece " + f.name.substr(pc + 2) + " of " + f.name.substr(0, pc);
+                x.note = fmt("resource %d, kind %d, flags %02X", f.resource, f.kind, f.flags) + (x.note.empty() ? "" : "; " + x.note);
+                out.push_back(x);
+            }
+            // a big file comes in pieces <name>.@0, <name>.@1 ...: joined in order, as the «Рубрикатор» (Show2k.exe) does
+            std::map<std::pair<int, std::string>, std::map<int, const ItvFile*>> pieces;   // (resource, name) -> pieces
+            for (auto& f : its.itvFiles()) {
+                size_t at = f.name.rfind(".@");
+                if (at == std::string::npos || at == 0 || at + 2 >= f.name.size()) continue;
+                std::string num = f.name.substr(at + 2);
+                if (num.size() > 5 || num.find_first_not_of("0123456789") != std::string::npos) continue;
+                pieces[{f.resource, f.name.substr(0, at)}][atoi(num.c_str())] = &f;
+            }
+            for (auto& kv : pieces) {
+                const auto& pm = kv.second;
+                int last = pm.rbegin()->first, have = 0;
+                std::string missing;
+                std::vector<uint8_t> joined;
+                for (int k = 0; k <= last; k++) {
+                    auto it = pm.find(k);
+                    if (it == pm.end() || !it->second->complete) {
+                        missing += (missing.empty() ? "" : " ") + fmt("%d", k);
+                        continue;
+                    }
+                    have++;
+                    if (missing.empty()) joined.insert(joined.end(), it->second->data.begin(), it->second->data.end());
+                }
+                Find x;
+                x.kind = Find::File;
+                x.name = kv.first.second;
+                x.service = svc;
+                x.where = where;
+                x.blocks = last + 1;
+                x.have = have;
+                x.blockBytes = 0;
+                x.size = joined.size();
+                x.status = missing.empty() ? fmt("complete, joined from %d pieces", last + 1) : fmt("%d of %d pieces (or more)", have, last + 1);
+                x.note = fmt("resource %d, pieces %s.@0 .. .@%d", kv.first.first, kv.first.second.c_str(), last) +
+                         (missing.empty() ? "" : "; pieces not received: " + missing);
+                if (missing.empty()) {
+                    std::string p = path_join(path_join(idir, folder(pm.begin()->second->kind, kv.first.first)), kv.first.second);
+                    try {
+                        make_dirs(dirname(p));
+                        write_file(p, joined.data(), joined.size());
+                        x.path = p;
+                    } catch (...) {}
+                    std::string n = x.path.empty() ? "" : unpackRar(x.path, joined, &x.text);
+                    if (!n.empty()) x.note += "; " + n;
+                }
+                x.type = x.path.empty() ? byExtension(kv.first.second) : fileTypeOf(x.path, kv.first.second);
+                if (x.type.empty()) x.type = "data";
+                out.push_back(x);
+            }
+            if (!acl.resources.empty() || !acl.groups.empty() || acl.cards) {
+                Find x;
+                x.kind = Find::Text;
+                x.name = fmt("InterTVNet access list: %zu resources, %zu groups, %d subscribers' records", acl.resources.size(), acl.groups.size(),
+                             acl.cards);
+                x.type = acl.type == 2 ? "access list, personal" : "access list, public";
+                x.service = svc;
+                x.where = where;
+                x.status = acl.ok ? "read to the end" : "read in part (an entry it does not know)";
+                for (auto& r : acl.resources)
+                    x.text.push_back(fmt("resource %d: folder %s", r.first, r.second.a.c_str()) + (r.second.b.empty() ? "" : ", " + r.second.b) +
+                                     (r.second.flag ? " (flag)" : ""));
+                for (auto& g : acl.groups) {
+                    std::string l = fmt("group %d%s: resources", g.first, g.first == 0 ? " (open to everyone)" : "");
+                    for (int v : g.second) l += fmt(" %d", v);
+                    x.text.push_back(l);
+                }
+                if (acl.cards)
+                    x.text.push_back(fmt("%d subscribers' records (which card opens which group), RC5-encrypted with the card's key: "
+                                         "not readable without the card", acl.cards));
+                x.note = "aclinfo.dat (acl_dll.dll): a receiver keeps group 0 and the groups its card opens";
+                out.push_back(x);
+            }
+            Find x;
+            x.kind = Find::Text;
+            x.name = fmt("InterTVNet data channel: %zu files", its.itvFiles().size());
+            x.type = "data broadcasting, packets X/31 of magazine 8 (BCH 63/51, CRC-16)";
+            x.service = svc;
+            x.where = where;
+            x.status = fmt("%lld packets right (%lld corrected), %lld lost", (long long)its.itvGood(), (long long)its.itvCorrected(),
+                           (long long)its.itvLost());
+            x.text = its.report();
+            x.note = "files of InterTVNet 7.30 (VbiDump.ax): sent open, the access list decides which resources a subscriber keeps";
+            out.push_back(x);
+        }
     }
     return out;
 }
@@ -448,7 +688,11 @@ std::string openableCopy(const std::string& path, bool refresh, const std::vecto
     // archives (7-Zip, WinRAR open them all; Windows itself ZIP)
     if (d[0] == 0x60 && d[1] == 0xEA) return copyAs(".arj");
     if (d[0] == 'P' && d[1] == 'K' && d[2] == 3 && d[3] == 4) return copyAs(".zip");
-    if (d[0] == 'R' && d[1] == 'a' && d[2] == 'r' && d[3] == '!') return copyAs(".rar");
+    if (d[0] == 'R' && d[1] == 'a' && d[2] == 'r' && d[3] == '!') {   // unpacked by rar.cpp: the folder opens
+        std::string c = copyAs(".rar");
+        unpackRar(path, d);
+        return exists(path + "_files") ? path + "_files" : c;
+    }
     if (d[2] == '-' && d[3] == 'l' && (d[4] == 'h' || d[4] == 'z') && d[6] == '-') return copyAs(".lzh");
     if (d[0] == 0x1A && d[1] >= 1 && d[1] <= 11 && d.size() > 16) {   // ARC: a DOS name of up to 12 characters, 0 at its end
         int k = 2;

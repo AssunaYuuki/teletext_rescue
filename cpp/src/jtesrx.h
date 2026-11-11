@@ -28,7 +28,11 @@ struct JtesRxPacket {
     bool refined = false;
 };
 
-struct JtesRxStats { int64_t scanned = 0, found = 0, refined = 0, wide = 0, idle = 0; int anchors = 0; };
+struct JtesRxStats {
+    int64_t scanned = 0, found = 0, refined = 0, wide = 0, idle = 0;
+    int anchors = 0;
+    std::vector<int64_t> idleRows;   // lines read as idle packets
+};
 
 // the GV-USB2 channel: 7 taps + level per half bit, measured at a run-in contrast, with the edge and start it was
 // measured at (JTES Decoder 0.9.51 receiver.calibrate): the bundled VHS profile, or one fitted to the clearest idle

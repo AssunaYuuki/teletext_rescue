@@ -562,7 +562,8 @@ struct LinesWin : Window {
             const LineInfo *li = info_of(l);
             const LineForce fl = force_of(l);
             RECT m{rast.left + lab, y0 + 1, rast.left + lab + mark, std::max(y0 + 2, y1 - 1)};
-            static const char *const kForceKind[] = {"", "empty", "CC", "Silent Radio", "AMOL", "Gemstar", "TV-Inform", "TV-Inform", "NABTS", "WST", "VITC", "test", "TV-Inform packets (Norpak, 55 55 E7)"};
+            static const char *const kForceKind[] = {"", "empty", "CC", "Silent Radio", "AMOL", "Gemstar", "TV-Inform", "TV-Inform", "NABTS", "WST", "VITC", "test", "TV-Inform packets (Norpak, 55 55 E7)", "TV-Inform"};
+            static_assert(sizeof kForceKind / sizeof *kForceKind == (size_t)LineForce::Count, "a colour for every LineForce");
             fill(dc, m, fl != LineForce::Auto ? service_colour(kForceKind[(int)fl]) : li ? service_colour(li->kind) : service_colour("empty"));
             if (rh >= S(hwnd, 11))
                 text_out(dc, rast.left + S(hwnd, 6), y0 + (int)(rh - S(hwnd, 13)) / 2, line_label(l) + (fl != LineForce::Auto ? " *" : ""),

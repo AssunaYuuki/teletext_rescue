@@ -429,7 +429,7 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
     const int MIN_TX = o.sparse ? 1 : 3, MIN_ROW = o.sparse ? 1 : 2;
     std::map<std::string, std::vector<Tx>> tx;
     std::map<int, std::shared_ptr<Seg>> cur;                // нет ключа или null — нет сегмента
-    std::map<int, int> last;
+    std::map<int, int> last, strike;
     std::vector<std::pair<std::string, std::shared_ptr<Seg>>> orphans;
     std::vector<std::shared_ptr<Seg>> loose;
     std::map<int, std::string> lasthdr;
@@ -479,7 +479,7 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
             rows->push_back({0, h});
             tx[pid].push_back({i, rows, ok ? sub_code(sc) : "", ok});
             auto s = std::make_shared<Seg>(); s->has_pid = true; s->pid = pid; s->rows = rows; s->i = i;
-            cur[mag] = s; last[mag] = 0;
+            cur[mag] = s; last[mag] = 0; strike[mag] = 0;
         } else if (row >= 1 && row <= 24) {
             auto it = cur.find(mag);
             if (it == cur.end() || !it->second) continue;
@@ -495,10 +495,22 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
                 // the bottom rows first, then 1..21 (Polsat 1996: header, 22, 23, 24, 27, 1, 2, ...): a row not yet
                 // received after only rows 20+ goes on with the page
                 if (!seen && onlyLow) { it->second->rows->push_back({row, r}); last[mag] = row; continue; }
-                if (!rep) cur[mag] = nullptr;
+                if (!rep) {
+                    // a damaged address re-decided among the code words may name another row (Партнер-Телетекст
+                    // 1999: 7, 20, 9 or 12, 5, 14); before, one such row ended the page there
+                    auto &rs = *it->second->rows;
+                    int last2 = rs.size() >= 2 ? rs[rs.size() - 2].first : -1;
+                    // the row before jumped ahead and this one goes on from the row before it: that one goes
+                    if (row > last2 && last[mag] > last2 + 1 && rs.back().first == last[mag]) {
+                        rs.pop_back(); rs.push_back({row, r}); last[mag] = row; strike[mag] = 0; continue;
+                    }
+                    // one row out of order is skipped; the second in a row means another page (its header lost)
+                    if (!strike[mag]) { strike[mag] = 1; continue; }
+                    cur[mag] = nullptr;
+                }
                 continue;
             }
-            it->second->rows->push_back({row, r}); last[mag] = row;
+            it->second->rows->push_back({row, r}); last[mag] = row; strike[mag] = 0;
         }
     }
     // хвосты-сироты
@@ -1125,6 +1137,32 @@ static std::pair<bool, std::pair<double, double>> field_skipping(const std::vect
     return {redge > 2 * std::max(rin, 0.01), {rin, redge}};
 }
 
+// A row between rows a and a+2 of its magazine that came with another number is row a+1: the byte repair
+// re-decides a damaged address among the code words and may pick a wrong one (Партнер-Телетекст 1999:
+// 12, 5, 14), and the page would end there
+static long mend_rows(std::vector<Packet42> &st) {
+    std::map<int, std::vector<std::pair<long, int>>> seq;   // mag -> (packet, row)
+    for (long i = 0; i < (long)st.size(); i++) {
+        int a = H(st[i][0]), b = H(st[i][1]);
+        if (a < 0 || b < 0) continue;
+        int row = (a >> 3) | (b << 1);
+        if (row <= 24) seq[a & 7].push_back({i, row});
+    }
+    long n = 0;
+    for (auto &kv : seq) {
+        auto &v = kv.second;
+        for (size_t k = 1; k + 1 < v.size(); k++) {
+            int a = v[k - 1].second, r = v[k].second;
+            if (r == 0 || a >= 23 || v[k + 1].second != a + 2 || r == a + 1 || v[k + 1].first - v[k - 1].first > 6) continue;
+            int row = a + 1;
+            st[v[k].first][0] = ham::enc[kv.first | (row & 1) << 3];
+            st[v[k].first][1] = ham::enc[row >> 1];
+            v[k].second = row; n++;
+        }
+    }
+    return n;
+}
+
 static bool sparse_stream(const std::vector<Packet42> &st) {
     std::map<std::tuple<int, int, int>, int> cnt;
     for (auto &p : st) {
@@ -1154,6 +1192,7 @@ void build_project(const std::string &t42_in, const std::string &out, const std:
         T42 = conv;
     }
     auto st = read_t42(T42);
+    if (long m = mend_rows(st)) pr.log(fmt("row numbers mended between their neighbours: %ld", m));
     pr.step("service data: keys, flags, clock");
     Json ex = extract_extras(st, pr);
     save_json(path_join(out, "extras.json"), ex, 0);

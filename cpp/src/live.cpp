@@ -33,15 +33,21 @@ struct LiveMlse {
     bool tape = false;
     LiveMlse(double spb, bool tape_ = false) : dec(model(spb, tape_)), tape(tape_) {}
     // tape = the tape decoder of a recording (vhs_wst): wide channel, the address and header re-decided among
-    // Hamming codewords and text among odd-parity bytes - but only after the free reading of the address was
-    // clean (MlseResult::good), so a line without a packet is not made one
+    // Hamming codewords and text among odd-parity bytes - but only after the free reading of the address or of
+    // the text was clean (MlseResult::good), so a line without a packet is not made one. A channel that loses
+    // 1010 (s_estr_8_c.vbi, SECAM: the run-in is nearly flat) reads 15 as 29 / 2A / 25 a bit off - rows 0 / 1
+    // and the zeros of page numbers - while the text around is clean
     static legacy::MlseModel model(double spb, bool tape)
     {
         auto m = legacy::wst_mlse_model();
         m.spb = spb;
         if (tape) {
             m.L = 6; m.R = 5; m.ntop = 2; m.refits = 1;
-            m.good = [](const uint8_t* p) { return ham::dec[p[0]] >= 0 && ham::dec[p[1]] >= 0; };
+            m.good = [](const uint8_t* p) {
+                int bad = 0;
+                for (int k = 2; k < 42; k++) bad += !(__builtin_popcount(p[k]) & 1);
+                return (ham::dec[p[0]] >= 0 && ham::dec[p[1]] >= 0) || bad <= 2;
+            };
             m.code_kind = 1;
             m.code = [](const uint8_t* p, int i) -> int {
                 if (i < 2) return 1;
@@ -59,7 +65,37 @@ struct LiveMlse {
     }
 };
 
+// the templates of the recording's decoder trained on this capture (LiveDecoder::tplStart)
+struct LiveTpl {
+    legacy::tpl::Decoder dec;
+    double lo = 0, hi = 0;         // where the packet starts on the bt8x8 grid (the training's calibration)
+    std::vector<double> src0;      // per line of the frame: where its packet starts in the capture, -1 = not trained
+    explicit LiveTpl(const legacy::tpl::Templates& T) : dec(T) {}
+};
+
 namespace {
+// a line of the capture on the bt8x8 grid (35.47 MHz, 2048 samples) the way the recording's decoder converts a
+// 27 MHz one (wst_to_bt8x8): its sample src0 (where the packet starts) goes where bttv has the run-in
+void toBt(const uint8_t* p, int fmt, int n, double fs, double src0, uint8_t* d)
+{
+    std::vector<float> y(n);
+    for (int i = 0; i < n; i++) y[i] = fmt == 1 ? (p[2 * i] | (p[2 * i + 1] << 8)) / 256.0f : p[i];
+    const double k = fs / 35468950.0;
+    for (int j = 0; j < 2048; j++) {
+        double x = src0 + (j - legacy::BT8X8_WST_START) * k, v;
+        int i = (int)std::floor(x);
+        if (i < 1 || i + 2 >= n) v = legacy::interp(x, y.data(), n);
+        else {
+            double t = x - i, p0 = y[i - 1], p1 = y[i], p2 = y[i + 1], p3 = y[i + 2];
+            v = p1 + 0.5 * t * (p2 - p0 + t * (2 * p0 - 5 * p1 + 4 * p2 - p3 + t * (3 * (p1 - p2) + p3 - p0)));
+        }
+        d[j] = (uint8_t)std::clamp(std::lround(v), 0L, 255L);
+    }
+}
+constexpr int kTplLines = 6000;   // teletext lines kept for the templates (a random sample of the session)
+constexpr int kTplMin = 3000;     // lines before the first training (~10 s of 12 lines a frame)
+constexpr int kTplParity = 4;     // text bytes still failing parity after the repair that a template packet may have
+
 // decoding runs below the capture threads: when the processor is busy the card must not lose fields
 void lowPriority(bool lowest)
 {
@@ -206,6 +242,77 @@ void LiveDecoder::joinProbe()
 
 // the line map of the full decoder (the original program's probe: test signals, SECAM identification,
 // copy protection, VPS, WSS, data clocks...) on the last 5 s, written to a temporary recording
+// a teletext line for the templates: on the bt8x8 grid from the common packet start, into the session's sample
+// (reservoir: every line seen has the same chance to be in it)
+void LiveDecoder::tplGather(int index, const uint8_t* p)
+{
+    const LineAcc& a = acc_[index];
+    if ((int)tplLine_.size() < g_.linesPerFrame) tplLine_.resize(g_.linesPerFrame, 0);
+    // the teletext lines are the ones named so before the first training: once the templates read, they would
+    // make packets of any line they are let on (SECAM identification, test signals - s_estr_8_c.vbi lines 7-15)
+    if (tplTries_ == 0) { if (a.kind != "WST teletext" || a.off < 0 || a.good < 0.2) return; tplLine_[index] = 1; }
+    else if (!tplLine_[index]) return;
+    tplSeen_++;
+    size_t have = tplBuf_.size() / 2048, slot = have;
+    if (have >= (size_t)kTplLines) {
+        tplRng_ = tplRng_ * 6364136223846793005ull + 1442695040888963407ull;
+        slot = (size_t)((tplRng_ >> 33) % tplSeen_);
+        if (slot >= have) return;
+    } else tplBuf_.resize((have + 1) * 2048);
+    toBt(p, g_.fmt, g_.validSamples, g_.lineSamples * g_.lineRate, tplSrc_, tplBuf_.data() + slot * 2048);
+}
+
+// the sample as a recording of 2 lines a frame, trained as the recording's decoder trains (train_templates); the
+// templates are taken when they read at least 30% of the sampled lines and more than the ones in use
+void LiveDecoder::tplStart()
+{
+    if (tplThread_.joinable()) tplThread_.join();
+    tplTries_++;
+    tplAt_ = frames_;
+    tplBusy_ = true;
+    auto buf = std::make_shared<std::vector<uint8_t>>(tplBuf_);
+    std::vector<double> src0(g_.linesPerFrame, -1);
+    for (int l = 0; l < g_.linesPerFrame && l < (int)tplLine_.size(); l++) if (tplLine_[l]) src0[l] = tplSrc_;
+    tplThread_ = std::thread([this, buf, src0] {
+        lowPriority(true);
+        legacy::parallel_low = true;
+        auto path = (std::filesystem::temp_directory_path() / ("TeletextRescue_tpl_" + std::to_string((uintptr_t)this) + ".vbi")).u8string();
+        try {
+            if (FILE* f = fopen(path.c_str(), "wb")) {
+                fwrite(buf->data(), 1, buf->size(), f);
+                fclose(f);
+                legacy::Progress pr;
+                auto stop = [this] { if (tplQuit_) throw std::runtime_error("stopped"); };
+                pr.on_step = [stop](const std::string&) { stop(); };
+                pr.on_progress = [stop](long long, long long, const std::string&) { stop(); };
+                static const bool debug = getenv("TR_DEBUG") != nullptr;
+                if (debug) pr.on_log = [](const std::string& s) { fprintf(stderr, "live templates: %s\n", s.c_str()); };
+                std::shared_ptr<LiveTpl> t;
+                double got, own = -1;
+                {
+                    legacy::VbiReader R(path, 2, false, pr);
+                    got = legacy::train_templates(R, pr);
+                    // templates only where they read more than the MLSE (on a clean channel the live slicer and
+                    // the MLSE read better than templates: they would take its lines with wrong bytes)
+                    own = R.rate_tpl;
+                    if (own >= 0.3 && own > R.rate_mlse && own * 100 > tplGot_) {
+                        t = std::make_shared<LiveTpl>(R.templates());
+                        t->lo = R.win_lo; t->hi = R.win_hi; t->src0 = src0;
+                    }
+                }
+                if (debug) fprintf(stderr, "live templates: %.0f%% of the sampled lines read, %.0f%% by the templates%s\n", got * 100, own * 100, t ? ", taken" : "");
+                std::lock_guard<std::mutex> lk(mu_);
+                if (t) { tpl_ = t; tplGot_ = (int)std::lround(own * 100); }
+                else if (!tpl_ && got * 100 > tplGot_) tplGot_ = (int)std::lround(got * 100);   // read well without them: no more tries
+            }
+        } catch (std::exception& e) {
+            if (getenv("TR_DEBUG")) fprintf(stderr, "live templates: %s\n", e.what());
+        } catch (...) {}
+        std::remove(path.c_str());
+        tplBusy_ = false;
+    });
+}
+
 void LiveDecoder::startProbe()
 {
     const char* fmtName = g_.pal && g_.lineBytes == 1440 && g_.linesPerFrame == 32 ? "saa7131"
@@ -326,12 +433,14 @@ void LiveDecoder::reset(const VbiGeometry& g)
 {
     stopWorker();
     joinProbe();
+    tplJoin();
     {
         std::lock_guard<std::mutex> q(qmu_);
         frameBytes_ = g.frameBytes();
         dropped_ = 0;
     }
     std::lock_guard<std::mutex> lk(mu_);
+    tpl_.reset(); tplNow_.reset(); tplBuf_.clear(); tplSeen_ = 0; tplLine_.clear(); tplSrc_ = -1; tplAt_ = 0; tplGot_ = -1; tplTries_ = 0;
     g_ = g;
     baseFirstLine_ = g.firstLine;
     frames_ = 0; packets_ = bad_ = 0;
@@ -339,6 +448,8 @@ void LiveDecoder::reset(const VbiGeometry& g)
     lineStats_.clear();
     last_.clear();
     pages_.clear();
+    pageTx_.clear();
+    pending_.clear();
     session_.clear();
     for (auto& m : lineMode_) m = kLiveLineAuto;
     for (auto& m : lineForce_) m = 0;
@@ -392,6 +503,20 @@ void LiveDecoder::feed(const uint8_t* frame)
     int L = g_.linesPerFrame;
     for (auto& a : acc_)
         if (a.mlse && master_ && master_->has_prior()) { a.mlse->dec.prior = master_->prior; a.mlse->dec.n = master_->n; }
+    // the teletext lines of this frame on the graphics card, when it was switched on and the model is learnt: the
+    // lines then skip their own slicing and take the packet the card read (one kernel call for the whole frame)
+    // study (TR_LC_PROF=1): processor time of the process spent in the card's call and in the lines' own decoding
+    static const bool prof = getenv("TR_LC_PROF") != nullptr;
+    auto cpuNow = [] {
+        FILETIME c, e, k, u;
+        GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
+        return ((((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime)) / 1e7;
+    };
+    static double pGpu = 0, pLines = 0, pRest = 0, pT = 0;
+    double c0 = prof ? cpuNow() : 0;
+    if (gpuWanted_ && !gpuDead_) { gpuStart(); if (gp_) gpuFrame(frame); }
+    double c1 = prof ? cpuNow() : 0;
+    { std::lock_guard<std::mutex> lk(mu_); tplNow_ = tpl_; }
     std::vector<LineOut> out(L);
     std::atomic<int> next{0};
     auto work = [&] { lowPriority(false); for (int l; (l = next++) < L;) out[l] = line(l, frame + (size_t)l * g_.lineBytes); };
@@ -400,6 +525,24 @@ void LiveDecoder::feed(const uint8_t* frame)
     for (int t = 1; t < T; t++) th.emplace_back(work);
     work();
     for (auto& t : th) t.join();
+    if (prof) {
+        double c2 = cpuNow();
+        pGpu += c1 - c0; pLines += c2 - c1;
+        if (pT == 0) pT = c0;
+        if (frames_ % 250 == 0) fprintf(stderr, "cpu: card call %.1f s, lines %.1f s, all %.1f s (%lld frames)\n", pGpu, pLines, c2 - pT, (long long)frames_);
+    }
+    // lines for the templates (WST 625): a sample of the session, trained in their own thread when there are enough
+    // and again every 20 s while the templates read under 60% of it
+    // (not while the card reads: it does not use them)
+    if (g_.pal && tplGot_ < 60 && tplTries_ < 30 && !gp_) {
+        if (tplSrc_ < 0 && frames_ >= 100) {   // the packet start, once the lines have settled on theirs
+            std::vector<double> offs;
+            for (auto& a : acc_) if (a.kind == "WST teletext" && a.off >= 0) offs.push_back(a.off);
+            if (!offs.empty()) { std::nth_element(offs.begin(), offs.begin() + offs.size() / 2, offs.end()); tplSrc_ = offs[offs.size() / 2]; }
+        }
+        if (tplSrc_ >= 0) for (int l = 0; l < L; l++) tplGather(l, frame + (size_t)l * g_.lineBytes);
+        if (!tplBusy_ && tplBuf_.size() >= (size_t)kTplMin * 2048 && (tplTries_ == 0 || frames_ - tplAt_ >= 500)) tplStart();
+    }
     for (auto& a : acc_) {
         if (!a.mlse || !a.mlse->dec.has_prior()) continue;
         if (!master_) master_ = std::make_shared<LivePrior>();
@@ -451,6 +594,11 @@ void LiveDecoder::feed(const uint8_t* frame)
             first = t0 > tot - 30 ? t0 - tot : t0 > off2 ? t0 - off2 : t0;
         else if (int t1 = fieldSyncFirst(frame + (size_t)half * g_.lineBytes, half, g_.lineBytes, g_.validSamples, g_.fmt, g_.pal))
             first = t1 - off2;
+        // the same numbering in 3 frames in a row: a tape dropout or a head switch can look like the field sync once
+        // (capture_2026-10-23_233506: the whole recording numbered from line 622)
+        if (first && first == syncCand_) syncCandN_++;
+        else { syncCand_ = first; syncCandN_ = first ? 1 : 0; }
+        if (first && syncCandN_ < 3) first = 0;
         if (first && first != g_.firstLine) {
             g_.firstLine = first;
             if (++syncMoves_ % 25 == 1) probeKind_.clear();   // named by the old numbering
@@ -480,6 +628,21 @@ void LiveDecoder::feed(const uint8_t* frame)
             for (auto& sp : kv.second)
                 for (auto& r : sp.second.rows) if (r.first > 0) rows.push_back(r.second.data());
         charset_ = guess_charset(rows, national_);
+        if (charset_ == "latin") {
+            // few dictionary words (titles in capitals, figures, tape errors): Russian read in the Latin set has
+            // w (в) q (я) x (ь) v (ж) and { | } ~ (ш э щ ч) often, q and x are rare in Western languages
+            long letters = 0, typical = 0, qx = 0;
+            for (const u8* r : rows)
+                for (int k = 0; k < 40; k++) {
+                    int c = r[k] & 0x7F;
+                    if (c < 0x40 || c == 0x7F) continue;
+                    letters++;
+                    int lc = c | 0x20;
+                    if (lc == 'q' || lc == 'x') { qx++; typical++; }
+                    else if (lc == 'w' || lc == 'v' || c >= 0x7B) typical++;
+                }
+            if (letters >= 300 && qx * 100 >= letters * 2 && typical * 100 >= letters * 9) charset_ = "cyr2";
+        }
     }
 }
 
@@ -510,13 +673,79 @@ LiveDecoder::LineOut LiveDecoder::line(int index, const uint8_t* p)
     if (g_.pal && !noTT && !ok && ((tv >= 22 && tv <= 24) || a.kind == "WSS") && wssRead(raw.data(), n, fs, res.wssv)) res.wss = ok = true;
     a.vpsGood = 0.95 * a.vpsGood + 0.05 * res.vps;
     a.wssGood = 0.95 * a.wssGood + 0.05 * res.wss;
+    // the packet the graphics card read for this line of the frame (gpuFrame): taken as it is, no slicing here
+    auto takeGpu = [&]() -> bool {
+        if (index >= (int)gpuHave_.size() || !gpuHave_[(size_t)index]) return false;
+        gpuHave_[(size_t)index] = 0;
+        std::copy(gpuLine_[(size_t)index].begin(), gpuLine_[(size_t)index].end(), res.pk);
+        res.wst = ok = true;
+        a.packets++; a.mlsePackets++; a.misses = 0;
+        // a line the card found by searching takes the place where it read the packet
+        const double go = index < (int)gpuOff_.size() ? gpuOff_[(size_t)index] : -1;
+        if (go >= 0) a.off = a.off < 0 ? go : 0.9 * a.off + 0.1 * go;
+        res.off = a.off;
+        return true;
+    };
+    // the card is reading (gpuFrame): the teletext of this frame is its packet, or the 8-bit data row it read, or
+    // nothing - not read again on the processor (the user: "only the graphics card")
+    const bool cardReads = gp_ && g_.pal && !noTT && !forceCC && a.kind != "CC 608" && a.kind != "CC rate";
     if (ok) {
-    } else if (g_.pal && mx - mn > 20 && a.kind != "CC 608" && !noTT) {
+    } else if (cardReads) {
+        if (!takeGpu()) {
+            if (index < (int)gpuRawHave_.size() && gpuRawHave_[(size_t)index]) {
+                std::copy(gpuRaw_[(size_t)index].begin(), gpuRaw_[(size_t)index].end(), res.rpk);
+                res.raw = true;
+            }
+            if (a.off >= 0 && index < (int)gpuTried_.size() && gpuTried_[(size_t)index] && ++a.misses > 250) { a.off = -1; a.misses = 0; }   // lost: searched again
+        }
+    } else if (g_.pal && mx - mn > 20 && a.kind != "CC 608" && !noTT && !takeGpu()) {
         double spb = fs / kWstRate;
         bool got = false;
         double bt = 0;
+        // the templates trained on this capture (tplStart), as the recording's decoder reads: the packet found in
+        // the window of the training, damaged bytes repaired; taken when the address is right and the text nearly
+        // clean, else the line goes on as before
+        // exact: the address as sent; else a bit of it may be corrected (the packets then often go to another row and
+        // break the pages: 1212\s_estr_8_c.vbi 113 subpages of 20+ rows against 192), so only for a line nothing read
+        // The line is read once; the second call only looks again at an address the first found broken
+        std::vector<float> yt;
+        legacy::tpl::Result r;
+        int tplState = 0;   // 0 not read, 1 read (address broken), 2 done
+        auto tplRead = [&](bool exact) {
+            const LiveTpl* T = tplNow_.get();
+            if (tplState == 2 || !T || index >= (int)T->src0.size() || T->src0[index] < 0) return;
+            if (tplState == 0) {
+                uint8_t d[2048];
+                toBt(p, g_.fmt, n, fs, T->src0[index], d);
+                yt = legacy::tpl::norm(d, 2048);
+                r = T->dec.decode_fast(yt, T->lo, T->hi);
+                tplState = 1;
+            }
+            {
+                const auto* hx = exact ? ham::dec : ham::fix;
+                int ad = hx[r.data[0]], c = hx[r.data[1]];
+                if (ad >= 0 && c >= 0) {
+                    tplState = 2;
+                    int row = (ad >> 3) | (c << 1), k0 = row == 0 ? 10 : 2, bad = 0;
+                    bool hamOk = true;
+                    for (int k = 2; k < k0; k++) hamOk &= ham::fix[r.data[k]] >= 0;
+                    if (row <= 25) {
+                        for (int k = k0; k < 42; k++) bad += !oddParity(r.data[k]);
+                        // the repair makes any bytes odd: only a packet the templates read nearly (as the MLSE takes)
+                        if (bad > 12) hamOk = false;
+                        else if (bad) { T->dec.repair(yt, r.off, r.data); bad = 0; for (int k = k0; k < 42; k++) bad += !oddParity(r.data[k]); }
+                    }
+                    bool take = row <= 25 ? hamOk && bad <= kTplParity : ham::dec[r.data[0]] >= 0 && ham::dec[r.data[1]] >= 0;
+                    if (take) {
+                        std::copy(r.data.begin(), r.data.end(), pk);
+                        got = true; a.tplPackets++; a.misses = 0;
+                        res.off = a.off;
+                    }
+                }
+            }
+        };
         // broadcast quality: run-in by correlation, sliced at its phase
-        if (a.off < 0 ? wstFind(y.data(), n, fs, bt) > 0.3 : (bt = a.off + spb / 2, true)) {
+        if ((a.off < 0 ? wstFind(y.data(), n, fs, bt) > 0.3 : (bt = a.off + spb / 2, true))) {
             for (double d : {0.0, -1.0, 1.0, -2.0, 2.0}) {
                 if (wstRead(y.data(), n, fs, bt + d, pk) && usable(pk) && parityBad(pk) <= 2) { got = true; bt += d; break; }
                 if (a.off < 0) break;
@@ -526,6 +755,7 @@ LiveDecoder::LineOut LiveDecoder::line(int index, const uint8_t* p)
                 res.off = a.off;
             }
         }
+        if (!got) tplRead(true);
         // tape: the channel-fitting MLSE of the original program, in a narrow window where the packet starts.
         // Teletext lines of one capture share the place; while a line has none of its own, once a second the
         // places that look like a run-in (normalised correlation) are tried as well
@@ -553,6 +783,7 @@ LiveDecoder::LineOut LiveDecoder::line(int index, const uint8_t* p)
             };
             if (tapeFirst) tape();
             std::vector<double> starts;
+            bool cleanText = false;
             if (known >= 0) starts.push_back(known);
             if (search)
                 for (double c : runInCandidates(y.data(), n, spb))
@@ -560,6 +791,8 @@ LiveDecoder::LineOut LiveDecoder::line(int index, const uint8_t* p)
             for (double o : got ? std::vector<double>{} : starts) {
                 auto r = a.mlse->dec.decode(raw.data(), n, std::max(0.0, o - 4), o + 4, 0.5);
                 if (r.data.size() == 42 && !usable(r.data.data()) && a.off >= 0) mendHeaderAddress(r.data.data());
+                // clean text under a broken address: the tape decoder decides the address below
+                if (r.data.size() == 42 && !usable(r.data.data()) && a.off >= 0 && parityBad(r.data.data()) <= 2) cleanText = true;
                 if (r.data.size() != 42 || !usable(r.data.data())) continue;
                 // a line not yet known to carry teletext must read a clean packet first (test lines, noise)
                 bool clean = ham::dec[r.data[0]] >= 0 && ham::dec[r.data[1]] >= 0 && parityBad(r.data.data()) <= 6;
@@ -581,7 +814,13 @@ LiveDecoder::LineOut LiveDecoder::line(int index, const uint8_t* p)
                 res.off = r.off;
                 break;
             }
-            if (!got && !res.raw && tapeLine && known >= 0 && !tapeFirst) tape();
+            if (!got && ((!res.raw && tapeLine) || cleanText) && known >= 0 && !tapeFirst) {
+                tape();
+                // a header whose address only the tape decoder read (its text clean) is left out: its magazine or
+                // subcode is often another page's and it closes the page being received (БТ Оскар 1996.vbi: 30
+                // subpages fewer, even with its page number checked against the pages seen)
+                if (got && cleanText && ham::dec[pk[0]] >= 0 && !(ham::dec[pk[0]] >> 3) && ham::dec[pk[1]] == 0) got = false;
+            }
             else if (got && tapeLine && !tapeFirst && (frames_ + index) % 25 == 0) {
                 // once a second the tape decoder reads the line too: where the two often disagree on the address
                 // (and the page number of a header) the narrow one is reading it wrong - the tape one takes over
@@ -595,6 +834,7 @@ LiveDecoder::LineOut LiveDecoder::line(int index, const uint8_t* p)
             }
             if (!got && a.off >= 0 && ++a.misses > 250) { a.off = -1; a.misses = 0; }   // nothing for 10 s: search again
         }
+        if (!got) tplRead(false);
         if (got) { ok = true; a.packets++; res.wst = true; }
         // a teletext line whose packet failed the parity test: sliced as is when its address is good
         // (8-bit binary rows of files sent in teletext; they go only to the .raw.t42)
@@ -717,6 +957,8 @@ void LiveDecoder::packet(const uint8_t* p)
         bool serial = h[7] >= 0 && (h[7] & 1);
         if (serial) for (int k = 0; k < 8; k++) closePage(k);
         else closePage(m);
+        // the clock goes on with every header (also time filling ones), as on a TV: each character from its last clean reading
+        for (int k = 32; k < 40; k++) if (oddParity(p[2 + k])) { clock_[k - 32] = p[2 + k] & 0x7F; hasClock_ = true; }
         if (h[0] < 0 || h[1] < 0 || h[0] > 9 || h[1] > 9) return;   // time filling / hex pages
         int pn = (m ? m : 8) * 0x100 + (h[1] << 4) + h[0];
         int sub = 0;
@@ -737,7 +979,7 @@ void LiveDecoder::packet(const uint8_t* p)
         for (int k = 0; k < 8; k++) r[k] = (uint8_t)num[k];
         for (int k = 8; k < 40; k++) {
             uint8_t c = p[2 + k];
-            if (oddParity(c)) r[k] = c & 0x7F; else { if (!r[k]) r[k] = 0x20; pg.errors++; }
+            if (oddParity(c)) r[k] = c & 0x7F; else { if (!r[k]) r[k] = 0x20; pg.errors++; pg.bad[0] |= 1ull << k; }
         }
         header_ = r; hasHeader_ = true;
         // the channel name stays the same in every header while titles, numbers and the clock change
@@ -755,11 +997,27 @@ void LiveDecoder::packet(const uint8_t* p)
             flush();
         }
         open_[m] = pn; openSub_[m] = key; openRow_[m] = 0;
+        prevRow_[m] = 0; lastNew_[m] = hasSkip_[m] = false; prevAt_[m] = lastAt_[m] = packets_;
         return;
     }
     if (row <= 24) {
         if (open_[m] < 0) return;
         LivePage& pg = pages_[open_[m]][openSub_[m]];
+        auto put = [&](int rw, const uint8_t* q) {
+            auto at = pg.rows.find(rw);
+            Row& r = at == pg.rows.end() ? (pg.rows[rw] = Row{}) : at->second;
+            if (at == pg.rows.end()) r.fill(0x20);
+            for (int k = 0; k < 40; k++) {
+                uint8_t c = q[2 + k];
+                if (oddParity(c)) { r[k] = c & 0x7F; pg.bad[rw] &= ~(1ull << k); } else { pg.errors++; if (at == pg.rows.end()) pg.bad[rw] |= 1ull << k; }
+            }
+            pg.frame = frames_;
+        };
+        // a packet between rows a and a+2 of its magazine (within 6 packets) is row a+1: the repair of a damaged
+        // address picks a wrong Hamming code word (12, 5, 14) - as mend_rows of the recording's page builder
+        auto mend = [&](const uint8_t* q, int ra, size_t since) {
+            if (ra < 23 && !pg.rows.count(ra + 1) && packets_ - since <= 6) put(ra + 1, q);
+        };
         auto it = pg.rows.find(row);
         if (row <= openRow_[m]) {
             // rows go up within a page: a lower row is either a repeat of one already received
@@ -771,16 +1029,28 @@ void LiveDecoder::packet(const uint8_t* p)
             int d = 0;
             if (it != pg.rows.end())
                 for (int k = 0; k < 40; k++) d += oddParity(p[2 + k]) && it->second[k] != (p[2 + k] & 0x7F);
-            if ((it == pg.rows.end() && !onlyLow) || d > 4) { closePage(m); return; }
+            if ((it == pg.rows.end() && !onlyLow) || d > 4) {
+                // one row out of order is a broken row number, not yet the next page (as export_pages):
+                // the row before that jumped ahead (7, 20, 9) goes, else this one waits for the next row
+                const int last = openRow_[m], before = prevRow_[m];
+                if (row > before && last > before + 1 && lastNew_[m]) {
+                    pg.rows.erase(last); pg.bad.erase(last);
+                    openRow_[m] = before; lastAt_[m] = prevAt_[m];
+                    if (row == before + 2) mend(lastPk_[m], before, prevAt_[m]);
+                    hasSkip_[m] = false;
+                } else if (!hasSkip_[m]) {
+                    std::copy(p, p + 42, skip_[m]); hasSkip_[m] = true;
+                    return;
+                } else { closePage(m); return; }
+            }
         }
+        if (hasSkip_[m] && row == openRow_[m] + 2) mend(skip_[m], openRow_[m], lastAt_[m]);
+        hasSkip_[m] = false;
+        prevRow_[m] = openRow_[m]; prevAt_[m] = lastAt_[m];
+        lastNew_[m] = !pg.rows.count(row); lastAt_[m] = packets_;
+        std::copy(p, p + 42, lastPk_[m]);
         openRow_[m] = row;
-        Row& r = it == pg.rows.end() ? (pg.rows[row] = Row{}) : it->second;
-        if (it == pg.rows.end()) r.fill(0x20);
-        for (int k = 0; k < 40; k++) {
-            uint8_t c = p[2 + k];
-            if (oddParity(c)) r[k] = c & 0x7F; else pg.errors++;
-        }
-        pg.frame = frames_;
+        put(row, p);
         return;
     }
     if (m == 0 && row == 30) {   // 8/30 format 1: status display in bytes 22..41
@@ -841,6 +1111,42 @@ double sameRows(const LivePage& a, const LivePage& b, int& both)
     }
     return both ? (double)same / both : 0;
 }
+
+bool mosaicRow(const Row& r)
+{
+    for (uint8_t c : r) { c &= 0x7F; if (c >= 0x10 && c <= 0x17) return true; }
+    return false;
+}
+// characters two readings of a row differ in, where both read a sign (a space that did not come is no difference)
+int textDiff(const Row& a, const Row& b)
+{
+    int d = 0;
+    for (int k = 0; k < 40; k++) { uint8_t x = a[k] & 0x7F, y = b[k] & 0x7F; d += x != y && x > 0x20 && y > 0x20; }
+    return d;
+}
+// rows of text that are another text (more than 10 characters differ): another page of a carousel or a new edition,
+// not tape errors (ТЕЛЕИНФ 100: four announcements in rows 11-14 under 0000, the other 20 rows the same)
+// bytes of a row of the transmission t that failed parity (tape damage)
+int badIn(const LivePage& t, int r)
+{
+    auto b = t.bad.find(r);
+    return b == t.bad.end() ? 0 : __builtin_popcountll(b->second);
+}
+// only a row t read cleanly tells: a damaged copy is not another page (ОРТ 2002 151: row 18 "чейЙИбРсиЙ ро3 ййс")
+int otherRows(const LivePage& t, const LivePage& p)
+{
+    int n = 0;
+    for (auto& rb : t.rows) {
+        if (rb.first < 1 || rb.first > 23 || badIn(t, rb.first) > 3) continue;
+        auto it = p.rows.find(rb.first);
+        if (it == p.rows.end() || mosaicRow(rb.second) || mosaicRow(it->second)) continue;
+        int ca = 0, cb = 0;
+        for (int k = 0; k < 40; k++) { ca += rb.second[k] > 0x20; cb += it->second[k] > 0x20; }
+        if (ca < 3 || cb < 3) continue;
+        n += textDiff(rb.second, it->second) > 10;
+    }
+    return n;
+}
 }
 
 // Pages with subcode 0000 that rotate several pages under it (no subcodes of their own) are told apart
@@ -894,11 +1200,98 @@ void LiveDecoder::closePage(int m)
             while (subs.count(key) && key < 0x20063) key++;
         }
     }
+    // a page a station rotates under 0000 with only a few rows changing (ТЕЛЕИНФ 100): the transmission shares most
+    // rows with the subpage chosen, but a row of text is another text - it goes to the subpage where nothing
+    // differs, or is a new one; character votes would mix the pages ("НАСТАБИДЬНОС БАПНАИЛ")
+    auto isAuto = [](int k, const LivePage& p) { return k >= 0 && !p.sub && !(k & 0x10000); };
+    if (!t.sub && nn <= 0) {
+        auto cur = subs.find(key);
+        if (cur != subs.end() && otherRows(t, cur->second)) {
+            int alt = -1;
+            for (auto& kv : subs) {
+                if (kv.first == key || !isAuto(kv.first, kv.second)) continue;
+                int both = 0;
+                if (sameRows(t, kv.second, both) >= 0.5 && both && !otherRows(t, kv.second)) { alt = kv.first; break; }
+            }
+            if (alt >= 0) key = alt;
+            else if (rows < 8) return;   // a piece of another page of the carousel: it would mix them
+            else {
+                // a new page of the rotation once its text came twice; the first time it waits (not mixed in)
+                auto& pend = pending_[pn];
+                int seen = -1;
+                for (size_t i = 0; i < pend.size(); i++) {
+                    int both = 0;
+                    if (sameRows(t, pend[i], both) >= 0.5 && both && !otherRows(t, pend[i]) && !otherRows(pend[i], t)) { seen = (int)i; break; }
+                }
+                if (seen < 0) {
+                    pend.push_back(t);
+                    if (pend.size() > 8) pend.erase(pend.begin());
+                    ++pageTx_[pn];
+                    return;
+                }
+                pend.erase(pend.begin() + seen);
+                key = 0x20000;
+                while (subs.count(key) && key < 0x20063) key++;
+            }
+        }
+    }
+    int64_t txNow = ++pageTx_[pn];
+    // a subpage of the carousel not sent for a long while (four rounds of all of them and 40 transmissions more: a
+    // rotation is still being gathered while its count grows, РТР 1995 205 has 27) was an old edition of an updated
+    // page, not a page of the rotation: it goes
+    {
+        int autos = 0;
+        for (auto& kv : subs) autos += isAuto(kv.first, kv.second);
+        if (autos >= 2)
+            for (auto it2 = subs.begin(); it2 != subs.end();) {
+                if (it2->first != key && isAuto(it2->first, it2->second) && txNow - it2->second.tx > 4 * autos + 40) it2 = subs.erase(it2);
+                else ++it2;
+            }
+    }
     auto ex = subs.find(key);
-    if (ex == subs.end() || openErase_[m]) { subs[key] = t; return; }
-    LivePage& p = ex->second;   // rows sent again replace those of the earlier transmission
-    for (auto& rb : t.rows) p.rows[rb.first] = rb.second;
-    p.frame = t.frame; p.errors = t.errors; p.national = t.national;
+    if (ex != subs.end() && openErase_[m]) {
+        // C4 (erase page): a new edition replaces the page; the same text sent again with C4 set
+        // (many services set it always) is voted on like any repeat
+        int both = 0;
+        if (sameRows(t, ex->second, both) < 0.5 || !both) { subs.erase(ex); ex = subs.end(); }
+    }
+    bool fresh = ex == subs.end();
+    LivePage& p = fresh ? subs[key] : ex->second;
+    if (fresh) { p = t; p.rows.clear(); p.votes.clear(); }
+    p.bad.clear();
+    // every character read cleanly votes; the reading with the most votes is shown. A new reading pushes out
+    // the weakest and weakens the others, so a changed page (a new edition) wins after 2 transmissions, a tape
+    // error seen once does not
+    for (auto& rb : t.rows) {
+        int r = rb.first;
+        auto bi = t.bad.find(r);
+        uint64_t bad = bi == t.bad.end() ? 0 : bi->second;
+        bool newRow = !p.rows.count(r);
+        // a row of text sent as another text (a new edition of the row) replaces it whole: character votes would
+        // keep letters of the old text among the new
+        if (!newRow && r >= 1 && r <= 23 && __builtin_popcountll(bad) <= 3 && !mosaicRow(rb.second) && !mosaicRow(p.rows[r]) &&
+            textDiff(p.rows[r], rb.second) > 10)
+            newRow = true;
+        Row& out = p.rows[r];
+        if (newRow) out = rb.second;
+        auto& vr = p.votes[r];
+        if (newRow) for (auto& v : vr) v.fill(0);
+        for (int k = 0; k < 40; k++) {
+            if ((r == 0 && k < 8) || (bad >> k & 1)) continue;
+            uint8_t c = rb.second[k];
+            if (r == 0 && k >= 32) { out[k] = c; continue; }   // the clock changes every second
+            auto& v = vr[k];   // val0 cnt0 val1 cnt1 val2 cnt2
+            int s = -1;
+            for (int i = 0; i < 3; i++) if (v[2 * i + 1] && v[2 * i] == c) s = i;
+            if (s < 0) { s = 0; for (int i = 1; i < 3; i++) if (v[2 * i + 1] < v[2 * s + 1]) s = i; v[2 * s] = c; v[2 * s + 1] = 0; }
+            if (v[2 * s + 1] < 6) v[2 * s + 1] += 2;
+            for (int i = 0; i < 3; i++) if (i != s && v[2 * i + 1]) v[2 * i + 1]--;
+            int best = s;
+            for (int i = 0; i < 3; i++) if (v[2 * i + 1] > v[2 * best + 1]) best = i;
+            out[k] = v[2 * best];
+        }
+    }
+    p.frame = t.frame; p.errors = t.errors; p.national = t.national; p.tx = txNow;
     if (nn > 0) { p.counter = nn; p.of = mm; }
 }
 
@@ -984,6 +1377,263 @@ std::vector<uint8_t> liveReadTeletext(const std::string& path, const VbiGeometry
     return out;
 }
 
+// the teletext lines of one frame read on the graphics card (OpenCL): the lines whose packet starts at the same
+// sample go in one call of the MLSE kernel, so the card does the work a frame at a time, not a line at a time
+struct LiveGpuBatch {
+    std::unique_ptr<legacy::MlseBatch> bd;       // the narrow model (as the processor's MLSE of a line)
+    std::unique_ptr<legacy::MlseBatch> bdTape;   // the tape model, for the lines the narrow one could not read
+};
+
+void LiveDecoder::setGpu(bool on)
+{
+    gpuWanted_ = on;
+    if (!on) { gp_.reset(); gpuDead_ = false; }
+    else gpuStart();                            // nothing happens before the processor has learnt the model
+}
+bool LiveDecoder::gpuActive()
+{
+    return gp_ && gp_->bd && gp_->bd->on_gpu();
+}
+
+void LiveDecoder::gpuStart()
+{
+    if (!gpuWanted_ || gpuDead_ || g_.linesPerFrame <= 0 || !g_.pal) return;   // the WST 625 models
+    if (gp_ && gp_->bdTape) return;             // both models on the card
+    const double spb = (g_.lineSamples * g_.lineRate) / kWstRate;
+    // the models learnt for the card in their own thread (below): the narrow one reads, the tape one (wide channel,
+    // codewords) reads again the lines the narrow one could not, as the processor's tape decoder did
+    std::vector<double> prior, tapePrior;
+    int n = 0, tapeN = 0;
+    bool learnt = false;
+    if (gpuLearn_) {
+        std::lock_guard<std::mutex> lk(gpuLearn_->m);
+        if (gpuLearn_->done) {
+            learnt = true;
+            if (gpuLearn_->n >= 6) { prior = gpuLearn_->prior; n = gpuLearn_->n; }
+            if (gpuLearn_->tapeN >= 6) { tapePrior = gpuLearn_->tapePrior; tapeN = gpuLearn_->tapeN; }
+        }
+    }
+    if (prior.empty() && master_ && master_->has_prior() && master_->n >= 6) { prior = master_->prior; n = (int)master_->n; }
+    if (!gp_ && !prior.empty()) {
+        try {
+            auto g = std::make_shared<LiveGpuBatch>();
+            legacy::Progress lp;
+            g->bd = std::make_unique<legacy::MlseBatch>(LiveMlse::model(spb, false), prior, n, true, lp);
+            if (!g->bd || !g->bd->on_gpu()) { gpuDead_ = true; return; }   // no OpenCL here: the processor as before
+            gp_ = g;
+        } catch (std::exception&) {
+            gpuDead_ = true;                    // a broken driver must not take the capture down with it
+            return;
+        }
+    }
+    if (gp_ && !gp_->bdTape && !tapePrior.empty()) {
+        try {
+            legacy::Progress lp;
+            auto t = std::make_unique<legacy::MlseBatch>(LiveMlse::model(spb, true), tapePrior, tapeN, true, lp);
+            if (t && t->on_gpu()) gp_->bdTape = std::move(t);
+        } catch (std::exception&) {}
+    }
+    if (gp_ && (gp_->bdTape || (learnt && frames_ - gpuLearnAt_ < 1500))) return;
+    // not learnt yet: the MLSE of the processor learns the models from the teletext lines of the last frames (the
+    // lines found so far), in a thread, so the capture does not wait; again every 10 s until it has (the tape model
+    // every 60 s when its lines did not read)
+    bool busy = false;
+    if (gpuLearn_) { std::lock_guard<std::mutex> lk(gpuLearn_->m); busy = !gpuLearn_->done; }
+    if (busy || frames_ - gpuLearnAt_ < 250) return;
+    const int L = g_.linesPerFrame, ns = g_.validSamples, bps = g_.fmt == 1 ? 2 : 1;
+    std::vector<std::pair<std::vector<float>, double>> lines;   // samples, where the packet starts
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto it = ring_.rbegin(); it != ring_.rend() && lines.size() < 200; ++it)
+            for (int l = 0; l < L && l < (int)acc_.size() && lines.size() < 200; l++) {
+                if (lineMode_[l] == kLiveLineOff || acc_[l].kind != "WST teletext") continue;
+                double off = acc_[l].off >= 0 ? acc_[l].off : off_;
+                if (off < 0 || it->size() < (size_t)(l + 1) * g_.lineBytes) continue;
+                const uint8_t* s = it->data() + (size_t)l * g_.lineBytes;
+                std::vector<float> y((size_t)ns);
+                for (int i = 0; i < ns; i++) { size_t q = (size_t)i * bps; y[i] = bps == 2 ? (float)(s[q] | (s[q + 1] << 8)) / 256.0f : (float)s[q]; }
+                lines.push_back({std::move(y), off});
+            }
+    }
+    if (lines.size() < 20) return;               // no teletext lines found yet
+    gpuLearnAt_ = frames_;
+    auto job = std::make_shared<GpuLearn>();
+    gpuLearn_ = job;
+    std::thread([job, lines = std::move(lines), spb, ns] {
+        lowPriority(true);
+        LiveMlse m(spb), t(spb, true);
+        for (auto& x : lines) m.dec.decode(x.first.data(), ns, std::max(0.0, x.second - 4), x.second + 4, 0.5);
+        for (auto& x : lines) t.dec.decode(x.first.data(), ns, std::max(0.0, x.second - 8 * spb), x.second + 8 * spb, 0.5);
+        std::lock_guard<std::mutex> lk(job->m);
+        job->prior = m.dec.prior; job->n = m.dec.n;
+        job->tapePrior = t.dec.prior; job->tapeN = t.dec.n;
+        job->done = true;
+    }).detach();
+}
+
+// the card reads every teletext line of the frame, in as few calls as the places of the packets allow; the lines it
+// could not read go once more to the card's tape model; lines with no teletext found yet are searched on the card
+// once a second. Nothing of it is done on the processor while the card works (the processor's MLSE on the 26
+// other lines of a SECAM capture took 1.3 s of processor time a second of video)
+namespace legacy { extern thread_local bool parallel_serial; }   // legacy/src/vbidecode.cpp
+
+void LiveDecoder::gpuFrame(const uint8_t* frame)
+{
+    // the card's calls are small (a frame's lines): their processor parts run in this thread, not in new threads
+    struct Serial { Serial() { legacy::parallel_serial = true; } ~Serial() { legacy::parallel_serial = false; } } serial;
+    const int L = std::max(0, g_.linesPerFrame), n = g_.validSamples, bps = g_.fmt == 1 ? 2 : 1;
+    if ((int)gpuHave_.size() != L) { gpuLine_.resize((size_t)L); gpuRaw_.resize((size_t)L); }
+    gpuHave_.assign((size_t)L, 0);
+    gpuTried_.assign((size_t)L, 0);
+    gpuRawHave_.assign((size_t)L, 0);
+    gpuOff_.assign((size_t)L, -1.0);
+    if (!gp_ || !gp_->bd || n <= 0) return;
+    const double spb = (g_.lineSamples * g_.lineRate) / kWstRate;
+    std::vector<float> buf;
+    // one call of a model for these lines, the window lo..hi (samples where the packet may start)
+    auto run = [&](legacy::MlseBatch& bd, const std::vector<int>& idx, double lo, double hi, std::vector<legacy::MlseResult>& res) {
+        buf.resize(idx.size() * (size_t)n);
+        std::vector<const float*> rows(idx.size());
+        for (size_t k = 0; k < idx.size(); k++) {
+            const uint8_t* s = frame + (size_t)idx[k] * g_.lineBytes;
+            float* y = &buf[k * (size_t)n];
+            for (int i = 0; i < n; i++) {
+                size_t q = (size_t)i * bps;
+                y[i] = bps == 2 ? (float)(s[q] | (s[q + 1] << 8)) / 256.0f : (float)s[q];
+            }
+            rows[k] = y;
+        }
+        try {
+            static const bool timing = getenv("TR_GPUTIME") != nullptr;   // study: time of the card's calls
+            auto t0 = std::chrono::steady_clock::now();
+            auto cpu = [] {
+                FILETIME c, e, k, u;
+                GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
+                return ((((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime)) / 1e7;
+            };
+            const double c0 = timing ? cpu() : 0;
+            res = bd.decode(rows, n, std::max(0.0, lo), std::max(lo, hi), nullptr, 0.5);
+            if (timing) {
+                const int tape = &bd == gp_->bdTape.get();
+                static double sum[2] = {0, 0}, cs[2] = {0, 0}; static int calls[2] = {0, 0};
+                sum[tape] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); cs[tape] += cpu() - c0; calls[tape]++;
+                if (calls[tape] % 250 == 0)
+                    fprintf(stderr, "gpu decode %s: %d calls, %.1f ms a call, processor %.1f ms a call, %zu lines\n", tape ? "tape  " : "narrow", calls[tape],
+                            1000 * sum[tape] / calls[tape], 1000 * cs[tape] / calls[tape], idx.size());
+            }
+            return true;
+        } catch (std::exception&) {
+            gpuDead_ = true; gp_.reset();       // the card went away: the processor reads the next frame
+            return false;
+        }
+    };
+    // lines by where their packet starts, those within 'gap' samples in one call
+    struct Group { double lo, hi; std::vector<int> lines; };
+    auto group = [](std::vector<std::pair<double, int>> at, double gap) {
+        std::sort(at.begin(), at.end());
+        std::vector<Group> g;
+        for (auto& x : at) {
+            if (g.empty() || x.first - g.back().lo > gap) g.push_back({x.first, x.first, {}});
+            g.back().hi = x.first;
+            g.back().lines.push_back(x.second);
+        }
+        return g;
+    };
+    // a line with no place of its own yet (not teletext, or lost) is searched once a second (every frame when set to
+    // teletext by hand or when the probe named it so)
+    auto searchTurn = [&](int l) {
+        const LineAcc& a = acc_[l];
+        if (lineMode_[l] == kLiveLineOff || a.off >= 0 || a.level < 20) return false;
+        if (a.kind == "CC 608" || a.kind == "VPS" || a.kind == "WSS" || a.kind == "VITC") return false;
+        const bool forced = lineMode_[l] == kLiveLineTeletext || ((readAll_ || probeTT_[l]) && lineMode_[l] != kLiveLineOff);
+        return forced || (frames_ + l) % 25 == 0;
+    };
+    // 1. the teletext lines, and the lines searched where this capture's teletext starts (one call for them all)
+    std::vector<std::pair<double, int>> at, failed;
+    std::vector<char> searched((size_t)L, 0);
+    for (int l = 0; l < L && l < (int)acc_.size(); l++) {
+        // a teletext line, or a line the card found a packet on (its name comes within a second)
+        if (lineMode_[l] == kLiveLineOff) continue;
+        if (acc_[l].kind != "WST teletext" && acc_[l].off < 0) {
+            if (off_ >= 0 && searchTurn(l)) { at.push_back({off_, l}); searched[(size_t)l] = 1; }
+            continue;
+        }
+        double off = acc_[l].off >= 0 ? acc_[l].off : off_;
+        if (off >= 0) at.push_back({off, l});
+    }
+    for (auto& gr : group(at, 8)) {
+        std::vector<legacy::MlseResult> res;
+        if (!run(*gp_->bd, gr.lines, gr.lo - 4.0, gr.hi + 4.0, res)) return;
+        for (size_t k = 0; k < gr.lines.size() && k < res.size(); k++) {
+            const int l = gr.lines[k];
+            auto& d = res[k].data;
+            gpuTried_[(size_t)l] = 1;
+            if (d.size() != 42) continue;
+            if (!usable(d.data())) mendHeaderAddress(d.data());
+            const int bad = parityBad(d.data());
+            if (searched[(size_t)l]) {   // a line searched: only a clean packet makes it teletext
+                if (!usable(d.data()) || ham::dec[d[0]] < 0 || ham::dec[d[1]] < 0 || bad > 6) continue;
+            }
+            if (usable(d.data()) && bad <= 12) {
+                std::copy(d.begin(), d.end(), gpuLine_[(size_t)l].begin());
+                gpuHave_[(size_t)l] = 1;
+                gpuOff_[(size_t)l] = res[k].off;
+                continue;
+            }
+            // 8-bit data row (a file sent in teletext, «Бизнес-Текст»): kept for the .raw.t42 if nothing better comes
+            if (ham::dec[d[0]] >= 0 && ham::dec[d[1]] >= 0 && bad > 12) {
+                std::copy(d.begin(), d.end(), gpuRaw_[(size_t)l].begin());
+                gpuRawHave_[(size_t)l] = 1;
+            }
+            if (!searched[(size_t)l]) failed.push_back({acc_[l].off >= 0 ? acc_[l].off : off_, l});
+        }
+    }
+    // 2. the card's tape model on the lines the narrow one could not read (a worn tape), its window wider; taken
+    // when its reading is good (the address and text re-decided among codewords), as the processor's tape decoder.
+    // Not on the 8-bit data rows: their bytes have no parity
+    if (gp_ && gp_->bdTape && !failed.empty()) {
+        std::vector<std::pair<double, int>> tf;
+        for (auto& x : failed) if (!gpuRawHave_[(size_t)x.second]) tf.push_back(x);
+        for (auto& gr : group(tf, 8)) {
+            std::vector<legacy::MlseResult> res;
+            if (!run(*gp_->bdTape, gr.lines, gr.lo - 8 * spb, gr.hi + 8 * spb, res)) return;
+            for (size_t k = 0; k < gr.lines.size() && k < res.size(); k++) {
+                const int l = gr.lines[k];
+                auto& d = res[k].data;
+                if (d.size() != 42 || !res[k].good || !usable(d.data())) continue;
+                std::copy(d.begin(), d.end(), gpuLine_[(size_t)l].begin());
+                gpuHave_[(size_t)l] = 1;
+                gpuOff_[(size_t)l] = res[k].off;
+            }
+        }
+    }
+    if (!gp_) return;
+    // 3. lines with no place of their own yet (not teletext, or lost): each once a second (every frame when set to
+    // teletext by hand or when the probe named it so), where the teletext lines of this capture start, or anywhere
+    // the packet fits when none is known yet; taken when the packet reads clean
+    // (with the place known they went with the teletext lines above: here only while no teletext line is known)
+    std::vector<int> search;
+    for (int l = 0; l < L && l < (int)acc_.size(); l++)
+        if (!gpuTried_[(size_t)l] && searchTurn(l)) search.push_back(l);
+    if (!search.empty()) {
+        // the packet fills the line: it starts in its first quarter (~115 samples of 1440 at 27 MHz)
+        const double lo = off_ >= 0 ? off_ - 8 : 0, hi = off_ >= 0 ? off_ + 8 : n * 0.25;
+        std::vector<legacy::MlseResult> res;
+        if (!run(*gp_->bd, search, lo, hi, res)) return;
+        for (size_t k = 0; k < search.size() && k < res.size(); k++) {
+            const int l = search[k];
+            auto& d = res[k].data;
+            gpuTried_[(size_t)l] = 1;
+            if (d.size() != 42 || !usable(d.data())) continue;
+            if (ham::dec[d[0]] < 0 || ham::dec[d[1]] < 0 || parityBad(d.data()) > 6) continue;   // a clean packet first
+            std::copy(d.begin(), d.end(), gpuLine_[(size_t)l].begin());
+            gpuHave_[(size_t)l] = 1;
+            gpuOff_[(size_t)l] = res[k].off;
+        }
+    }
+    gpuFrames_++;
+}
+
 std::vector<uint8_t> LiveDecoder::sessionPackets()
 {
     std::lock_guard<std::mutex> lk(mu_);
@@ -1022,6 +1672,8 @@ void LiveDecoder::snapshot(LiveSnapshot& s, int page)
     { std::lock_guard<std::mutex> q(qmu_); s.dropped = dropped_; }
     s.frame = last_;
     for (int k = 0; k < 2; k++) { s.picRow[k] = picRow_[k]; s.picWss[k] = frames_ - picWssAt_[k] < 50; }
+    for (int k = 2; k < 8 && k < picRowsGot_; k++) s.picRow[k] = picRow_[k];
+    s.picRows = picRowsGot_;
     s.lines = lineStats_;
     for (auto& st : s.lines) { auto it = probeKind_.find(st.lineNo); if (it != probeKind_.end()) st.probe = it->second; }
     s.list.clear();
@@ -1033,6 +1685,7 @@ void LiveDecoder::snapshot(LiveSnapshot& s, int page)
     s.pages.clear();
     if (page && pages_.count(page)) s.pages[page] = pages_[page];
     s.header = header_; s.hasHeader = hasHeader_;
+    memcpy(s.clock, clock_, sizeof clock_); s.hasClock = hasClock_;
     // VPS / WSS (voted in voteCodes), shown while they come
     s.vps = vps_.have && frames_ - vpsFrame_ < 125 ? vpsText(vps_.bytes) : "";
     s.wss = vps_.wssHave && frames_ - wssFrame_ < 125 ? wssText(vps_.wssBits) : "";
@@ -1417,6 +2070,7 @@ void LiveDecoder::find525(const std::string& vbiPath, int64_t frames, int64_t fi
     DecodeResult r;
     std::string err;
     bool ok = decodeFile(vbiPath, o, r, err);
+    if (getenv("TR_DEBUG")) fprintf(stderr, "find525: %lld frames of %s: %s, %zu lines, %zu 5.7 Mbit/s packets\n", (long long)frames, formatKey(o.force), ok ? "decoded" : err.c_str(), r.lines.size(), r.fastPackets.size());
     if (jtesHow_.slots.empty()) {
         if (!found.slots.empty()) jtesHow_ = found;
         else if (o.jtesProbe) jtesTries_++;
@@ -1528,6 +2182,32 @@ void LiveDecoder::pictureFrame(const uint8_t* p, int w, int h, int stride, doubl
     luma(r0, a);
     luma(r1, b);
     pictureRows(a.data(), b.data(), w, fs);
+    // the lines that follow 23 / 336 (24, 337, 25 ...) as well, as many as the capture window asks for: a VCR writes
+    // its own text or a data line right there, above or below the driver's window
+    const int want = std::clamp(picRowsWanted_, 2, 8);
+    if (want > 2) {
+        std::vector<uint8_t> r;
+        std::lock_guard<std::mutex> lk(mu_);
+        for (int k = 2; k < want; k++) {
+            luma(std::min(h - 1, k), r);
+            picRow_[k] = r;
+        }
+        picRowsGot_ = want;
+    } else {
+        std::lock_guard<std::mutex> lk(mu_);
+        picRowsGot_ = 2;
+    }
+}
+
+void LiveDecoder::setPictureRows(int n)
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    picRowsWanted_ = std::clamp(n, 1, 8);
+}
+int LiveDecoder::pictureRowsNow()
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    return picRowsWanted_;
 }
 
 // line 23 / 336 from the picture: WSS (EN 300 294) on the row of either field (pictureFrame finds it); read on every

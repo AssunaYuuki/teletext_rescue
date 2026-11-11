@@ -139,7 +139,7 @@ struct TtWin : Win {
         Over x = P.fitted(s.rows, P.overlay(pg, &s), t);
         RenderOpts o;
         o.reveal = reveal; o.flash_on = flash_on; o.tv = tv; o.codes = codes; o.cursor_r = cursor_r; o.cursor_c = cursor_c;
-        return render_teletext(s.rows, t, P.table2(), &x, o, &last_flash, &last_box);
+        return render_teletext(s.rows, t, P.table2(&pg), &x, o, &last_flash, &last_box);
     }
     void draw_page(bool keep_flash = false)
     {

@@ -20,6 +20,9 @@ std::vector<std::string> audioInputs();
 struct CaptureStandard { long bit; const char* name; };
 const std::vector<CaptureStandard>& captureStandards();
 
+// Capture::open's error when the driver lets only an elevated process open the card (Behold SAA7231)
+inline const char* const kCaptureAccessDenied = "access denied: the driver opens this card only for a program run as administrator";
+
 class Capture {
 public:
     Capture();

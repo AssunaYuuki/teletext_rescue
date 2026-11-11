@@ -239,7 +239,9 @@ Json extract_extras(const std::vector<Packet42> &st, Progress &pr) {
         Json e = Json::object();
         if (tx.get(pid)) {
             e["tx"] = (int)tx.get(pid);
-            int ns = 0; for (auto &kv : subs[pid].v) if (kv.second >= 3) ns++;
+            int ns = 0; long stop = 0;
+            for (auto &kv : subs[pid].v) stop = std::max(stop, kv.second);
+            for (auto &kv : subs[pid].v) if (kv.second >= 3 && kv.second * 10 >= stop) ns++;
             e["subpages"] = ns ? ns : 1;
             if (c6.get(pid) >= std::max(2.0, 0.5 * tx.get(pid))) e["boxed"] = true;
             e["nat"] = nat[pid].empty() ? 1 : nat[pid].top().first;
@@ -398,6 +400,126 @@ R40 vote(const std::vector<const R40 *> &mem) {
         for (auto m : mem) if (odd_parity((*m)[k])) c.add((*m)[k]);
         out[k] = (u8)((c.empty() ? 0x20 : c.top().first) & 0x7F);
     }
+    return out;
+}
+// голосование по рядам, которые уже собраны (7 бит, чётность снята), с весом каждой версии (сколько раз она пришла):
+// берётся самый весомый знак, при равенстве — не пробел (пробел в собранном ряду чаще всего значит «ни одна копия не
+// дала верный знак»)
+R40 vote_clean(const std::vector<std::pair<const R40 *, int>> &mem) {
+    R40 out;
+    for (int k = 0; k < 40; k++) {
+        std::map<int, int> c;
+        for (auto &m : mem) c[(*m.first)[k] & 0x7F] += std::max(1, m.second);
+        int best = 0x20, bn = -1;
+        for (auto &kv : c) if (kv.second > bn || (kv.second == bn && best == 0x20)) { best = kv.first; bn = kv.second; }
+        out[k] = (u8)best;
+    }
+    return out;
+}
+// страница, которую станция крутит под одним субкодом (777 ГЦРТ: дюжина разных страниц подряд, каждая
+// передача — одна копия): сборка оставляет их версиями из одного снимка, и голосовать не по чему — каждая
+// копия в единственном числе. Похожие версии склеиваем и голосуем: по одной чистой странице на кадр карусели.
+std::vector<Version> cluster_rotations(const std::vector<Version> &in) {
+    if (in.size() < 2) return in;
+    auto mosaic = [](const Row &r) { for (u8 c : r) if ((c & 0x7F) >= 0x10 && (c & 0x7F) <= 0x17) return true; return false; };
+    auto textDiff = [&](const Row &x, const Row &y) {
+        int d = 0;
+        for (int k = 0; k < 40; k++) { u8 a = x[k] & 0x7F, b = y[k] & 0x7F; d += a != b && a != 0x20 && b != 0x20; }
+        return d;
+    };
+    // a — представитель группы (пришёл чаще всех в ней), b — кандидат
+    auto sim = [&](const Version &a, const Version &b) {
+        // копия, пришедшая вчетверо реже, с другим рядом — чаще всего порченная лентой (ОРТ 2002, 453: 20 копий
+        // против одной «0 г бнт"  Жб  йибе»): она вливается, и голос частой перевешивает. Ряд текста, другой больше
+        // чем в 10 знаках у версий, пришедших примерно одинаково часто, — уже другая страница, сколько бы остальных
+        // рядов ни совпало: ТЕЛЕИНФ 100 крутит под 0000 четыре анонса в рядах 11-14 при общих 20 рядах, и
+        // посимвольное голосование склеивало их в «НАСТАБИДЬНОС БАПНАИЛ»
+        bool strict = a.n < 4 * b.n;
+        int eq = 0, tot = 0;
+        for (int r = 0; r <= 24; r++) {
+            auto ia = a.rows.find(r), ib = b.rows.find(r);
+            if (ia == a.rows.end() || ib == b.rows.end()) continue;
+            if (strict && r >= 1 && r <= 23 && !mosaic(ia->second) && !mosaic(ib->second) && textDiff(ia->second, ib->second) > 10)
+                return 0.0;
+            for (int k = 0; k < 40; k++) eq += ia->second[k] == ib->second[k];
+            tot += 40;
+        }
+        return tot >= 200 ? (double)eq / tot : 0.0;
+    };
+    // частые версии первыми: представитель группы — та, что пришла чаще всех
+    std::vector<int> order(in.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](int x, int y) { return in[x].n > in[y].n; });
+    std::vector<std::vector<int>> cl;
+    for (int i : order) {
+        int best = -1; double bs = 0;
+        for (int c = 0; c < (int)cl.size(); c++) { double s = sim(in[cl[c][0]], in[i]); if (s > bs) { bs = s; best = c; } }
+        if (best >= 0 && bs >= 0.85) cl[best].push_back(i);
+        else cl.push_back({i});
+    }
+    std::vector<Version> out;
+    for (auto &c : cl) {
+        Version v = in[c[0]];
+        double t = v.t; int n = 0;
+        std::map<int, std::vector<std::pair<const R40 *, int>>> mem;
+        for (int i : c) {
+            n += in[i].n; t = std::min(t, in[i].t);
+            for (auto &rb : in[i].rows) mem[rb.first].push_back({&rb.second, in[i].n});
+        }
+        // ряды версий уже проголосованы (бит чётности снят): vote() с проверкой чётности здесь выбросил бы
+        // каждый знак с чётным числом единиц (о, е, т, р, и, «0» — ТВ6 2000, 100/0002 вышла наполовину пустой)
+        // ряд, который есть только у одной версии группы, тоже остаётся (НТВ 1996, 133: «банков мира на закрытие NYSE»
+        // пришёл не в той версии, что чаще всех)
+        for (auto &kv : mem) {
+            if (kv.second.size() > 1) v.rows[kv.first] = vote_clean(kv.second);
+            else if (!v.rows.count(kv.first)) v.rows[kv.first] = *kv.second[0].first;
+        }
+        // копий ряда — наибольшее по версиям группы (c версии — копии всего кластера ряда, так что не суммируем): с
+        // копиями одного представителя ряд, пришедший в других версиях, получал 0, и проход «чужие ряды» отдавал его
+        // соседней странице (НТВ 132/133 «ОТКРЫТИЯ ЗАКРЫТИЯ»)
+        for (int i : c)
+            for (auto &rb : in[i].rows) {
+                if (rb.first == 0) continue;
+                auto ci = in[i].c.find(rb.first);
+                int k = ci == in[i].c.end() ? 1 : ci->second;
+                auto &dst = v.c[rb.first];
+                dst = std::max(dst, k);
+            }
+        v.t = t; v.n = n;
+        out.push_back(v);
+    }
+    // склейка двух страниц карусели (НТВ 1996, 160: ряд 3 от одной страницы, ряд 4 от другой, ни одного своего ряда)
+    // теперь не растворяется в похожей версии - она убирается, когда каждый её ряд текста есть у одной из двух
+    // версий, пришедших не реже, а от каждой из них она в каком-то ряду отличается
+    auto textRow = [&](int r, const Row &x) {
+        if (r < 1 || r > 23 || mosaic(x)) return false;
+        int n = 0; for (u8 c : x) n += (c & 0x7F) != 0x20; return n >= 12;
+    };
+    // -1: в w нет ряда, 0: тот же текст, 1: другой
+    auto rel = [&](const Version &v, const Version &w, int r) {
+        auto it = w.rows.find(r);
+        if (it == w.rows.end()) return -1;
+        return textDiff(v.rows.at(r), it->second) > 10 ? 1 : 0;
+    };
+    std::vector<char> splice(out.size(), 0);
+    for (size_t i = 0; i < out.size(); i++)
+        for (size_t a = 0; a < out.size() && !splice[i]; a++)
+            for (size_t b = a + 1; b < out.size() && !splice[i]; b++) {
+                if (a == i || b == i || splice[a] || splice[b] || out[a].n < out[i].n || out[b].n < out[i].n) continue;
+                bool covered = true, offA = false, offB = false; int rows = 0;
+                for (auto &rb : out[i].rows) {
+                    if (!textRow(rb.first, rb.second)) continue;
+                    rows++;
+                    int ra = rel(out[i], out[a], rb.first), rbb = rel(out[i], out[b], rb.first);
+                    if (ra != 0 && rbb != 0) { covered = false; break; }
+                    offA |= ra == 1; offB |= rbb == 1;
+                }
+                if (covered && rows >= 2 && offA && offB) splice[i] = 1;
+            }
+    std::vector<Version> kept;
+    for (size_t i = 0; i < out.size(); i++) if (!splice[i]) kept.push_back(out[i]);
+    out.swap(kept);
+    std::stable_sort(out.begin(), out.end(), [](const Version &a, const Version &b) { return a.t < b.t; });
     return out;
 }
 }
@@ -630,7 +752,9 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
         for (auto &t : T) if (t.has_sub) main.add(t.sub);
         if (main.empty()) { for (auto &t : T) out.push_back({t.i, t.rows, "0000"}); return out; }
         std::set<std::string> kn;
-        for (auto &kv : main.v) if (kv.second >= MIN_TX) kn.insert(kv.first);
+        long top = main.top().second;
+        // субкод, встретившийся в единицы раз на сотню (0x2B вместо 0x15 — сбитый бит на ленте), — не подстраница
+        for (auto &kv : main.v) if (kv.second >= MIN_TX && kv.second * 10 >= top) kn.insert(kv.first);
         if (kn.empty()) kn.insert(main.top().first);
         if (kn.size() == 1) {
             std::string only = *kn.begin();
@@ -658,6 +782,42 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
         return out;
     };
 
+    // карусель под одним субкодом (777 ГЦРТ: десятки разных страниц, каждая приходит кусками по 3-7 строк):
+    // передача принадлежит той странице, чьи строки она повторяет. Строка с тем же номером, но другим
+    // содержимым — уже другая страница. Обычную страницу, где передачи повторяют друг друга, не трогаем.
+    auto split_rotation = [&](const std::vector<TT> &T) {
+        std::vector<std::vector<TT>> one{T};
+        if (T.size() < 4) return one;
+        auto agree = [](const TT &a, const TT &b, int &eq, int &diff) {
+            eq = diff = 0;
+            for (auto &ra : *a.rows)
+                for (auto &rb : *b.rows) if (rb.first == ra.first) {
+                    int d = 0; for (int k = 0; k < 40; k++) d += ra.second[k] != rb.second[k];
+                    if (d <= 6) eq++; else diff++;
+                    break;
+                }
+        };
+        int eq, diff, same = 0;
+        for (auto &t : T) { agree(T[0], t, eq, diff); if (eq >= 1 && diff == 0) same++; }
+        if (same * 4 >= (int)T.size() * 3) return one;      // 75% и больше повторяют первую — обычная страница
+        // связные компоненты передач: две передачи — одна страница, если у них есть общая строка с тем же
+        // содержимым и нет строки с тем же номером, но другим содержимым. Кусок, у которого общих строк нет
+        // ни с кем, остаётся своей страницей (его строки не подмешиваются к чужим).
+        int n = (int)T.size();
+        std::vector<int> par(n);
+        for (int i = 0; i < n; i++) par[i] = i;
+        auto root = [&](int x) { while (par[x] != x) { par[x] = par[par[x]]; x = par[x]; } return x; };
+        for (int i = 0; i < n; i++)
+            for (int j = i + 1; j < n; j++) {
+                int e, d; agree(T[i], T[j], e, d);
+                if (e >= 1 && d == 0) { int a = root(i), b = root(j); if (a != b) par[a] = b; }
+            }
+        std::map<int, std::vector<TT>> by;
+        for (int i = 0; i < n; i++) by[root(i)].push_back(T[i]);
+        std::vector<std::vector<TT>> cl;
+        for (auto &kv : by) cl.push_back(kv.second);
+        return cl;
+    };
     auto build = [&](const std::vector<TT> &T) {
         struct Cl { const R40 *rep; std::vector<const R40 *> mem; };
         std::map<int, std::vector<Cl>> reps;
@@ -908,8 +1068,19 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
             if (changed || snaps.empty()) snaps.push_back({state, T[k].i, T[k].i, 1});
             else { snaps.back().t1 = T[k].i; snaps.back().n++; }
         }
-        for (int k = (int)snaps.size() - 2; k >= 0; k--)
+        for (int k = (int)snaps.size() - 2; k >= 0; k--) {
+            // недостающие ряды подтягиваем только у соседа той же страницы: на карусели (777 ГЦРТ) соседний
+            // снимок — уже другая страница, и её ряды в чужой кадр не годятся
+            int same = 0, both = 0;
+            for (auto &rc : snaps[k + 1].st) {
+                int ci = st_get(snaps[k].st, rc.first);
+                if (ci < 0) continue;
+                both++;
+                if (near4(vote(reps[rc.first][ci].mem), vote(reps[rc.first][rc.second].mem))) same++;
+            }
+            if (both && same * 2 < both) continue;
             for (auto &rc : snaps[k + 1].st) if (st_get(snaps[k].st, rc.first) < 0) snaps[k].st.push_back(rc);
+        }
         std::vector<Snap> good;
         for (auto &s : snaps) if (s.n >= MIN_ROW) good.push_back(s);
         if (good.empty() && !snaps.empty()) {
@@ -948,7 +1119,24 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
         std::vector<Version> out;
         for (auto &sb : by) {
             if ((int)sb.second.size() < MIN_TX && by.size() > 1) continue;
-            auto snaps = build(sb.second);
+            std::vector<Version> snaps;
+            auto groups = split_rotation(sb.second);
+            int gi = 0;
+            for (auto &g : groups) {
+                auto part = build(g);
+                // кадры карусели не подмешиваем друг к другу: rot >= 0 говорит merge_pages, что это отдельная страница
+                if (groups.size() > 1) for (auto &v : part) v.rot = gi;
+                snaps.insert(snaps.end(), part.begin(), part.end());
+                gi++;
+            }
+            // кусок карусели из одной передачи, все ряды которой испорчены лентой, даёт версию из одного заголовка
+            // (ТВ6 2000, 100: три пустых кадра между настоящими); она пустая, пока есть версия с рядами
+            {
+                auto empty = [](const Version &v) { for (auto &rb : v.rows) if (rb.first >= 1 && rb.first <= 24) return false; return true; };
+                bool full = std::any_of(snaps.begin(), snaps.end(), [&](const Version &v) { return !empty(v); });
+                if (full) snaps.erase(std::remove_if(snaps.begin(), snaps.end(), empty), snaps.end());
+            }
+            if (snaps.size() > 1) snaps = cluster_rotations(snaps);
             for (auto &s : snaps) s.s = sb.first;
             out.insert(out.end(), snaps.begin(), snaps.end());
         }
@@ -1172,6 +1360,9 @@ void build_project(const std::string &t42_in, const std::string &out, const std:
                    const std::string &vbi, Progress &pr) {
     std::string T42 = abspath(t42_in), SOURCE = T42;
     make_dirs(out);
+    if (!is_dir(out))   // the folder is made here, and a refusal said plainly, not "No such file or directory" later
+        throw std::runtime_error("cannot create the folder " + out + ": Windows did not let it be made.\n\n"
+                                 "Choose another folder (for example on the Desktop) and repeat.");
     uint64_t sz = file_size(T42);
     if (ends_with_i(T42, ".t34") || (sz % 42 && !(sz % 34))) {
         pr.step("converting .t34 (525 lines, 32 characters per row) to .t42");
@@ -1194,7 +1385,13 @@ void build_project(const std::string &t42_in, const std::string &out, const std:
         pr.log(fmt("row breaks: within a field %.1f%%, at boundaries %.1f%% -> %s", fsk.second.first * 100, fsk.second.second * 100,
                    skip ? "fields are skipped, building field-aware" : "continuous recording"));
     }
-    if (headers(st) < 3) throw std::runtime_error("The stream has almost no page headers \xE2\x80\x94 there is nothing to build pages from.");
+    // a stream with almost no headers is noise; a file of one or two pages (25-26 packets each: a page saved alone,
+    // vhs-teletext's template.t42, TeletextRecoveReese's kyle_reese.t42) is those pages
+    {
+        const size_t h = headers(st);
+        if (h == 0 || (h < 3 && st.size() > 30 * h))
+            throw std::runtime_error("The stream has almost no page headers \xE2\x80\x94 there is nothing to build pages from.");
+    }
     bool sparse = sparse_stream(st);
     pr.step(std::string("building pages") + (sparse ? " (pages repeat rarely \xE2\x80\x94 a cleaned stream or a short recording: each page is taken from its first copy)" : ""));
     ExportOpts fo; fo.field_reset = false; fo.sparse = sparse; fo.clean = clean_stream(st);

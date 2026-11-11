@@ -5,7 +5,11 @@
 #define NOMINMAX
 #endif
 #include "slicer.h"
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -182,6 +186,8 @@ public:
         LOAD(ReleaseQueue_, "clReleaseCommandQueue");
         LOAD(ReleaseContext_, "clReleaseContext");
 #undef LOAD
+        GetProgramInfo_ = (decltype(GetProgramInfo_))(void*)GetProcAddress(dll_, "clGetProgramInfo");
+        CreateProgramWithBinary_ = (decltype(CreateProgramWithBinary_))(void*)GetProcAddress(dll_, "clCreateProgramWithBinary");
         cl_platform_id plats[8];
         cl_uint np = 0;
         if (GetPlatformIDs_(8, plats, &np) != 0 || np == 0) { err = "no OpenCL platforms"; return false; }
@@ -206,17 +212,9 @@ public:
         src += kFastSrc;
         src += "\n";
         src += kFastKernelSrc;
-        const char* s = src.c_str();
-        prog_ = CreateProgramWithSource_(ctx_, 1, &s, nullptr, &e);
-        if (!prog_) { err = "clCreateProgramWithSource failed"; return false; }
-        if (BuildProgram_(prog_, 1, &dev_, "-cl-fast-relaxed-math", nullptr, nullptr) != 0) {
-            size_t len = 0;
-            GetProgramBuildInfo_(prog_, dev_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &len);
-            std::string log(len + 1, '\0');
-            GetProgramBuildInfo_(prog_, dev_, CL_PROGRAM_BUILD_LOG, len, &log[0], nullptr);
-            err = "OpenCL build failed: " + log.substr(0, 2000);
-            return false;
-        }
+        std::string log;
+        prog_ = buildCached(src, "-cl-fast-relaxed-math", log);
+        if (!prog_) { err = "OpenCL build failed: " + log.substr(0, 2000); return false; }
         kernel_ = CreateKernel_(prog_, "slice_kernel", &e);
         if (kernel_) fastKernel_ = CreateKernel_(prog_, "fast_kernel", &e);
         if (!kernel_) { err = "clCreateKernel failed"; return false; }
@@ -276,17 +274,10 @@ public:
         src += kJtesSrc;
         src += "\n";
         src += kJtesKernelSrc;
-        const char* sp = src.c_str();
         cl_int e = 0;
-        jProg_ = CreateProgramWithSource_(ctx_, 1, &sp, nullptr, &e);
-        if (!jProg_ || BuildProgram_(jProg_, 1, &dev_, "", nullptr, nullptr) != 0) {
-            std::string log;
-            if (jProg_) {
-                size_t len = 0;
-                GetProgramBuildInfo_(jProg_, dev_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &len);
-                log.assign(len + 1, '\0');
-                GetProgramBuildInfo_(jProg_, dev_, CL_PROGRAM_BUILD_LOG, len, &log[0], nullptr);
-            }
+        std::string log;
+        jProg_ = buildCached(src, "", log);
+        if (!jProg_) {
             jFailed_ = true;
             jErr_ = err = "OpenCL build of the Japanese teletext receiver failed: " + log.substr(0, 2000);
             return false;
@@ -519,6 +510,79 @@ private:
     cl_int(CLAPI* ReleaseProgram_)(cl_program) = nullptr;
     cl_int(CLAPI* ReleaseQueue_)(cl_command_queue) = nullptr;
     cl_int(CLAPI* ReleaseContext_)(cl_context) = nullptr;
+    // the cache of built programs (optional)
+    cl_int(CLAPI* GetProgramInfo_)(cl_program, cl_uint, size_t, void*, size_t*) = nullptr;
+    cl_program(CLAPI* CreateProgramWithBinary_)(cl_context, cl_uint, const cl_device_id*, const size_t*, const unsigned char**, cl_int*, cl_int*) = nullptr;
+
+    // A program from source costs the driver 1-2 s (NVIDIA keeps no OpenCL cache of its own) on every decode: the built
+    // binary is kept, keyed by device, driver, options and source (%LOCALAPPDATA%\TeletextRescue\clcache, or TR_CLCACHE).
+    // -> the built program, or nullptr with the build log
+    cl_program buildCached(const std::string& src, const char* opts, std::string& log)
+    {
+        std::string file;
+        {
+            const char* d = getenv("TR_CLCACHE");
+            std::string dir = d ? d : "";
+            if (dir.empty()) { const char* b = getenv("LOCALAPPDATA"); if (!b) b = getenv("TEMP"); if (b) dir = std::string(b) + "/TeletextRescue/clcache"; }
+            if (!dir.empty()) {
+                char dv[256] = {};
+                GetDeviceInfo_(dev_, 0x102D /* CL_DRIVER_VERSION */, sizeof dv - 1, dv, nullptr);
+                uint64_t h = 1469598103934665603ull;
+                for (const std::string& s : {devName_, std::string(dv), std::string(opts), src}) {
+                    for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
+                    h ^= 0xFF; h *= 1099511628211ull;
+                }
+                char b[40];
+                snprintf(b, sizeof b, "/slicer_%016llx.bin", (unsigned long long)h);
+                file = dir + b;
+                for (size_t i = 0; i <= dir.size(); i++)
+                    if (i == dir.size() || ((dir[i] == '/' || dir[i] == '\\') && i > 2)) {
+#ifdef _WIN32
+                        CreateDirectoryA(dir.substr(0, i).c_str(), nullptr);
+#endif
+                    }
+            }
+        }
+        cl_int e = 0;
+        if (!file.empty() && CreateProgramWithBinary_)
+            if (FILE* f = fopen(file.c_str(), "rb")) {
+                std::vector<unsigned char> bin;
+                unsigned char buf[65536];
+                for (size_t n; (n = fread(buf, 1, sizeof buf, f)) > 0;) bin.insert(bin.end(), buf, buf + n);
+                fclose(f);
+                const unsigned char* p = bin.data();
+                size_t len = bin.size();
+                cl_int st = 0;
+                cl_program pr = bin.empty() ? nullptr : CreateProgramWithBinary_(ctx_, 1, &dev_, &len, &p, &st, &e);
+                if (pr && !e && !st && BuildProgram_(pr, 1, &dev_, "", nullptr, nullptr) == 0) return pr;
+                if (pr) ReleaseProgram_(pr);
+            }
+        const char* s = src.c_str();
+        cl_program pr = CreateProgramWithSource_(ctx_, 1, &s, nullptr, &e);
+        if (!pr) { log = "clCreateProgramWithSource failed"; return nullptr; }
+        if (BuildProgram_(pr, 1, &dev_, opts, nullptr, nullptr) != 0) {
+            size_t len = 0;
+            GetProgramBuildInfo_(pr, dev_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &len);
+            log.assign(len + 1, '\0');
+            GetProgramBuildInfo_(pr, dev_, CL_PROGRAM_BUILD_LOG, len, &log[0], nullptr);
+            ReleaseProgram_(pr);
+            return nullptr;
+        }
+        size_t len = 0;
+        if (!file.empty() && GetProgramInfo_ && GetProgramInfo_(pr, 0x1165 /* BINARY_SIZES */, sizeof len, &len, nullptr) == 0 && len) {
+            std::vector<unsigned char> bin(len);
+            unsigned char* p = bin.data();
+            if (GetProgramInfo_(pr, 0x1166 /* BINARIES */, sizeof p, &p, nullptr) == 0) {
+                std::string tmp = file + ".tmp" + std::to_string((uintptr_t)this);
+                if (FILE* f = fopen(tmp.c_str(), "wb")) {
+                    bool ok = fwrite(bin.data(), 1, len, f) == len;
+                    fclose(f);
+                    if (!ok || std::rename(tmp.c_str(), file.c_str()) != 0) std::remove(tmp.c_str());
+                }
+            }
+        }
+        return pr;
+    }
 };
 
 } // namespace

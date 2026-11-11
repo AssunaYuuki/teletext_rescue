@@ -67,6 +67,7 @@ Info read_info(const u8 *d, size_t n) {
         if (p + 4 > n) throw std::runtime_error("FLAC: broken metadata");
         last = d[p] & 0x80; int type = d[p] & 0x7F; size_t len = ((size_t)d[p + 1] << 16) | (d[p + 2] << 8) | d[p + 3];
         p += 4;
+        if (len > n - p) throw std::runtime_error("FLAC: broken metadata");   // the block must fit the file
         if (type == 0 && len >= 34) {
             Bits b(d, n, p);
             I.min_block = b.get(16); I.max_block = b.get(16); b.get(24); b.get(24);
@@ -141,6 +142,9 @@ size_t decode_frame(const u8 *d, size_t n, const Hdr &h, int bps, std::vector<in
         if (method > 1) throw std::runtime_error("FLAC: unknown residual coding");
         int pbits = method ? 5 : 4, esc = method ? 31 : 15;
         int porder = b.get(4);
+        // a damaged frame can name a partition order the block size cannot hold: without this the sample
+        // count of the first partition wraps around and the loop writes far past the buffer
+        if ((N >> porder) < (uint32_t)order) throw std::runtime_error("FLAC: bad partition order");
         uint32_t parts = 1u << porder, i = order;
         for (uint32_t pt = 0; pt < parts; pt++) {
             uint32_t cnt = (N >> porder) - (pt == 0 ? order : 0);
@@ -202,6 +206,7 @@ uint64_t flac_to_raw(const std::string &in, const std::string &out, Progress &pr
     MappedFile mf(in);
     const u8 *d = mf.data(); size_t n = (size_t)mf.size();
     Info I = read_info(d, n);
+    if (I.first_frame > n) throw std::runtime_error("FLAC: broken metadata");
     if (comment) *comment = I.comment;
     if (I.channels != 1) throw std::runtime_error(fmt("FLAC: %u channels \xE2\x80\x94 a VBI recording in FLAC has one", I.channels));
     if (I.bps != 8 && I.bps != 16) throw std::runtime_error(fmt("FLAC: %u bits per sample \xE2\x80\x94 expected 8 or 16", I.bps));
@@ -275,7 +280,7 @@ uint64_t flac_to_raw(const std::string &in, const std::string &out, Progress &pr
                 fseek64(f, (int64_t)(h.first_sample * bpsmp), SEEK_SET);
                 fwrite(buf.data(), 1, buf.size(), f);
                 uint64_t dn = done += cnt;
-                if ((dn / cnt) % 512 == 0) pr.progress((long long)(dn >> 10), (long long)(total >> 10), "unpacking FLAC");
+                if (cnt && (dn / cnt) % 512 == 0) pr.progress((long long)(dn >> 10), (long long)(total >> 10), "unpacking FLAC");
                 p = next;
             }
         } catch (std::exception &e) { std::lock_guard<std::mutex> lk(fmu); if (err.empty()) err = e.what(); }

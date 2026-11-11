@@ -302,9 +302,12 @@ std::string join_ints(const std::vector<int> &v, const char *sep) { std::string 
 std::string num_or_none(const Json &j) { return j.is_null() ? "None" : fmt("%g", j.num()); }
 }
 
-std::string datacast_export(const std::string &src, const std::string &out, std::vector<std::pair<int, int>> lines, Progress &pr) {
+std::string datacast_export(const std::string &src, const std::string &out, std::vector<std::pair<int, int>> lines, Progress &pr,
+                            const std::string &format) {
     auto t0 = std::chrono::steady_clock::now();
-    auto fc = detect_format(src);
+    // the rows in lines are records of the layout they were found in: the same one is read here (detecting again took
+    // cx23885 for rows of d27-pal - January 1998 Whyy Test: row 18 of a 12-record field, read past the end of the file)
+    auto fc = format.empty() || !vbi_format(format) ? detect_format(src) : std::make_pair(format, Json());
     if (fc.first.empty()) throw std::runtime_error("unknown recording format");
     Rec R(src, fc.first);
     if (lines.empty()) {

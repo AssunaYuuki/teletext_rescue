@@ -7,8 +7,8 @@
 // ТВ-информ at fТ3 = 6.9375 MHz (444 x fH), GOST R 50822-95 (RTR / ВГТРК, 23.12.2001, lines 19 and 332).
 // A line is 360 bits = 45 bytes, bit 0 first: a run-in (a 2.8 MHz tone, not on the data clock), the
 // header FB AC, then 41 data bytes. The levels are not inverted; the eye is narrow (the 2T pulse of the
-// recording is 296 ns), so the bits come from an MLSE (16 states, the observation of a bit depends on
-// two bits either side; the channel is learnt from the recording itself). A 27 MHz capture window ends
+// recording is 296 ns; a tape cut at ~3.2 MHz, RTR 14.09.2002), so the bits come from an MLSE (64 states, the
+// observation of a bit depends on three bits either side; the channel is learnt from the recording itself). A 27 MHz capture window ends
 // before the last 2 bits of the line: byte 40 has only its low 6 bits.
 //
 // The data stream runs over the lines in time order (field 1, field 2, field 1 ...): the next slot of
@@ -20,6 +20,7 @@
 // 00 = beacon (DOS date and time of the inserter + test text "TV-INFORM / THE RED FOX ...").
 // The service sends on more VBI lines than a capture card keeps (11 of the ГОСТ lines a field): of the
 // record numbers only the share on the captured lines is seen, so files are rarely complete.
+constexpr int kTvi3M = 3, kTvi3Ctx = 1 << (2 * kTvi3M + 1);   // MLSE: bits either side, contexts
 constexpr int kTvi3Bytes = 41;          // data bytes of a line (after 55 55 FB AC)
 // a line with an equalizing pulse mid-line (lines of the field sync): bytes 13..23 are the pulse and the blanking
 // after it, the data go on after them - the word is 30 bytes
@@ -42,7 +43,7 @@ public:
     bool trained() const { return trained_; }
     int learnt() const { return varied_; }               // lines with data gathered for the learning
     int toLearn() const { return needVaried_; }
-    struct Model { float mu[32][2]; float var[2]; };
+    struct Model { float mu[kTvi3Ctx][2]; float var[2]; };
 private:
     struct Pending { int64_t frame; int lineNo, field; std::vector<float> raw; bool varied; };
     float fs_, T_;

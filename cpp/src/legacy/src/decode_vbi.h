@@ -16,12 +16,16 @@ public:
     ~VbiReader();
     int frames() const { return N; }
     const u8 *line(int f, int l) const { return mf.data() + ((uint64_t)f * lpf + l) * 2048; }
-    std::vector<std::pair<int, int>> sample(int n_frames = 1500, int n_lines = 2500);
-    double prepare(const std::vector<std::pair<int, int>> &cand, bool train);   // < 0 — не читается
+    std::vector<std::pair<int, int>> sample(int n_frames = 1500, int n_lines = 2500, unsigned seed = 0);
+    // < 0 — не читается; mlse_seed = false: шаблоны растут только от встроенных (без затравки строками MLSE)
+    double prepare(const std::vector<std::pair<int, int>> &cand, bool train, bool mlse_seed = true);
+    void reset_templates();   // встроенные шаблоны, MLSE не запасной (перед новой калибровкой)
     std::map<std::pair<int, int>, std::array<u8, 42>> decode_all(const std::vector<int> *frames = nullptr);
     bool gpu_on() const { return (bool)gpu; }
+    const tpl::Templates &templates() const { return dec.templates(); }
     double win_lo = 113, win_hi = 121;
     bool fallback = false, do_repair = true;
+    double rate_tpl = -1, rate_mlse = -1;   // the last prepare: shares of the sample the templates and the MLSE read
     std::vector<char> only;   // non-empty: only these lines of the frame are teletext (the probe found WST there)
     bool use_line(int l) const { return only.empty() || (l < (int)only.size() && only[l]); }
     std::vector<std::pair<int, int>> warm;   // строки, уверенно прочитанные MLSE при калибровке: на них копится модель для видеокарты
@@ -36,6 +40,11 @@ private:
     tpl::Decoder dec;
     std::unique_ptr<tpl::GpuDecoder> gpu;
 };
+
+// the templates for the recording (decode_vbi_project, the live decoder): trained on a sample of its lines, below half
+// again from the built-in ones on other samples, the best kept. -> share of the sampled lines read confidently;
+// < 0 unreadable, -2 no line with a signal
+double train_templates(VbiReader &R, Progress &pr);
 
 // запись -> out/stream.t42, line_pkt.npy, проект страниц. Бросает runtime_error.
 void decode_vbi_project(const std::string &vbi, const std::string &out, int lpf, bool use_gpu, bool repair, Progress &pr,

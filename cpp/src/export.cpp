@@ -255,7 +255,7 @@ std::string exportResult(const DecodeResult& r, const std::string& dir, Progress
                     Over x = P.fitted(vs[k].rows, P.overlay(kv.second, &vs[k]), t);
                     RenderOpts o;
                     o.reveal = true;
-                    Image im = render_teletext(vs[k].rows, t, P.table2(), &x, o);
+                    Image im = render_teletext(vs[k].rows, t, P.table2(&kv.second), &x, o);
                     png_save(path_join(png, kv.first + (vs.size() > 1 ? fmt("_%zu", k + 1) : "") + ".png"), im.scaled(im.w * 2, im.h * 2));
                 }
             }

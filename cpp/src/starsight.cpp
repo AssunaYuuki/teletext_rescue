@@ -665,9 +665,9 @@ std::string SsDatabase::titleOf(int program) const
     if (it != programs.end() && !it->second.title.empty())
         return it->second.partial ? it->second.title + "\xE2\x80\xA6" : it->second.title;
     if (program == 0) return "";
-    // the title of this programme was not sent while recording
-    char b[48];
-    snprintf(b, sizeof b, "(title not received, #%d)", program);
+    // the title of this programme was not sent while recording: keep the cell short
+    char b[32];
+    snprintf(b, sizeof b, "#%d", program);
     return b;
 }
 
@@ -710,6 +710,46 @@ bool ssKnownChannel(int id, std::string& label, std::string& call)
         else hi = mid - 1;
     }
     return false;
+}
+
+int ssApplyChannelNames(SsDatabase& db, const std::string& recordingPath)
+{
+    std::string dir;
+    size_t sl = recordingPath.find_last_of("/\\");
+    if (sl != std::string::npos) dir = recordingPath.substr(0, sl);
+    std::vector<std::string> files;
+    if (const char* f = getenv("TR_SSCHANNELS")) files.push_back(f);
+    if (!dir.empty()) files.push_back(dir + "/starsight_channels.txt");
+    int applied = 0;
+    for (auto& f : files) {
+        FILE* fp = fopen(f.c_str(), "rb");
+        if (!fp) continue;
+        char buf[512];
+        while (fgets(buf, sizeof buf, fp)) {
+            std::string line = buf;
+            size_t hash = line.find('#');
+            if (hash != std::string::npos) line = line.substr(0, hash);
+            size_t p = line.find_first_not_of(" \t\r\n");
+            if (p == std::string::npos) continue;
+            char* end = nullptr;
+            long id = strtol(line.c_str() + p, &end, 10);
+            if (!end || end == line.c_str() + p || id <= 0 || id > 65535) continue;
+            std::string name = end;
+            size_t b = name.find_first_not_of(" \t=:,\r\n");
+            if (b == std::string::npos) continue;
+            name = name.substr(b);
+            while (!name.empty() && (name.back() == '\r' || name.back() == '\n' || name.back() == ' ')) name.pop_back();
+            if (name.size() > 8) name.resize(8);          // так же, как в команде «channel data»
+            auto& c = db.channels[(int)id];
+            if (c.id == 0) c.id = (int)id;
+            c.name = name;
+            c.nameFlag = true;
+            c.abbrevBits = 0;
+            applied++;
+        }
+        fclose(fp);
+    }
+    return applied;
 }
 
 // ------------------------------------------------------------- Huffman ---

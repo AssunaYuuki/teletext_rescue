@@ -246,6 +246,10 @@ struct Capture::Impl {
     VbiFormat wantLay = VbiFormat::Unknown;
     int padLay = 0;
     bool bt8x8 = false;   // Bt848/Bt878 WDM driver: VBI padded to 2048, small picture
+    // bt8x8 PAL line start (us x 100) that gives Linux bttv's window; samples the lines are moved right when the
+    // driver keeps a later start
+    static constexpr long kBtLinuxStart = 594;
+    int btShift = 0;
     std::vector<uint8_t> frame;
     bool have1 = false;
     int nextField = 1;
@@ -410,8 +414,11 @@ struct Capture::Impl {
             dst += (size_t)pad * lb;
             for (int l = 0; l < fieldLines; l++) {
                 uint8_t* d = dst + (size_t)l * lb;
-                memcpy(d, src + (size_t)l * stride, sb);
-                if (sb < lb) memset(d + sb, d[sb - 1], lb - sb);   // the line end repeated up to 2048
+                const BYTE* sl = src + (size_t)l * stride;
+                const int sh = std::min(btShift, lb - 1), n = std::min(sb, lb - sh);
+                if (sh) memset(d, sl[0], sh);   // the line start (blanking) repeated in front
+                memcpy(d + sh, sl, n);
+                if (sh + n < lb) memset(d + sh + n, d[sh + n - 1], lb - sh - n);   // the line end repeated up to 2048
             }
         };
         if (n >= 2L * fieldLines * stride) {   // a whole frame in one sample
@@ -506,6 +513,14 @@ struct Capture::Impl {
             h->BufferSize = h->StrideInBytes * (b - a + 1) * 2;
             chosen.lSampleSize = h->BufferSize;
         }
+        // bt8x8 PAL: the line window where Linux bttv has it (run-in at sample ~110, where the decoders look for it).
+        // Conexant BtPCI's default line start 8.20 us puts the window 2.25 us (80 samples) later than bttv's: the
+        // run-in lands at the left edge (raster of the same tape, Windows vs Linux) -> 5.94 us asked for
+        {
+            auto* h = (KS_VBIINFOHEADER*)chosen.pbFormat;
+            bool bt = std::abs((double)h->SamplingFrequency - 35468950.0) < 2000 && h->SamplesPerLine <= 2048 && !vbi525(h);
+            if (bt && h->MinLineStartTime <= kBtLinuxStart && h->MaxLineStartTime >= kBtLinuxStart) h->ActualLineStartTime = kBtLinuxStart;
+        }
         // through the Kernel Tee (Tee/Sink-to-Sink Converter) the capture graph builder puts after the pin:
         // the bt8x8 WDM driver (Conexant BtPCI) connects straight to the grabber too but then sends nothing
         HRESULT hr = E_FAIL;
@@ -558,6 +573,11 @@ struct Capture::Impl {
             const int bytes = bt8x8 ? 2048 : srcBytes, lf = fg.linesPerFrame / 2;
             if (fg.lineBytes == bytes && lf >= fieldLines + padTop) { lay = wantLay; padLay = lf - fieldLines - padTop; }
         }
+        // a driver that kept its own line start: the lines are moved right in the frame by the difference (the
+        // samples cut on the left are lost, the run-in is back where bttv has it)
+        btShift = 0;
+        if (bt8x8 && !is525 && h->ActualLineStartTime > kBtLinuxStart)
+            btShift = std::min(256, (int)lround((h->ActualLineStartTime - kBtLinuxStart) * 1e-8 * h->SamplingFrequency));
         g = formatGeometry(lay);
         g.validSamples = srcBytes;
         if (!bt8x8) g.samplesPerLine = g.lineBytes = srcBytes;
@@ -571,6 +591,7 @@ struct Capture::Impl {
         frame.assign((size_t)g.frameBytes(), 0);
         have1 = false; nextField = 1;
         info = fmt_info(h);
+        if (btShift) info += ", lines moved " + std::to_string(btShift) + " samples to the Linux bttv place";
         freeType(chosen);
         // the picture (optional: VBI works without it)
         CoCreateInstance(kSampleGrabber, nullptr, CLSCTX_INPROC_SERVER, IID_IBaseFilter, (void**)&pgrab);
@@ -656,8 +677,8 @@ struct Capture::Impl {
         bool is525 = vbi525(h);
         int off = is525 ? 263 : 313;
         char b[160];
-        snprintf(b, sizeof b, "lines %lu-%lu / %lu-%lu, %.2f MHz, %lu samples per line", h->StartLine, h->EndLine,
-                 h->StartLine + off, h->EndLine + off, h->SamplingFrequency / 1e6, h->SamplesPerLine);
+        snprintf(b, sizeof b, "lines %lu-%lu / %lu-%lu, %.2f MHz, %lu samples per line, line start %.2f us", h->StartLine, h->EndLine,
+                 h->StartLine + off, h->EndLine + off, h->SamplingFrequency / 1e6, h->SamplesPerLine, h->ActualLineStartTime / 100.0);
         return b;
     }
 };
@@ -715,6 +736,7 @@ bool Capture::open(int index, std::string& err)
     if (index < 0 || index >= (int)ms.size()) { for (auto* m : ms) m->Release(); err = "no such capture device"; return false; }
     HRESULT hr = ms[index]->BindToObject(nullptr, nullptr, IID_IBaseFilter, (void**)&d->cap);
     for (auto* m : ms) m->Release();
+    if (hr == E_ACCESSDENIED) { err = kCaptureAccessDenied; return false; }
     if (FAILED(hr) || !d->cap) { err = "the device cannot be opened (in use by another program?)"; return false; }
     d->cardAud = hasAudioOut(d->cap);
     CoCreateInstance(CLSID_FilterGraph, nullptr, CLSCTX_INPROC_SERVER, IID_IGraphBuilder, (void**)&d->gb);

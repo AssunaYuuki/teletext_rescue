@@ -40,6 +40,7 @@ bool draw_item(LPARAM lp);
 // WM_CTLCOLOR*: цвета для подписей и полей (muted — для подписей с id из набора)
 LRESULT ctl_colour(UINT msg, WPARAM wp, LPARAM lp);
 void set_label_colour(HWND h, COLORREF c);
+void buffer_label(HWND h);   // a label drawn whole in memory: no flicker when its text changes often (a status line)
 void lv_set(HWND lv, int row, int col, const std::string &s);
 LRESULT lv_custom_draw(LPARAM lp, const std::function<COLORREF(int row)> &text_colour = nullptr);
 

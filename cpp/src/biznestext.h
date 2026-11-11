@@ -3,7 +3,7 @@
 // in teletext. The catalogue goes round on pages 600-602 (and 6B0/6B2; on 9.12.94 pages 500-509 and
 // 600-6FF, magazines 5 and 6 sent in parallel; on 9.07.94 also 7xx with blocks 101+): each transmission is a header + rows 21-23 in Hamming 8/4,
 // nibble pairs, low nibble first:
-//   row 21: AA AA AA AA (FF FF FF FF = file sent open), 8.3 file name (11 characters, no dot), 00,
+//   row 21: AA AA AA AA (a file sent open: plain spaces, no Hamming pairs), 8.3 file name (11 characters, no dot), 00,
 //           file size as a*10000 + b*100 + c (three bytes 0-99), 01
 //   row 22: 00 <blocks hi> <blocks lo> 00 00 <block being sent now>, date DDMMYY + time HHMMSS as digits,
 //           file number, type (01 binary, 04 open test, 05 text, 13 .COD)
@@ -49,6 +49,7 @@ struct BtWritten {
     // byte where the copies differ / that do not
     int sumRight = 0, sumMended = 0, sumWrong = 0;
     bool decrypted = false;
+    bool open = false;                 // sent open (not encrypted): written as it came
     // how much of the file is there and whether it checks: ARJ unpacked and every CRC-32 compared (arjcheck.cpp),
     // PCX decoded line by line, a text by the bytes that read
     double readPct = 0;                // bytes of the file received and readable, %
@@ -58,6 +59,8 @@ struct BtWritten {
     // uniform); "disk leftovers" = old contents of the sender's disk inside a file made at its size
     // (9.07.94: dictionaries, RemoteAccess BBS, Windows - its directory lists these very files)
     std::string content;
+    // a file put together from copies sent under several names (MOSCOW1-4.ARJ -> MOSCOW_combined.ARJ): their names
+    std::vector<std::string> combinedOf;
 };
 
 class BtCatalog {
@@ -95,6 +98,7 @@ private:
         std::map<int, std::map<long, int>> blockSum;   // 1994: block -> the sum of its 800 bytes as sent (row 23)
         std::set<int> sent;
         int64_t first = -1, last = -1;
+        int open = 0, closed = 0;   // transmissions whose row 21 starts AA AA AA AA (Hamming pairs: closed) / not (sent open)
     };
     struct Cur { std::string page; std::map<int, std::vector<uint8_t>> rows, data; int last = 0; bool on = false; };
     using Row40 = std::array<uint8_t, 40>;

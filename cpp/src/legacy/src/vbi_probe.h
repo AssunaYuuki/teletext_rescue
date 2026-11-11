@@ -65,4 +65,10 @@ bool vitc_slice(const std::vector<float> &y, double fs, double fh, uint8_t bytes
 // строка -> 1440 отсчётов 27 МГц (для NABTS / WST 525)
 void resample27(const Rec &R, const std::vector<float> &y, float *out);
 // телетекст PAL с любого чипа -> временная запись bt8x8 (32 × 2048, 35,47 МГц) для декодеров WST
-void wst_to_bt8x8(const Rec &R, const std::string &out, Progress &pr);
+// где в строках записи начинается вступление телетекста (отсчёт); исключение, если телетекста нет
+double wst_start(const Rec &R, Progress &pr);
+// start: уже найденное wst_start (NAN = найти). Окно строк: per записей на поле с ТВ-строк first1 / first2
+// (bttv: 16 с 7 и 320; шире, когда телетекст идёт и на строках 6, 318, 319)
+void wst_to_bt8x8(const Rec &R, const std::string &out, Progress &pr, double start = NAN, int first1 = 7, int first2 = 320, int per = 16);
+// где вступление у bt8x8 (Linux bttv): декодеры WST ждут его здесь
+const double BT8X8_WST_START = 110;

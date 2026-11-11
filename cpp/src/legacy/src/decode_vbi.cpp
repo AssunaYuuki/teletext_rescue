@@ -36,9 +36,10 @@ VbiReader::VbiReader(const std::string &path, int lpf_, bool use_gpu, Progress &
 VbiReader::~VbiReader() {}
 
 void VbiReader::set_templates(const tpl::Templates &T) { dec.set_templates(T); if (gpu) gpu->set_templates(T); }
+void VbiReader::reset_templates() { set_templates(tpl::base_templates()); fallback = false; warm.clear(); }
 
-std::vector<std::pair<int, int>> VbiReader::sample(int n_frames, int n_lines) {
-    std::mt19937 rng(0);
+std::vector<std::pair<int, int>> VbiReader::sample(int n_frames, int n_lines, unsigned seed) {
+    std::mt19937 rng(seed);
     std::vector<int> fs(N); for (int i = 0; i < N; i++) fs[i] = i;
     std::shuffle(fs.begin(), fs.end(), rng);
     fs.resize(std::min(N, n_frames)); std::sort(fs.begin(), fs.end());
@@ -133,7 +134,8 @@ int VbiReader::train(const std::vector<LineRes> &res) {
     std::vector<std::tuple<std::vector<float>, double, std::vector<u8>>> S;
     for (auto &r : res)
         if (wst_confident(r.b.data())) S.emplace_back(tpl::norm(line(r.f, r.l), 2048), r.off, bits_lsb(r.b.data(), 42));
-    if (S.size() >= 300) set_templates(tpl::train_zoned(S));
+    // 300 строк — обычный запас; на слабой записи учимся и на меньшем числе, иначе шаблоны не обновятся вовсе
+    if (S.size() >= 40) set_templates(tpl::train_zoned(S));   // слабая запись: учимся и на десятках строк
     return (int)S.size();
 }
 
@@ -190,7 +192,7 @@ double VbiReader::calibrate(const std::vector<std::pair<int, int>> &cand) {
     return med;
 }
 
-double VbiReader::prepare(const std::vector<std::pair<int, int>> &cand, bool train_) {
+double VbiReader::prepare(const std::vector<std::pair<int, int>> &cand, bool train_, bool mlse_seed) {
     auto rate = [](const std::vector<LineRes> &r) { size_t k = 0; for (auto &x : r) k += wst_confident(x.b.data()); return (double)k / std::max<size_t>(1, r.size()); };
     pr.step("calibrating the offset from the run-in");
     double off = calibrate(cand);
@@ -207,7 +209,7 @@ double VbiReader::prepare(const std::vector<std::pair<int, int>> &cand, bool tra
         for (auto &x : m) if (wst_confident(x.b.data())) ok.push_back(x);
         rm = (double)ok.size() / std::max<size_t>(1, m.size());
         pr.log(fmt("MLSE decoder without training: %.0f%% of sampled lines read confidently", rm * 100));
-        if (ok.size() >= 100) {
+        if (ok.size() >= 100 && mlse_seed) {
             warm.clear(); for (auto &x : ok) warm.push_back({x.f, x.l});
             std::vector<double> offs; for (auto &x : ok) offs.push_back(x.off);
             double med = median(offs);
@@ -229,18 +231,24 @@ double VbiReader::prepare(const std::vector<std::pair<int, int>> &cand, bool tra
     double rt = r0;
     if (train_) {
         auto res = tpl_lines(cand); rt = rate(res);
-        for (int it = 1; it < 6; it++) {
+        // on a weak recording the share read climbs slowly and dips on the way (Партнер-Телетекст 1999: 28, 25,
+        // 26, 28, 33 ... 65%): the passes go on until four in a row bring nothing, the best templates are kept
+        tpl::Templates bestT = dec.templates(); double bestR = rt; int still = 0;
+        for (int it = 1; it < 48; it++) {
             pr.step(fmt("adapting templates to the recording, pass %d", it));
-            if (train(res) < 300) { pr.log("too few confident lines \xE2\x80\x94 templates are left unchanged"); break; }
-            res = tpl_lines(cand); double prev = rt; rt = rate(res);
+            if (train(res) < 40) { pr.log("too few confident lines \xE2\x80\x94 templates are left unchanged"); break; }
+            res = tpl_lines(cand); rt = rate(res);
             pr.log(fmt("%.0f%% of sampled lines read confidently", rt * 100));
-            if (it >= 2 && rt < prev + 0.01) break;
+            if (rt > bestR + 0.005) { bestR = rt; bestT = dec.templates(); still = 0; }
+            else if (++still >= 4) break;
         }
+        if (bestR > rt) { set_templates(bestT); rt = bestR; pr.log(fmt("the best templates are kept: %.0f%%", rt * 100)); }
     }
-    if (rm >= 0 && rm > rt + 0.05) {
+    if (rm >= 0.03) {
         fallback = true;
         pr.log(fmt("on this recording the MLSE decoder is better (%.0f%% vs %.0f%%): it will read the lines the templates could not", rm * 100, rt * 100));
     }
+    rate_tpl = rt; rate_mlse = rm;
     double best = std::max(rt, rm);
     return best >= 0.03 ? best : -1;
 }
@@ -390,6 +398,31 @@ std::map<std::pair<int, int>, std::array<u8, 42>> VbiReader::decode_all(const st
     return res;
 }
 
+double train_templates(VbiReader &R, Progress &pr) {
+    auto cand = R.sample();
+    if (cand.empty()) return -2;
+    double got = R.prepare(cand, true);
+    // the templates grow from a random sample of lines and on a weak recording may stall at a few per cent
+    // (Партнер-Телетекст 1999: 14% or 74% by the sample; seeded by the MLSE lines never above 12%): when
+    // they stay below half, other samples are tried from the built-in templates and the best one is kept
+    if (got >= 0 && got < 0.5) {
+        int bestSeed = -1; double best = got;   // -1: the first calibration (MLSE seed allowed)
+        for (unsigned sd = 0; sd <= 4 && best < 0.5; sd++) {
+            pr.log(fmt("the templates stalled at %.0f%%: again from the built-in ones, sample %u", best * 100, sd + 1));
+            R.reset_templates();
+            double r = R.prepare(R.sample(1500, 2500, sd), true, false);
+            if (r > best + 0.01) { best = r; bestSeed = (int)sd; }
+            if (best >= 0.5 && bestSeed == (int)sd) break;   // the calibration just made is the one kept
+        }
+        if (best < 0.5) {   // none reached half: the best one is made again
+            R.reset_templates();
+            R.prepare(bestSeed < 0 ? cand : R.sample(1500, 2500, (unsigned)bestSeed), true, bestSeed < 0);
+        }
+        got = best;
+    }
+    return got;
+}
+
 void decode_vbi_project(const std::string &vbi_in, const std::string &out_in, int lpf, bool use_gpu, bool repair, Progress &pr,
                         const std::vector<int> *rows) {
     std::string VBI = abspath(vbi_in), OUT = abspath(out_in);
@@ -404,9 +437,9 @@ void decode_vbi_project(const std::string &vbi_in, const std::string &out_in, in
         for (int r : *rows) if (r >= 0 && r < lpf) R.only[r] = 1;
         pr.log(fmt("teletext lines only: %zu of %d lines in the frame", rows->size(), lpf));
     }
-    auto cand = R.sample();
-    if (cand.empty()) throw std::runtime_error("no lines with a teletext signal were found in the recording");
-    if (R.prepare(cand, true) < 0)
+    double got = train_templates(R, pr);
+    if (got == -2) throw std::runtime_error("no lines with a teletext signal were found in the recording");
+    if (got < 0)
         throw std::runtime_error("The decoder cannot read this recording: almost no line gave a valid address\n(neither with templates nor with the MLSE decoder). Probably a different capture format\n(sample rate, number of lines) or the signal is too distorted. If you have a .t42 stream\nfrom another program, open it with \xE2\x80\x9COpen stream .t42\xE2\x80\x9D.");
     auto res = R.decode_all();
     pr.step("writing the stream");

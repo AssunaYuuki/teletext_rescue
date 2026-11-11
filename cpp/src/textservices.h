@@ -20,6 +20,9 @@ void ccDecodeXds(const std::vector<uint8_t>& bytes, std::vector<std::string>& li
 // XDS packets with a good checksum (finds which field really is field 2).
 int ccCountXds(const std::vector<uint8_t>& bytes);
 double ccParityRatio(const std::vector<uint8_t>& bytes, const std::vector<uint8_t>& valid);
+// stretches of 4 s whose bytes are mostly not 7 bits + odd parity become nulls (0x80); -> number of good stretches,
+// share = part of the stream they cover. For a recording that changes channels: captions on some, noise on others
+int ccKeepGoodStretches(std::vector<uint8_t>& bytes, const std::vector<uint8_t>& valid, double* share);
 
 // Silent Radio: see silentradio.h
 

@@ -213,6 +213,120 @@ std::string guess_charset(const std::vector<const u8 *> &rows, int national) {
     return (sc[1] > 1.5 * sc[0] && sc[1] >= 10) ? "cyr2" : "latin";
 }
 
+double latin_first_vote(const Rows &rows, const Charset &cyr, const Charset &lat, int *nwords, int *sure) {
+    // every word of 3+ letters: how much more it looks Latin than Russian (letter pairs, the dictionaries),
+    // counted for a Latin start of the row when it stands before an even number of ESCs, against it after an odd one
+    double v = 0;
+    int n = 0;
+    for (auto &kv : rows) {
+        if (kv.first == 0) continue;   // the header: the same for every page of the magazine
+        bool mos = false, odd = false;
+        std::u32string cy, la;
+        auto flush = [&] {
+            if (cy.size() >= 3) {
+                // only words a dictionary knows vote: letter pairs alone are chance on binary pages (Бизнес-Текст
+                // 1995: random bytes voted their pages over) and on Russian words of few letters
+                // a word is the run of Cyrillic letters: ы ш щ ч э ю ъ read in Latin as & { } ~ | ` ', so a Latin
+                // reading with those inside is no English word - a Russian one (сырое / s&roe; cutting the word
+                // there left "рое" / "roe", which the English dictionary knows)
+                bool sym = false;
+                for (char32_t x : la) sym |= !((x | 0x20) >= 'a' && (x | 0x20) <= 'z');
+                bool en = false;
+                double s = sym ? -99 : latin_score(cy, la, &en);
+                if (en && la.size() < 4) en = false;   // 3-letter English words are Russian syllables too (топ, фар)
+                if (getenv("TR_SWAP_WORDS")) fprintf(stderr, "  %s / %s: %.2f%s%s\n", from_u32(cy).c_str(), from_u32(la).c_str(), s, en ? " en" : "", odd ? " (after ESC)" : "");
+                if (s <= -50 || en) {
+                    // a word the dictionary knows where a Latin start of the row puts it: English before an even
+                    // number of ESCs, Russian (not only "has ы ш щ") after an odd one - binary pages have none
+                    if (sure && ((en && !odd) || (s <= -50 && !sym && odd))) (*sure)++;
+                    s = s <= -50 ? -3.0 : 2.0;   // a Russian word / an English one
+                    v += odd ? -s : s;
+                    n++;
+                }
+            }
+            cy.clear(); la.clear();
+        };
+        for (int c = 0; c < 40; c++) {
+            int ch = kv.second[c] & 0x7F;
+            if (ch < 0x20) {
+                flush();
+                if (ch <= 0x07) mos = false;
+                else if (ch >= 0x10 && ch <= 0x17) mos = true;
+                else if (ch == 0x1B) odd = !odd;
+                continue;
+            }
+            if (mos && (ch & 0x20)) { flush(); continue; }
+            char32_t a = cyr[ch - 0x20], b = lat[ch - 0x20];
+            if (a >= 0x400 && a <= 0x4FF) { cy += a; la += b; }   // (■ at 0x7F is no letter)
+            else flush();
+        }
+        flush();
+    }
+    if (nwords) *nwords = n;
+    return v;
+}
+
+bool rows_start_latin(const std::vector<const Rows *> &versions, const Charset &cyr, const Charset &lat, bool nat0, double *vote, int *words) {
+    double v = 0;
+    int n = 0, sure = 0;
+    for (const Rows *r : versions) {
+        int k = 0;
+        v += latin_first_vote(*r, cyr, lat, &k, &sure);
+        n += k;
+    }
+    if (vote) *vote = v;
+    if (words) *words = n;
+    if (sure < 2) return false;   // no dictionary word for a Latin start: binary pages, test patterns
+    // only a clear vote turns a page (Телеэкспо 1999 264, ТВЦ 1998 252 sit at national option 0 and are Cyrillic);
+    // option 0 on a page of a stream of option 4 asks for less
+    return v > std::max(nat0 ? 1.0 : 3.0, (nat0 ? 0.1 : 0.3) * n);
+}
+
+int words_known(const Rows &rows, const Charset &t, const Charset *t2) {
+    static const std::set<std::string> lat = [] {
+        std::set<std::string> s(std::begin(WORDS_LATIN), std::end(WORDS_LATIN));
+        for (const char *w : {"with", "from", "you", "your", "this", "that", "are", "all", "new", "information", "company", "firm",
+                              "in", "on", "is", "by", "or", "an", "at", "our", "we", "can", "will", "has", "not", "be"}) s.insert(w);
+        return s;
+    }();
+    static const std::set<std::string> cyr = [] {
+        std::set<std::string> s(std::begin(WORDS_CYR), std::end(WORDS_CYR));
+        s.insert(std::begin(WORDS_CYR3), std::end(WORDS_CYR3));
+        for (const char *w : {"а", "у", "об", "или", "же", "уже", "руб", "тыс", "млн", "тел", "цена", "курс", "москва", "москве",
+                              "фирма", "фирмы", "компания", "продукции", "тел", "факс", "адрес", "мин", "час", "день", "года", "г"}) s.insert(w);
+        return s;
+    }();
+    int n = 0;
+    for (auto &kv : rows) {
+        const Charset *cs = &t;
+        bool mos = false;
+        std::u32string w;
+        auto flush = [&] {
+            if (w.size() >= 1) {
+                std::string x = lower(from_u32(w));
+                for (auto &c : x) c = (char)std::tolower((unsigned char)c);
+                n += (*cs)[0x21] >= 0x400 ? cyr.count(x) : lat.count(x);
+            }
+            w.clear();
+        };
+        for (int c = 0; c < 40; c++) {
+            int ch = kv.second[c] & 0x7F;
+            if (ch < 0x20) {
+                flush();
+                if (ch <= 0x07) mos = false;
+                else if (ch >= 0x10 && ch <= 0x17) mos = true;
+                else if (ch == 0x1B && t2) cs = cs == &t ? t2 : &t;
+                continue;
+            }
+            if (mos && (ch & 0x20)) { flush(); continue; }
+            char32_t u = (*cs)[ch - 0x20];
+            if (word_char(u) && !(u >= '0' && u <= '9')) w += u; else flush();
+        }
+        flush();
+    }
+    return n;
+}
+
 char32_t g2_extract(int code) { return code >= 0x20 && code < 0x80 ? G2_EXTRACT[code - 0x20] : 0; }
 char32_t diacritic_mark(int mode) { return mode >= 0 && mode < 16 ? DIA_MARK[mode] : 0; }
 

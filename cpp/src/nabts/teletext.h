@@ -51,6 +51,18 @@ using Over = std::map<std::pair<int, int>, std::string>;   // поправки X
 std::vector<Cell> level1_cells(const Rows &rows, const Charset &t, const Charset *t2, const Over *over,
                                bool *has_flash = nullptr, bool *has_box = nullptr);
 std::map<int, std::string> row_texts(const Rows &rows, const Charset &t, const Charset *t2, const Over *over);
+// words of the rows that a short dictionary knows, read with set t at the start of each row and ESC switching to t2:
+// tells which of the two sets a page starts its rows in (Ostankino 1993: pages with national option 0 start in Latin)
+int words_known(const Rows &rows, const Charset &t, const Charset *t2);
+// > 0: the words of the rows read better with Latin at the start of each row and ESC to Cyrillic than the other way
+// round (latin_score of every word of 3+ letters, -3..3); nwords: the words counted
+// sure: words a dictionary knows that only a Latin start explains (English before ESC, Russian after it)
+double latin_first_vote(const Rows &rows, const Charset &cyr, const Charset &lat, int *nwords = nullptr, int *sure = nullptr);
+// a Cyrillic page whose rows start in Latin, ESC to Cyrillic (Russian teletext without X/28: the receivers took that
+// from the national option, 0 against the usual 4). versions: the copies of the page; nat0: its option is 0 in a
+// stream of another one
+bool rows_start_latin(const std::vector<const Rows *> &versions, const Charset &cyr, const Charset &lat, bool nat0,
+                      double *vote = nullptr, int *words = nullptr);
 // Russian teletext writes English names with the Latin letters of the same codes (no ESC to a second set):
 // how much more the word looks English read in Latin than Russian read in Cyrillic (mean log probability
 // of its letter pairs, abc_pairs.inc), -99 when the Russian dictionary knows it or a letter is outside

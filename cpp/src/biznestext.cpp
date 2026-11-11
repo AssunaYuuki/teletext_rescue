@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 
 namespace {
 // Hamming 8/4 with one bit corrected
@@ -94,6 +95,13 @@ void BtCatalog::packet(const uint8_t* p, int64_t frame)
     for (auto& c : name) c = (char)toupper((unsigned char)c);
     Entry& e = entries_[name];
     e.n++;
+    {
+        // closed: AA AA AA AA in Hamming pairs; open (BTEST on 25.05.96): plain spaces there, no Hamming pairs
+        int aa = 0;
+        for (int k = 0; k < 4; k++) aa += pairAt(r21, k) == 0xAA;
+        if (aa >= 3) e.closed++;
+        else e.open++;
+    }
     if (page.find('?') == std::string::npos) e.page[page]++;
     if (e.first < 0) e.first = frame;
     e.last = frame;
@@ -374,11 +382,16 @@ std::vector<int> findKey(const std::vector<KBlock>& B, int len)
         for (auto& b : B) for (int o = 0; o < 800; o++) if (b.c[o] >= 0) { u[b.c[o] ^ K[b.base + o]]++; t++; }
         for (int i = 0; i < 256; i++) lu[i] = std::log(u[i] / t);
     };
-    for (int it = 0; it < 2; it++) {
+    // until the reading settles (two rounds were not enough where a letter is about as common as the space: the
+    // start "commonest = space" is then wrong at half the places, every one by the same XOR, and the bigram rounds below
+    // kept it)
+    for (int it = 0; it < 8; it++) {
         unigram();
         std::vector<int> nk(len);
         for (int k = 0; k < len; k++) nk[k] = pick(k, [&](int, int, int p) { return lu[p]; }, all);
+        bool same = nk == K;
         K = nk;
+        if (same && it >= 1) break;
     }
     // the case bit (0x20 tells "e" from "E", "р" from "└", a space from 00)
     std::vector<double> pr(256, std::log(0.05));
@@ -390,6 +403,18 @@ std::vector<int> findKey(const std::vector<KBlock>& B, int len)
     for (int c = 0x80; c < 0xA0; c++) pr[c] = std::log(1.5);
     for (const char* q = "0123456789.,;:-()\"'!?/*"; *q; q++) pr[(uint8_t)*q] = 0;
     pr[13] = pr[10] = 0;
+    // the whole key moved by one XOR can read as consistently as the true one (a Russian text: 88 swaps the space
+    // with "и" and "а о е" with "( & -"); the prior of a DOS text decides between such readings
+    {
+        int bestD = 0;
+        double bestS = -1e300;
+        for (int d = 0; d < 256; d++) {
+            double s = 0;
+            for (auto& b : B) for (int o = 0; o < 800; o++) if (b.c[o] >= 0) s += pr[b.c[o] ^ K[b.base + o] ^ d];
+            if (s > bestS) { bestS = s; bestD = d; }
+        }
+        if (bestD) for (auto& k : K) k ^= bestD;
+    }
     for (int k = 0; k < len; k++) K[k] = pick(k, [&](int, int, int p) { return pr[p]; }, {K[k], K[k] ^ 0x20});
     for (int it = 0; it < 3; it++) {
         unigram();
@@ -717,6 +742,72 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
         for (auto& kv : to)   // a chain (A -> B -> C) ends at its last name
             for (int i = 0; i < 8 && !kv.second.empty() && to.count(kv.second) && to[kv.second] != kv.second; i++) kv.second = to[kv.second];
     }
+    // one file sent under several names (29.12.95: MOSCOW1-4.ARJ, PCXPIC1-4.ARJ - the same size and date, and as sent
+    // 66-80% the same bytes, the rest tape errors; two different files share 0.4%): all their copies voted together into
+    // <name>_combined, next to the files themselves
+    std::map<std::string, std::string> catOfName;   // combined name -> the member whose catalogue entry it takes
+    std::map<std::string, std::vector<std::string>> groups;
+    {
+        auto sizeOf = [&](const std::string& n) { auto e = entries_.find(n); return e != entries_.end() ? best<long>(e->second.size, -1L) : -1L; };
+        auto dateOf = [&](const std::string& n) { auto e = entries_.find(n); return e != entries_.end() ? best<std::string>(e->second.date, std::string()) : std::string(); };
+        std::vector<std::string> names;
+        for (auto& kv : data_) if (to[kv.first] == kv.first && !kv.first.empty()) names.push_back(kv.first);
+        std::map<std::string, std::string> root;
+        for (auto& nm : names) root[nm] = nm;
+        std::function<std::string(const std::string&)> find = [&](const std::string& x) { return root[x] == x ? x : root[x] = find(root[x]); };
+        for (size_t i = 0; i < names.size(); i++)
+            for (size_t j = i + 1; j < names.size(); j++) {
+                const std::string &a = names[i], &b = names[j];
+                long sa = sizeOf(a);
+                if (sa <= 0 || sa != sizeOf(b) || dateOf(a) != dateOf(b)) continue;
+                long n = 0;
+                double ag = 0;
+                {
+                    long eq = 0;
+                    for (auto& blk : data_.at(a)) {
+                        auto ib = data_.at(b).find(blk.first);
+                        if (ib == data_.at(b).end()) continue;
+                        for (auto& r : blk.second) {
+                            auto ir = ib->second.find(r.first);
+                            if (ir == ib->second.end()) continue;
+                            std::vector<const Copy*> ca, cb;
+                            for (auto& x : r.second) ca.push_back(&x);
+                            for (auto& x : ir->second) cb.push_back(&x);
+                            auto va = voteRow(ca), vb = voteRow(cb);
+                            for (int k = 0; k < 40; k++) { n++; eq += (va[k] & 0xFF) == (vb[k] & 0xFF); }
+                        }
+                    }
+                    ag = n ? (double)eq / n : 0;
+                }
+                if (n >= 400 && ag >= 0.3) root[find(a)] = find(b);
+            }
+        std::map<std::string, std::vector<std::string>> by;
+        for (auto& nm : names) by[find(nm)].push_back(nm);
+        for (auto& g : by) {
+            if (g.second.size() < 2) continue;
+            std::sort(g.second.begin(), g.second.end());
+            // MOSCOW1.ARJ + MOSCOW2.ARJ -> MOSCOW_combined.ARJ
+            const std::string& f0 = g.second.front();
+            size_t dot = f0.rfind('.');
+            std::string stem = dot == std::string::npos ? f0 : f0.substr(0, dot), ext = dot == std::string::npos ? "" : f0.substr(dot);
+            size_t common = stem.size();
+            for (auto& m : g.second) {
+                size_t k = 0;
+                while (k < common && k < m.size() && m[k] == stem[k]) k++;
+                common = k;
+            }
+            std::string base = stem.substr(0, common);
+            while (!base.empty() && (base.back() == '_' || base.back() == '-')) base.pop_back();
+            if (base.empty()) base = stem;
+            std::string cn = base + "_combined" + ext;
+            catOfName[cn] = f0;
+            groups[cn] = g.second;
+        }
+    }
+    auto entryOf = [&](const std::string& n) {
+        auto c = catOfName.find(n);
+        return entries_.find(c != catOfName.end() ? c->second : n);
+    };
     // file -> block -> 800 bytes voted over the copies (-1 = row not received)
     std::map<std::string, std::map<int, std::map<int, std::vector<const Copy*>>>> cp;
     for (auto& kv : data_)
@@ -731,6 +822,8 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
                     int count = e != entries_.end() ? best<int>(e->second.blocks, -1) : -1;
                     if (count > 0 && b.first > count) continue;
                     cp[nm][b.first][r.first].push_back(&x);
+                    for (auto& g : groups)
+                        if (std::find(g.second.begin(), g.second.end(), nm) != g.second.end()) cp[g.first][b.first][r.first].push_back(&x);
                 }
     std::map<std::string, std::map<int, Blk>> F;
     std::map<std::string, std::map<int, std::array<int16_t, 800>>> alt;   // the byte of the next commonest copy (-1 = none)
@@ -755,17 +848,35 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
     if (F.empty()) return out;
     // 1996: Hamming codewords spread over the columns (most received codewords valid under one key)
     std::vector<const Blk*> all;
-    for (auto& f : F) for (auto& b : f.second) all.push_back(&b.second);
+    // a file sent open (row 21 FF FF FF FF: BTEST1-4.TXT on 25.05.96, "Блок 0005,Строка  2 ABC..") is plain text:
+    // it is written as it came and kept out of the key search (its text made a false key fit, which then spoiled
+    // it and every closed file)
+    auto isOpen = [&](const std::string& n) {
+        auto c = catOfName.find(n);
+        auto e = entries_.find(c != catOfName.end() ? c->second : n);
+        return e != entries_.end() && e->second.open > e->second.closed;
+    };
+    for (auto& f : F)
+        if (!isOpen(f.first)) for (auto& b : f.second) all.push_back(&b.second);
     std::array<uint8_t, 800> base{};
     say(fmt("%zu blocks of %zu files: which form of the service (1994 / 1996)", all.size(), F.size()));
     // a clean recording gives > 80% valid codewords, a tape received live much less (bit errors, split copies);
     // from 30% on the 1996 key is looked for, and a key under which a file reads as DOS text with lines decides
     double s96 = all.size() >= 8 ? base96(all, base) : 0;
+    if (getenv("TR_BT96DEBUG"))
+        for (auto& f : F) {
+            std::vector<const Blk*> one;
+            for (auto& b : f.second) one.push_back(&b.second);
+            std::array<uint8_t, 800> tmp{};
+            say(fmt("  %s: %zu blocks, %.0f%% codewords valid", f.first.c_str(), one.size(), 100 * base96(one, tmp)));
+        }
     bool v96 = s96 > 0.8;
     Key96 k96;
     if (s96 > 0.3) {
         say(fmt("%.0f%% of the codewords can be valid: trying the 1996 form (two Hamming 8/4 codewords a byte)", 100 * s96));
-        k96 = findKey96(F, base);
+        std::map<std::string, std::map<int, Blk>> closedF;
+        for (auto& f : F) if (!isOpen(f.first)) closedF[f.first] = f.second;
+        k96 = findKey96(closedF, base);
         if (!k96.from.empty()) v96 = true;
     }
     say(v96 ? "1996 form (two Hamming 8/4 codewords a byte)" : "1994 form (800-byte blocks): finding the key from the text of the files");
@@ -776,10 +887,27 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
     for (int per : {1, 8}) {
         if (v96) break;
         std::vector<KBlock> B;
+        // each file once: copies of one file under several names give the same bytes at the same places, and that
+        // false "most common value" would fit the key to them (the combined file stands for its copies)
+        std::set<std::string> member;
+        for (auto& g : groups) for (auto& m : g.second) member.insert(m);
         for (auto& f : F)
+            if (!member.count(f.first) && !isOpen(f.first))
             for (auto& b : f.second) {
                 KBlock k{((b.first - 1) % per) * 800, {}};
                 for (int o = 0; o < 800; o++) k.c[o] = (int16_t)(b.second[o] < 0 ? -1 : b.second[o] & 0xFF);
+                // rows of the transmitter's filler (zeros, a running bit 01 02 04 .. 80) are not encrypted: in the key
+                // search they make the key "20 20 20 .." (29.12.95: a batch of packed files and empty .COD records)
+                for (int r = 0; r < 20; r++) {
+                    int fill = 0, got = 0;
+                    for (int c = 0; c < 40; c++) {
+                        int v = k.c[r * 40 + c];
+                        if (v < 0) continue;
+                        got++;
+                        fill += v == 0 || (v & (v - 1)) == 0;
+                    }
+                    if (got && fill >= got * 9 / 10) for (int c = 0; c < 40; c++) k.c[r * 40 + c] = -1;
+                }
                 B.push_back(k);
             }
         long n = 0;
@@ -789,19 +917,40 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
         long t = 0;
         for (auto& b : B) for (int o = 0; o < 800; o++) if (b.c[o] >= 0) t += textByte(b.c[o] ^ k[b.base + o]);
         double share = (double)t / n;
-        if (share > 0.6 && share > bestText + 0.03) { bestText = share; K = k; P = per; }
+        // random bytes are ~64% "DOS text" codes, so the share over everything passes for packed files too (29.12.95:
+        // a batch of archives got a key "20 20 20 .."): the key must make at least one file of 4+ blocks read as text
+        double fileBest = 0;
+        for (auto& f : F) {
+            if (f.second.size() < 4 || isOpen(f.first)) continue;
+            long ft = 0, fn = 0;
+            for (auto& b : f.second)
+                for (int r = 0; r < 20; r++) {
+                    int fill = 0, got = 0;
+                    for (int c = 0; c < 40; c++) { int v = b.second[r * 40 + c]; if (v < 0) continue; got++; v &= 0xFF; fill += v == 0 || (v & (v - 1)) == 0; }
+                    if (!got || fill >= got * 9 / 10) continue;
+                    for (int c = 0; c < 40; c++) {
+                        int v = b.second[r * 40 + c];
+                        if (v < 0) continue;
+                        fn++;
+                        ft += textByte((v & 0xFF) ^ k[((b.first - 1) % per) * 800 + r * 40 + c]);
+                    }
+                }
+            if (fn >= 800) fileBest = std::max(fileBest, (double)ft / fn);
+        }
+        if (share > 0.6 && fileBest >= 0.85 && share > bestText + 0.03) { bestText = share; K = k; P = per; }
     }
     note = v96 ? fmt("each byte sent as two Hamming 8/4 codewords spread down the columns (400 bytes a block); key of 800 codewords "
                      "found from the text of %s (%.0f%% of its bytes read as DOS text)", k96.from.c_str(), 100 * k96.text)
          : P ? fmt("key of %d bytes found from the text of the files (%.0f%% of the bytes read as DOS text)", 800 * P, 100 * bestText)
-             : std::string("encrypted; too little of the files received to find the key");
+             : std::string("not decrypted: no file of this batch reads as text under any key (the key is found from a text "
+                           "file; packed files and empty records cannot give it), or too little received");
     if (v96 && k96.from.empty()) note = "each byte sent as two Hamming 8/4 codewords (1996); no file reads as text to find the key";
     // 1994: a block whose bytes as sent do not add up to the catalogue's sum (row 23) is mended when exactly one byte
     // where the copies differ makes it right with the other copy's value
     std::map<std::string, std::array<int, 3>> sumStat;   // file -> right, mended, wrong
     if (!v96)
         for (auto& f : F) {
-            auto e = entries_.find(f.first);
+            auto e = entryOf(f.first);
             if (e == entries_.end()) continue;
             for (auto& b : f.second) {
                 auto s = e->second.blockSum.find(b.first);
@@ -820,9 +969,15 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
                 else st[2]++;
             }
         }
-    const int bb = v96 ? 400 : 800;   // file bytes a block
+    const int bbAll = v96 ? 400 : 800;   // file bytes a block
+    const int bb = bbAll;
     // the file's bytes of a block, -1 = not received / not readable
-    auto plain = [&](int blk, const Blk& raw) {
+    auto plain = [&](int blk, const Blk& raw, bool open) {
+        if (open) {   // as it came, 800 bytes a block
+            std::vector<int16_t> d(800, -1);
+            for (int o = 0; o < 800; o++) if (raw[o] >= 0) d[o] = (int16_t)(raw[o] & 0xFF);
+            return d;
+        }
         std::vector<int16_t> d(bb, -1);
         if (v96) {
             if (k96.from.empty()) return d;
@@ -836,12 +991,16 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
     std::string rep;
     size_t fileNo = 0;
     for (auto& f : F) {
-        say(fmt("decrypting and writing %s (%zu of %zu, %zu blocks)", f.first.c_str(), ++fileNo, F.size(), f.second.size()));
+        const bool open = isOpen(f.first);
+        const int bb = open ? 800 : bbAll;   // a file sent open: 800 file bytes a block in any form
+        say(fmt(open ? "writing %s as sent - it was sent open (%zu of %zu, %zu blocks)" : "decrypting and writing %s (%zu of %zu, %zu blocks)",
+                f.first.c_str(), ++fileNo, F.size(), f.second.size()));
         BtWritten w;
         w.name = f.first;
         w.blockBytes = bb;
+        if (groups.count(f.first)) w.combinedOf = groups.at(f.first);
         if (sumStat.count(f.first)) { auto& st = sumStat[f.first]; w.sumRight = st[0]; w.sumMended = st[1]; w.sumWrong = st[2]; }
-        auto e = entries_.find(f.first);
+        auto e = entryOf(f.first);
         if (e != entries_.end()) w.blocks = best<int>(e->second.blocks, -1);
         long size = e != entries_.end() ? best<long>(e->second.size, -1L) : -1;
         // the blocks the file really has: its size in blocks (9.07.94: the catalogue's count is 156 more for every
@@ -851,9 +1010,10 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
         int nb = std::max(last, w.blocks);
         // one key for all files: every file is decrypted (PASSWORD.COD then shows its repeating structure);
         // a text of its own (.txt) when the most of it reads as DOS text
-        w.decrypted = v96 ? !k96.from.empty() : P != 0;
+        w.decrypted = !open && (v96 ? !k96.from.empty() : P != 0);
+        w.open = open;
         std::map<int, std::vector<int16_t>> D;
-        for (auto& b : f.second) D[b.first] = plain(b.first, b.second);
+        for (auto& b : f.second) D[b.first] = plain(b.first, b.second, open);
         // a block carrying another block's data (25.05.96: "block 12" of PAGE350.PCX = block 28, "113" of TOWER350.PCX
         // = 129, each sent whole on page 601 - the generator's page changed before its catalogue rows) is not the
         // block it says: always the data of the block 16 further on (the round of 16 pages), so block b is taken as
@@ -872,7 +1032,7 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
             }
         }
         bool isText = false;
-        if (w.decrypted) {
+        if (w.decrypted || open) {
             long t = 0, n = 0;
             for (auto& b : D) for (auto v : b.second) if (v >= 0) { n++; t += textByte(v); }
             isText = n && t >= 0.6 * n;
@@ -889,7 +1049,9 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
             }
             // random bytes are 64% "DOS text" codes: packed data is no text
             if (packed + other && packed >= 0.9 * (packed + other)) isText = false;
-            if (packed + other)
+            if (open)
+                w.content = isText ? "sent open (text)" : "sent open";
+            else if (packed + other)
                 w.content = v96 ? (packed >= 0.9 * (packed + other) ? "compressed (archive / packed)" : isText ? "text" : "data")
                           : packed >= 0.9 * (packed + other) ? "compressed data of the service"
                           : other >= 0.9 * (packed + other) ? (isText ? "disk leftovers (text)" : "disk leftovers")
@@ -961,9 +1123,45 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
         }
         // how much is there, and does it check
         w.readPct = bin.empty() ? 0 : 100.0 * (double)((long)bin.size() - std::min<long>(bad, (long)bin.size())) / bin.size();
-        if (bin.size() >= 4 && bin[0] == 0x60 && bin[1] == 0xEA) {
-            ArjCheck a = arjCheck(bin);
+        // an ARJ archive also when its start did not come (by its name, its files from the first header that checks);
+        // the rows not received are told to the unpacking, which goes on past them
+        std::vector<char> lostMask(txtIn.size(), 0);
+        for (size_t k = 0; k < txtIn.size(); k++) lostMask[k] = txtIn[k] < 0;
+        bool arjName = w.name.size() > 4 && (w.name.compare(w.name.size() - 4, 4, ".ARJ") == 0 || w.name.compare(w.name.size() - 4, 4, ".arj") == 0);
+        ArjCheck arjTry;
+        bool startArj = bin.size() >= 4 && bin[0] == 0x60 && bin[1] == 0xEA;
+        if (bin.size() >= 4 && !startArj && arjName && w.decrypted) {
+            arjTry = arjCheck(bin, &lostMask);
+            // an .ARJ begins with 60 EA: two damaged bytes there must not hide the archive (its header's CRC then
+            // tells whether it is one)
+            if (!arjTry.archive) {
+                std::vector<uint8_t> t = bin;
+                t[0] = 0x60; t[1] = 0xEA;
+                std::string lg;
+                arjRepair(t, &lostMask, nullptr, lg, 5);
+                ArjCheck c2 = arjCheck(t, &lostMask);
+                if (c2.archive && c2.headerOk) { bin.swap(t); startArj = true; }
+            }
+        }
+        if (startArj || arjTry.archive) {
+            // files inside that do not check: bytes the copies read differently, a tape's one-bit errors and one or
+            // two bytes not received, chosen by each file's CRC-32
+            std::vector<std::vector<uint8_t>> alts;
+            if (!v96 && P && alt.count(f.first)) {
+                alts.assign(bin.size(), {});
+                for (auto& ab : alt.at(f.first))
+                    for (int o = 0; o < 800; o++) {
+                        int v = ab.second[o];
+                        long idx = (long)(ab.first - 1) * 800 + o;
+                        if (v >= 0 && idx >= 0 && idx < (long)bin.size()) alts[idx].push_back((uint8_t)(v ^ K[((ab.first - 1) % P) * 800 + o]));
+                    }
+            }
+            std::string mendLog;
+            int mended = w.decrypted ? arjRepair(bin, &lostMask, alts.empty() ? nullptr : &alts, mendLog) : 0;
+            if (mended) write_file(w.path, bin);
+            ArjCheck a = (arjTry.archive && !mended) ? arjTry : arjCheck(bin, &lostMask);
             w.check = a.summary();
+            if (mended) w.check += fmt("; %d file(s) inside mended by their CRC", mended);
             for (auto& e : a.files) if (!e.ok) w.check += "; " + e.name + ": " + e.why;
             w.checkOk = a.archive && a.headerOk && a.complete && !a.files.empty() && a.good() == (int)a.files.size();
             // unpacked even when damaged (7-Zip refuses it): whole files, and the rest as far as it unpacks
@@ -1004,7 +1202,7 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
                 write_file(path_join(path_join(dir, "leftovers"), safe + ".txt"), lo.data(), lo.size());
             }
         }
-        rep += fmt("%-14s %-32s %s  blocks %d of %d, rows %d of %d", w.name.c_str(), w.content.c_str(), w.decrypted ? "decrypted" : "as sent  ", w.blocksHave,
+        rep += fmt("%-14s %-32s %s  blocks %d of %d, rows %d of %d", w.name.c_str(), w.content.c_str(), w.decrypted ? "decrypted" : w.open ? "open     " : "as sent  ", w.blocksHave,
                    std::max(nb, 0), w.rowsHave, w.rows) + (w.rowsBad ? fmt(" (%d spoiled rows left out)", w.rowsBad) : std::string()) +
                (bad ? fmt(", %ld bytes missing or not readable", bad) : std::string()) +
                (w.sumRight + w.sumMended + w.sumWrong ? fmt(", block sums %d right, %d mended, %d wrong", w.sumRight, w.sumMended, w.sumWrong) : std::string()) + (size > 0 ? fmt(", %ld bytes by the catalogue", size) : std::string()) +
@@ -1044,5 +1242,9 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
     else if (P)
         for (size_t i = 0; i < K.size(); i++) ks += fmt("%02X%s", K[i], i % 40 == 39 ? "\n" : " ");
     if (!ks.empty()) write_file(path_join(dir, "key.txt"), ks.data(), ks.size());
+    else {   // no key this time: a key.txt of an earlier run would say the files were decrypted with it
+        std::error_code ec;
+        std::filesystem::remove(std::filesystem::u8path(path_join(dir, "key.txt")), ec);
+    }
     return out;
 }

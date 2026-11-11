@@ -229,6 +229,7 @@ struct GuideWin : Window {
                 fill(dc, b, bg);
                 if (s.flags & 0x40) { RECT pb{b.left, b.bottom - S(hwnd, 3), b.right, b.bottom}; fill(dc, pb, C_PAY); }
                 std::string t = R->db.titleOf(s);
+                if (!t.empty() && t[0] == '#') t += fmt("  \xC2\xB7  %d min", s.duration);   // названия нет — показываем хотя бы длительность
                 if (s.start < view) t = "\xE2\x97\x80 " + t;
                 RECT tr{b.left + S(hwnd, 8), b.top, b.right - S(hwnd, 4), b.bottom};
                 draw_text(dc, tr, t, is_sel ? BG : past ? MUTED : FG, is_sel ? smallb : norm, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -245,7 +246,7 @@ struct GuideWin : Window {
         const SsSlot *s = selected();
         int ix = info.left + S(hwnd, 18), iy = info.top + S(hwnd, 10);
         if (!s) { text_out(dc, ix, iy, chans.empty() ? "" : "no show at this time on " + cname(chans[sel]), MUTED, norm); return; }
-        text_out(dc, ix, iy, R->db.titleOf(*s), FG, mid); iy += S(hwnd, 30);
+        text_out(dc, ix, iy, R->db.titleOf(*s)[0] == '#' ? "Programme " + R->db.titleOf(*s) : R->db.titleOf(*s), FG, mid); iy += S(hwnd, 30);
         std::string when = tlabel(s->start) + " \xE2\x80\x93 " + tlabel(s->start + s->duration) + "   \xC2\xB7   " + dlabel(s->start) + "   \xC2\xB7   " + cname(chans[sel]) + fmt("  (%d)", chans[sel] % 1000);
         text_out(dc, ix, iy, when, ACCENT2, norm);
         // what follows on the same channel
@@ -275,6 +276,8 @@ struct GuideWin : Window {
         if (d && !d->text.empty()) desc = d->partial ? d->text + "\xE2\x80\xA6" : d->text;
         else if (d && d->compressed) desc = "The description is Huffman-compressed with codes not recovered yet.";
         else if (s->description) desc = fmt("Description #%d was not received in this recording.", s->description);
+        else if (R->db.programs.empty()) desc = "This recording carries the schedule but no titles: StarSight sends them in separate \"show title\" messages, "
+                                                "and none of those arrived while this file was recorded. A longer recording, or one made where the titles cycle, fills them in.";
         else desc = "No description was sent for this show.";
         if (d && !d->advisories.empty()) { desc += "\nAdvisory:"; for (auto &a : d->advisories) desc += " " + a; }
         RECT dr{ix, iy, info.right - S(hwnd, 18), info.bottom - S(hwnd, 8)};
@@ -286,7 +289,8 @@ struct GuideWin : Window {
         case WM_CREATE:
             dark_window(hwnd);
             build();
-            hd.create(hwnd, "StarSight", fmt("programme guide \xC2\xB7 %zu channels \xC2\xB7 ", chans.size()) + file_name(*R));
+            hd.create(hwnd, "StarSight", fmt("programme guide \xC2\xB7 %zu channels \xC2\xB7 ", chans.size()) +
+                                                (R->db.programs.empty() ? std::string("no titles in this recording \xC2\xB7 ") : std::string()) + file_name(*R));
             hd.add(hwnd, 401, "Now", 80);
             hd.add(hwnd, 402, "Export JSON\xE2\x80\xA6", 130);
             hd.add(hwnd, 403, "Text report", 120);
@@ -985,6 +989,7 @@ struct GemWin : Window {
     Header hd; HWND lst = nullptr, spanBtn = nullptr, busyBtn = nullptr;
     RECT card{}, days{}, ruler{}, grid{}, info{};
     int rowh = 32, chw = 100;
+    std::map<int, const GemstarText*> rowText;   // строка списка -> статья гида, которую она открывает
 
     static std::string tlabel(int64_t t) { int h = (int)(t / 60 % 24), m = (int)(t % 60); return fmt("%d:%02d %s", h % 12 == 0 ? 12 : h % 12, m, h < 12 ? "AM" : "PM"); }
     static std::string dlabel(int64_t t) { int y, m, d, wd; civil_from_days(t / 1440, y, m, d, wd); return fmt("%s %d %s %d", DAYS[wd], d, MONTHS[m - 1], y); }
@@ -1218,6 +1223,7 @@ struct GemWin : Window {
     {
         double fr = frame_rate(*R);
         int i = 0;
+        rowText.clear();
         auto row = [&](const std::string &t, const std::string &where, const std::string &kind, const std::string &block, const std::string &host,
                        const std::string &content, int copies, COLORREF c) {
             lv_set(lst, i, 0, t); lv_set(lst, i, 1, where); lv_set(lst, i, 2, kind); lv_set(lst, i, 3, block); lv_set(lst, i, 4, host);
@@ -1239,13 +1245,20 @@ struct GemWin : Window {
                 } else row(rec_time(p.frame / fr), where, fmt("type %02X", p.type), "", "", p.text(), p.copies, FG);
             }
             // Type B: what gemstarGuide read from the download blocks
-            bool typeB = false;
             for (auto &l : s.guide) {
                 std::string t = trim_sp(l);
                 if (t.rfind("payload scrambled", 0) == 0) { if (keyNote.empty()) keyNote = "Type A " + t; continue; }
-                if (t.rfind("Type B", 0) == 0) typeB = true;
-                if (!typeB || t.empty() || t == "Other messages:") continue;
-                row("", where, "Type B", "", "", t, 1, ACCENT2);
+                if (t.rfind("Type B", 0) == 0 || t.rfind("Programmes", 0) == 0 || t.rfind("themes:", 0) == 0)
+                    row("", where, "Type B", "", "", t, 1, ACCENT2);
+            }
+            // статьи гида (анонсы фильмов, топ книг, справки) — одна строка на сообщение,
+            // полный текст открывается двойным щелчком
+            for (auto &gt : s.texts) {
+                std::string head = gt.lines.empty() ? std::string() : gt.lines.front();
+                if (gt.lines.size() > 1) head = head + "  \xE2\x80\xA6";
+                rowText[i] = &gt;
+                row(rec_time(gt.frame / fr), where, fmt("Guide text %02X", gt.type), fmt("%zu B", gt.bytes), "", head,
+                    (int)gt.lines.size(), ACCENT);
             }
         }
     }
@@ -1337,6 +1350,17 @@ struct GemWin : Window {
             auto *nh = (NMHDR *)l;
             if (lst && nh->hwndFrom == lst && nh->code == NM_CUSTOMDRAW)
                 return lv_custom_draw(l, [this](int row) { return row >= 0 && row < (int)rowColour.size() ? rowColour[row] : FG; });
+            if (lst && nh->hwndFrom == lst && nh->code == NM_DBLCLK) {   // статья гида — целиком, как текст
+                int r = ListView_GetNextItem(lst, -1, LVNI_SELECTED);
+                auto it = rowText.find(r);
+                if (it != rowText.end() && it->second) {
+                    const GemstarText *t = it->second;
+                    std::string body;
+                    for (auto &l2 : t->lines) body += l2 + "\r\n";
+                    text_window(hwnd, fmt("Guide text (type %02X) \xE2\x80\x94 ", t->type) + file_name(*R),
+                                fmt("%zu bytes, received at %s", t->bytes, rec_time(t->frame / frame_rate(*R)).c_str()), body);
+                }
+            }
             return 0;
         }
         case WM_COMMAND: {

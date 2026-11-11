@@ -1,5 +1,6 @@
 #include "tviftr3.h"
 #include "util.h"
+#include "tvimeteo.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -7,6 +8,8 @@
 #include <set>
 #include <array>
 #include <cstdlib>
+
+constexpr int kM = kTvi3M, kCtx = kTvi3Ctx, kStates = 1 << (2 * kTvi3M);
 
 static float sampleAt(const uint8_t* p, int fmt, int i) { return fmt == 1 ? (float)(p[2 * i] | (p[2 * i + 1] << 8)) : (float)p[i]; }
 
@@ -30,7 +33,8 @@ static float interp(const std::vector<float>& s, double x, float outside)
 static bool tvi3Grid(const std::vector<float>& s, float T, double& pos, float& v0, float& v1)
 {
     const int n = (int)s.size();
-    // the run-in starts the line: its first rise past mid level; the header is 16 bits later. Mid level from the
+    // the run-in starts the line: its first rise past mid level; the header is 16 bits later on RTR 2001,
+    // 25 bits later on RTR 14.09.2002 (a longer tone) - looked for 12..34 bits after it. Mid level from the
     // line's lowest sample, and from the blanking level the line starts with (a line in the field sync carries an
     // equalizing pulse mid-line, far below the blanking - tvinfoorm.vbi lines 624/625/4/5)
     const float mn = *std::min_element(s.begin(), s.end()), mx = *std::max_element(s.begin(), s.end());
@@ -44,7 +48,7 @@ static bool tvi3Grid(const std::vector<float>& s, float T, double& pos, float& v
     while (e2 < n / 2 && s[e2] <= base + 0.25f * (mx - base)) e2++;
     if (e2 >= n / 2) e2 = e;
     double best = -2, bx = 0;
-    const double lo = std::min(e, e2) + 12.0 * T, hi = std::min(std::max(e, e2) + 22.0 * T, (double)n - 17.0 * T);
+    const double lo = std::min(e, e2) + 12.0 * T, hi = std::min(std::max(e, e2) + 34.0 * T, (double)n - 17.0 * T);
     if (hi <= lo) return false;
     for (int pass = 0; pass < 2; pass++) {
         double a = pass ? bx - T / 8 : lo, b = pass ? bx + T / 8 : hi, step = pass ? T / 64 : T / 8;
@@ -95,65 +99,66 @@ Tvi3Slicer::Tvi3Slicer(float fs, bool live) : fs_(fs), T_(fs / kTviRateHz[2])
     if (live) { needVaried_ = 150; needLines_ = 750; retrainAt_ = 1500; }
 }
 
-// MLSE: the observation of bit k (its centre and the half-bit point after it) depends on bits k-2..k+2
+// MLSE: the observation of bit k (its centre and the half-bit point after it) depends on bits k-kM..k+kM
 static int ctxOf(const std::vector<uint8_t>& b, int k)
 {
-    auto at = [&](int i) { return i >= 0 && i < (int)b.size() ? b[i] : 0; };
-    return at(k - 2) << 4 | at(k - 1) << 3 | at(k) << 2 | at(k + 1) << 1 | at(k + 2);
+    int c = 0;
+    for (int i = k - kM; i <= k + kM; i++) c = c << 1 | (i >= 0 && i < (int)b.size() ? b[i] : 0);
+    return c;
 }
 
 static std::vector<uint8_t> viterbi(const std::vector<float>& y, const Tvi3Slicer::Model& m)
 {
     const int L = (int)y.size() / 2;
-    std::vector<float> cost(16, 0), nc(16);
-    std::vector<uint8_t> back((size_t)L * 16);
+    std::vector<float> cost(kStates, 0), nc(kStates);
+    std::vector<uint8_t> back((size_t)L * kStates);
     const float iv0 = 1 / m.var[0], iv1 = 1 / m.var[1];
-    float e[32];
+    float e[kCtx];
     for (int k = 0; k < L; k++) {
         const float a = y[2 * k], b = y[2 * k + 1];
-        for (int c = 0; c < 32; c++) {
+        for (int c = 0; c < kCtx; c++) {
             float d0 = a - m.mu[c][0], d1 = b - m.mu[c][1];
             e[c] = d0 * d0 * iv0 + d1 * d1 * iv1;
         }
-        // state after step k = b(k-1) b(k) b(k+1) b(k+2); context of observation k = b(k-2) << 4 | state
-        for (int s = 0; s < 16; s++) {
-            float c0 = cost[s >> 1] + e[s], c1 = cost[8 | (s >> 1)] + e[16 | s];
+        // state after step k = b(k-kM+1) .. b(k+kM); context of observation k = b(k-kM) << (2kM) | state
+        for (int s = 0; s < kStates; s++) {
+            float c0 = cost[s >> 1] + e[s], c1 = cost[(kStates >> 1) | (s >> 1)] + e[kStates | s];
             bool h = c1 < c0;
             nc[s] = h ? c1 : c0;
-            back[(size_t)k * 16 + s] = h;
+            back[(size_t)k * kStates + s] = h;
         }
         std::swap(cost, nc);
     }
     int st = (int)(std::min_element(cost.begin(), cost.end()) - cost.begin());
-    std::vector<uint8_t> bits(L + 2, 0);
+    std::vector<uint8_t> bits(L + kM, 0);
     for (int k = L - 1; k >= 0; k--) {
-        bits[k + 2] = st & 1;
-        int h = back[(size_t)k * 16 + st];
-        st = (h << 3) | (st >> 1);
+        bits[k + kM] = st & 1;
+        int h = back[(size_t)k * kStates + st];
+        st = (h << (2 * kM - 1)) | (st >> 1);
     }
-    bits[1] = st & 1; bits[0] = (st >> 1) & 1;
+    for (int j = 0; j < kM; j++) bits[j] = (st >> (kM - 1 - j)) & 1;
     bits.resize(L);
     return bits;
 }
 
 static void fitModel(const std::vector<const std::vector<float>*>& ys, const std::vector<std::vector<uint8_t>>& bs, Tvi3Slicer::Model& m)
 {
-    double sum[32][2] = {}, n[32] = {};
+    double sum[kCtx][2] = {}, n[kCtx] = {};
     for (size_t i = 0; i < ys.size(); i++) {
         const auto& y = *ys[i];
         const auto& b = bs[i];
-        for (int k = 2; k + 2 < (int)b.size() && 2 * k + 1 < (int)y.size(); k++) {
+        for (int k = kM; k + kM < (int)b.size() && 2 * k + 1 < (int)y.size(); k++) {
             int c = ctxOf(b, k);
             sum[c][0] += y[2 * k]; sum[c][1] += y[2 * k + 1]; n[c]++;
         }
     }
-    for (int c = 0; c < 32; c++)
-        for (int j = 0; j < 2; j++) m.mu[c][j] = n[c] > 5 ? (float)(sum[c][j] / n[c]) : (float)((c >> 2) & 1);
+    for (int c = 0; c < kCtx; c++)
+        for (int j = 0; j < 2; j++) m.mu[c][j] = n[c] > 5 ? (float)(sum[c][j] / n[c]) : (float)((c >> kM) & 1);
     double r[2] = {}, cnt = 0;
     for (size_t i = 0; i < ys.size(); i++) {
         const auto& y = *ys[i];
         const auto& b = bs[i];
-        for (int k = 2; k + 2 < (int)b.size() && 2 * k + 1 < (int)y.size(); k++) {
+        for (int k = kM; k + kM < (int)b.size() && 2 * k + 1 < (int)y.size(); k++) {
             int c = ctxOf(b, k);
             for (int j = 0; j < 2; j++) { double d = y[2 * k + j] - m.mu[c][j]; r[j] += d * d; }
             cnt++;
@@ -333,10 +338,49 @@ static uint32_t le32(const uint8_t* p) { return p[0] | p[1] << 8 | p[2] << 16 | 
 struct Tvi3Rec {
     int64_t frame = 0;
     int seq = 0, type = 0, len = 0;
-    uint32_t id = 0;
+    uint32_t id = 0, bodyCrc = 0;
     bool bodyOk = false;
+    bool fixed = false;           // the body passed its CRC-32 once 1 or 2 bits were turned
     std::vector<uint8_t> body;    // as far as the stream went (len bytes when complete)
 };
+
+// CRC-32 is affine: crc(x ^ e) = crc(x) ^ lin(e), lin = the CRC with no initial and final inversion. A body of
+// n bytes whose CRC is off by syn: turns the one bit, or two bits at most 8 apart (the MLSE errs in pairs),
+// whose lin equals syn (two bits: at most 2 apart, the MLSE errs in pairs). 8n + 16n candidates against 2^32 values: a wrong body passes as fixed about once in
+// 160000 bodies of 1108 bytes (and only bodies on learnt links are tried)
+static bool tvi3FixBits(std::vector<uint8_t>& b, uint32_t want)
+{
+    static uint32_t t[256];
+    if (!t[1])
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            t[i] = c;
+        }
+    const size_t n = b.size();
+    if (!n || n > 4096) return false;
+    const uint32_t syn = crc32(b.data(), n) ^ want;
+    if (!syn) return true;
+    // lin of bit q (q = 8 x byte + bit, bit 0 = 0x01): the register after that bit and the zero bytes after it
+    std::vector<uint32_t> L(n * 8);
+    for (int bit = 0; bit < 8; bit++) {
+        uint32_t v = t[(1u << bit) & 0xFF];
+        for (size_t j = n; j-- > 0;) {
+            L[j * 8 + bit] = v;
+            v = t[v & 0xFF] ^ (v >> 8);
+        }
+    }
+    for (size_t q = 0; q < L.size(); q++)
+        if (L[q] == syn) { b[q / 8] ^= (uint8_t)(1u << (q % 8)); return true; }
+    for (size_t q = 0; q < L.size(); q++)
+        for (size_t r = q + 1; r < L.size() && r <= q + 2; r++)
+            if ((L[q] ^ L[r]) == syn) {
+                b[q / 8] ^= (uint8_t)(1u << (q % 8));
+                b[r / 8] ^= (uint8_t)(1u << (r % 8));
+                return true;
+            }
+    return false;
+}
 
 static std::string tvi3Hms(double sec)
 {
@@ -346,7 +390,7 @@ static std::string tvi3Hms(double sec)
 
 void tvi3Build(TviStream& s, const std::string& dir, double fps)
 {
-    s.report.clear(); s.files.clear(); s.fileInfo.clear(); s.beacons.clear(); s.texts.clear();
+    s.report.clear(); s.files.clear(); s.fileInfo.clear(); s.beacons.clear(); s.texts.clear(); s.meteo.clear(); s.catalog.clear();
     if (s.words.empty()) return;
     if (fps <= 0) fps = 25;
     // slots in broadcast order: frame, then its fТ3 lines by field and line (RTR: one line a field; tvinfoorm.vbi:
@@ -388,17 +432,76 @@ void tvi3Build(TviStream& s, const std::string& dir, double fps)
         idle += !any || all1;
     }
     auto S = [&](int64_t k) { return &slot[(size_t)k * kTvi3Bytes]; };
+    static const uint8_t mk[5] = {0x7E, 0x80, 0x80, 0x80, 0x80};
+    // which captured line the stream goes on to, learnt from the recording: a record header cut by the end of a
+    // line must pass its CRC-32 with the start of the next line, at least 4 of its 14 checked bytes coming from
+    // that line (a chance pass: 2^-32). Per place in the frame: the slot distance d to the next line, and whether
+    // the last byte of the line is data (a capture of every line: field 1 -> field 2 -> next frame; RTR 2000:
+    // byte 40 is a fill 10100 10100 ...). Learnt links win over the guesses below.
+    struct Link { int d = 0, drop = 0, hits = 0; };
+    std::vector<Link> link((size_t)perFrame);
+    {
+        std::map<std::array<int, 3>, int> hit;   // (place, drop, d) -> headers passed
+        uint8_t tmp[23 + kTvi3Bytes];
+        for (int64_t k = 0; k < N; k++) {
+            if (!slen[k]) continue;
+            const uint8_t* a = S(k);
+            for (int drop = 0; drop < 2; drop++) {
+                const int cut = slen[k] - drop;
+                for (int p = std::max(0, cut - 22); p < cut; p++) {
+                    if (memcmp(a + p, mk, std::min(5, cut - p))) continue;
+                    if (p + 19 <= cut + 3) continue;
+                    const int fromA = cut - p;
+                    for (int d = -(perFrame - 1); d <= 3 * perFrame && k + d < N; d++) {   // also back in the frame: the inserter may fill a field in any order
+                        if (!d || k + d < 0 || !slen[k + d]) continue;
+                        const int need = 23 - fromA;
+                        if (need > slen[k + d]) continue;
+                        memcpy(tmp, a + p, fromA);
+                        memcpy(tmp + fromA, S(k + d), need);
+                        if (!memcmp(tmp, mk, 5) && crc32(tmp + 5, 10) == le32(tmp + 15)) hit[{(int)(k % perFrame), drop, d}]++;
+                    }
+                }
+            }
+        }
+        // whether the last byte is data is one thing for the whole capture (the line format): the drop with
+        // more passes; then per place the distance with most passes - 2 or more, 3 times any other (a header
+        // passing its CRC-32 by chance: 2^-32 a try)
+        int byDrop[2] = {0, 0};
+        for (auto& kv : hit) byDrop[kv.first[1]] += kv.second;
+        const int drop = byDrop[1] > byDrop[0] ? 1 : 0;
+        std::vector<std::pair<int, int>> best((size_t)perFrame, {0, 0}), second((size_t)perFrame, {0, 0});   // (passes, d)
+        for (auto& kv : hit) {
+            if (kv.first[1] != drop) continue;
+            auto& b = best[kv.first[0]];
+            if (kv.second > b.first) { second[kv.first[0]] = b; b = {kv.second, kv.first[2]}; }
+            else if (kv.second > second[kv.first[0]].first) second[kv.first[0]] = {kv.second, kv.first[2]};
+        }
+        for (int o = 0; o < perFrame; o++)
+            if (best[o].first >= 2 && best[o].first >= 3 * second[o].first) link[o] = {best[o].second, drop, best[o].first};
+    }
     // successor: with several fТ3 lines in a field (tvinfoorm.vbi) the stream runs on from a line to the next
     // line of the field the capture has (then on lines it does not have); with one line a field (RTR) slot k+d
     // repeats the last 2d bytes of slot k (byte 40: low 6 bits) - two bit errors are allowed in the repeat of
     // the next line or the one after
     std::vector<int64_t> succ((size_t)N, -1);
     std::vector<uint8_t> sd((size_t)N, 0);
+    std::vector<uint8_t> use((size_t)N, 0);   // bytes of the slot that go into the stream
+    for (int64_t k = 0; k < N; k++) use[k] = slen[k];
     std::vector<char> hasPrev((size_t)N, 0);
-    for (int64_t k = 0; k + 1 < N; k++)
-        if (slen[k] && slen[k + 1] && (k + 1) % perFrame && sfield[k] == sfield[k + 1]) { succ[k] = k + 1; hasPrev[k + 1] = 1; }
+    std::vector<char> guessed((size_t)N, 0);   // the link to the next slot is the same-field guess, not learnt
+    std::vector<char> learntTo((size_t)perFrame, 0);   // a learnt link ends at this place
+    for (int o = 0; o < perFrame; o++)
+        if (link[o].hits) learntTo[((o + link[o].d) % perFrame + perFrame) % perFrame] = 1;
     for (int64_t k = 0; k < N; k++) {
-        if (!has[k] || succ[k] >= 0 || slen[k] != kTvi3Bytes) continue;
+        const Link& L = link[k % perFrame];
+        if (!slen[k] || !L.hits || k + L.d >= N || k + L.d < 0 || !slen[k + L.d]) continue;
+        succ[k] = k + L.d; hasPrev[k + L.d] = 1; use[k] = (uint8_t)(slen[k] - L.drop);
+    }
+    for (int64_t k = 0; k + 1 < N; k++)
+        if (succ[k] < 0 && !link[k % perFrame].hits && !learntTo[(k + 1) % perFrame] && !hasPrev[k + 1] && slen[k] && slen[k + 1] &&
+            (k + 1) % perFrame && sfield[k] == sfield[k + 1]) { succ[k] = k + 1; hasPrev[k + 1] = 1; guessed[k] = 1; }
+    for (int64_t k = 0; k < N; k++) {
+        if (!has[k] || succ[k] >= 0 || link[k % perFrame].hits || slen[k] != kTvi3Bytes) continue;
         const uint8_t* a = S(k);
         int bd = 0;
         for (int d = 1; d <= 7 && k + d < N; d++) {
@@ -411,12 +514,11 @@ void tvi3Build(TviStream& s, const std::string& dir, double fps)
             if (e == 0) { bd = d; break; }
             if (e <= 2 && !bd && d <= 2) bd = d;
         }
-        if (bd && !hasPrev[k + bd]) { succ[k] = k + bd; sd[k] = (uint8_t)bd; hasPrev[k + bd] = 1; }
+        if (bd && !hasPrev[k + bd]) { succ[k] = k + bd; sd[k] = (uint8_t)bd; hasPrev[k + bd] = 1; use[k] = (uint8_t)(slen[k] - 2 * bd); }
     }
     // records in every chain of slots
     std::vector<Tvi3Rec> recs;
     int64_t hdrOk = 0;
-    static const uint8_t mk[5] = {0x7E, 0x80, 0x80, 0x80, 0x80};
     std::vector<std::string> texts;
     std::set<std::string> textSeen;
     std::map<std::string, int> headings;   // "TTAAii CCCC YYGGgg" -> copies
@@ -425,7 +527,7 @@ void tvi3Build(TviStream& s, const std::string& dir, double fps)
         std::vector<uint8_t> st;
         std::vector<int64_t> at;            // slot of each byte
         for (int64_t j = i; j >= 0; j = succ[j]) {
-            int n = slen[j] - 2 * sd[j];
+            int n = use[j];
             st.insert(st.end(), S(j), S(j) + n);
             at.insert(at.end(), n, j);
         }
@@ -436,12 +538,22 @@ void tvi3Build(TviStream& s, const std::string& dir, double fps)
             hdrOk++;
             Tvi3Rec r;
             r.frame = f0 + at[p] / perFrame;
-            r.seq = h[0] | h[1] << 8; r.id = le32(h + 2); r.type = h[6]; r.len = h[7] | h[8] << 8;
+            r.seq = h[0] | h[1] << 8; r.id = le32(h + 2); r.type = h[6]; r.len = h[7] | h[8] << 8; r.bodyCrc = le32(h + 14);
             // a block (06, or 09 with no length) is followed by its number, offset and data: keep what came
             const size_t want = (r.type == 6 || r.type == 9) ? std::max(r.len, 1108) : r.len;
             size_t b0 = p + 23, b1 = std::min(st.size(), b0 + want);
             r.body.assign(st.begin() + b0, st.begin() + b1);
-            r.bodyOk = r.len > 0 && (int)r.body.size() >= r.len && crc32(r.body.data(), r.len) == le32(h + 14);
+            r.bodyOk = r.len > 0 && (int)r.body.size() >= r.len && crc32(r.body.data(), r.len) == r.bodyCrc;
+            // a whole body off its CRC: one bit, or two close bits, turned back
+            bool onGuess = false;
+            for (size_t q = p; q + 1 < std::min(st.size(), b0 + r.len) && !onGuess; q++) onGuess = at[q] != at[q + 1] && guessed[at[q]];
+            if (!r.bodyOk && !onGuess && r.len > 0 && r.len <= 1108 && (int)r.body.size() >= r.len && r.type != 9) {
+                std::vector<uint8_t> b(r.body.begin(), r.body.begin() + r.len);
+                if (tvi3FixBits(b, r.bodyCrc)) {
+                    std::copy(b.begin(), b.end(), r.body.begin());
+                    r.bodyOk = r.fixed = true;
+                }
+            }
             recs.push_back(std::move(r));
         }
         // plain text runs (WMO bulletins) and abbreviated headings TTAAii CCCC YYGGgg
@@ -450,7 +562,8 @@ void tvi3Build(TviStream& s, const std::string& dir, double fps)
             size_t e = q;
             while (e < st.size() && ((st[e] >= 0x20 && st[e] < 0x7F) || st[e] == '\r' || st[e] == '\n')) e++;
             if (e - q >= 40) {
-                std::string t(st.begin() + q, st.begin() + e);
+                // the last byte of the chain is byte 40 of its last line: 6 bits only
+                std::string t(st.begin() + q, st.begin() + (e == st.size() ? e - 1 : e));
                 if (textSeen.insert(t).second) texts.push_back(t);
             }
             q = e + 1;
@@ -493,23 +606,84 @@ void tvi3Build(TviStream& s, const std::string& dir, double fps)
     // files, as the Бизнес-Текст files: each at its size from the descriptor (type 05); the blocks (06 / 09:
     // number, offset = (number - 1) x 1100, data) put in where they belong - checked blocks as they are, the
     // bytes of broken-off blocks voted between copies; bytes not received are 0, and [...] in the .txt
-    struct Piece { uint32_t id, off; int64_t frame; bool ok; std::vector<uint8_t> data; };
+    struct Piece { uint32_t id, off; int64_t frame; bool ok, fixed; std::vector<uint8_t> data; };
     std::vector<Piece> pieces;
     std::map<int, int> byType, okByType;
+    int fixedBits = 0;
     for (auto& r : recs) {
         byType[r.type]++;
         okByType[r.type] += r.bodyOk;
+        fixedBits += r.fixed;
         if ((r.type != 6 && r.type != 9) || r.body.size() <= 8) continue;
         uint32_t no = le32(&r.body[0]), off = le32(&r.body[4]);
         if (no < 1 || no > 4000 || off != (no - 1) * 1100) continue;
         size_t n = std::min<size_t>(r.body.size() - 8, 1100);
         if (r.bodyOk && r.type == 6) n = std::min<size_t>((size_t)r.len - 8, 1100);
-        pieces.push_back({r.id, off, r.frame, r.bodyOk && r.type == 6, std::vector<uint8_t>(r.body.begin() + 8, r.body.begin() + 8 + n)});
+        pieces.push_back({r.id, off, r.frame, r.bodyOk && r.type == 6, r.fixed, std::vector<uint8_t>(r.body.begin() + 8, r.body.begin() + 8 + n)});
+    }
+    // a block sent again (the carousel comes round): whole copies off their CRC voted byte by byte, the vote
+    // checked by the CRC-32 of the header
+    int votedBlocks = 0;
+    {
+        std::map<std::pair<uint32_t, uint32_t>, std::vector<const Tvi3Rec*>> copies;   // (id, number) -> whole bodies
+        std::set<std::pair<uint32_t, uint32_t>> okBlocks;
+        for (auto& r : recs) {
+            if (r.type != 6 || r.len <= 8 || r.len > 1108 || (int)r.body.size() < r.len) continue;
+            uint32_t no = le32(&r.body[0]);
+            if (r.bodyOk) okBlocks.insert({r.id, no});
+            else copies[{r.id, no}].push_back(&r);
+        }
+        for (auto& kv : copies) {
+            if (okBlocks.count(kv.first)) continue;
+            std::map<std::pair<int, uint32_t>, std::vector<const Tvi3Rec*>> same;   // the same length and CRC
+            for (auto* r : kv.second) same[{r->len, r->bodyCrc}].push_back(r);
+            for (auto& g : same) {
+                if (g.second.size() < 2) continue;
+                const int len = g.first.first;
+                std::vector<uint8_t> v(len);
+                for (int i = 0; i < len; i++) {
+                    int c[256] = {0}, bi = 0;
+                    for (auto* r : g.second) c[r->body[i]]++;
+                    for (int x = 1; x < 256; x++) if (c[x] > c[bi]) bi = x;
+                    v[i] = (uint8_t)bi;
+                }
+                bool ok = crc32(v.data(), len) == g.first.second;
+                if (!ok && g.second.size() >= 3) ok = tvi3FixBits(v, g.first.second);
+                if (!ok) continue;
+                const uint32_t off = le32(&v[4]);
+                if (off != (kv.first.second - 1) * 1100) continue;
+                pieces.push_back({kv.first.first, off, g.second[0]->frame, true, true, std::vector<uint8_t>(v.begin() + 8, v.end())});
+                votedBlocks++;
+                break;
+            }
+        }
     }
     struct FileAcc { TviFile f; int64_t frame; int copies = 0; };
     std::vector<FileAcc> files;
+    // descriptors: those that passed their CRC; for an id with none, the size and name that two or more whole
+    // copies carry alike (a printable name)
+    std::set<uint32_t> descOk;
+    for (auto& r : recs) if (r.type == 5 && r.bodyOk) descOk.insert(r.id);
+    std::map<std::pair<uint32_t, std::string>, int> descAlike;   // (id, size + name bytes) -> copies
+    auto descKey = [](const Tvi3Rec& r) { return std::string(r.body.begin() + 6, r.body.begin() + 11 + r.body[10]); };
     for (auto& r : recs) {
-        if (r.type != 5 || !r.bodyOk || r.body.size() < 11) continue;
+        if (r.type != 5 || r.bodyOk || descOk.count(r.id) || r.len < 11 || (int)r.body.size() < r.len) continue;
+        const int nl = r.body[10];
+        if (nl < 1 || 11 + nl > r.len) continue;
+        bool printable = true;
+        for (int i = 0; i < nl; i++) printable &= r.body[11 + i] > 0x20 && r.body[11 + i] < 0x7F;
+        if (printable) descAlike[{r.id, descKey(r)}]++;
+    }
+    for (auto& r : recs) {
+        if (r.type != 5 || r.body.size() < 11) continue;
+        if (!r.bodyOk) {
+            if (descOk.count(r.id) || r.len < 11 || (int)r.body.size() < r.len || r.body[10] < 1 || 11 + r.body[10] > r.len) continue;
+            auto it = descAlike.find({r.id, descKey(r)});
+            if (it == descAlike.end() || it->second < 2) continue;
+            int most = 0;
+            for (auto& kv : descAlike) if (kv.first.first == r.id) most = std::max(most, kv.second);
+            if (it->second < most) continue;
+        }
         int nl = r.body[10];
         if (11 + nl > (int)r.body.size()) continue;
         std::string name(r.body.begin() + 11, r.body.begin() + 11 + nl);
@@ -541,6 +715,7 @@ void tvi3Build(TviStream& s, const std::string& dir, double fps)
             for (auto& o : files)
                 if (o.f.id == pc.id && (!nearest || std::llabs(o.frame - pc.frame) < std::llabs(nearest->frame - pc.frame))) nearest = &o;
             if (nearest != &fa) continue;
+            if (pc.ok && pc.fixed && !sure[pc.off]) fa.f.joined++;
             for (size_t i = 0; i < pc.data.size() && pc.off + i < fa.f.size; i++) {
                 if (pc.ok) { bin[pc.off + i] = pc.data[i]; sure[pc.off + i] = 1; }
                 else votes[pc.off + i][pc.data[i]]++;
@@ -567,11 +742,17 @@ void tvi3Build(TviStream& s, const std::string& dir, double fps)
         for (auto& c : safe) if (strchr("\\/:*?\"<>|", c)) c = '_';
         if (names.count(safe)) safe = fmt("%s_%08X_%u", safe.c_str(), fa.f.id, fa.f.size);
         names.insert(safe);
-        fa.f.note = have == fa.f.blocks ? "complete, every block checked by CRC-32"
-                    : fmt("%zu of %u bytes received (%d of %d blocks checked by CRC-32); bytes not received are 0, [...] in the .txt; "
-                          "the rest went on VBI lines the capture does not keep", got, fa.f.size, have, fa.f.blocks);
+        // written once a block of it is checked: whole under its own name, else as <name>.part
+        if (have < fa.f.blocks) safe += ".part";
+        fa.f.note = have == fa.f.blocks ? (fa.f.joined ? fmt("complete, every block checked by CRC-32 (%d of them mended: bits turned "
+                                                             "back or copies voted, then checked)", fa.f.joined)
+                                                       : std::string("complete, every block checked by CRC-32"))
+                    : have ? fmt("%zu of %u bytes received (%d of %d blocks checked by CRC-32); bytes not received are 0, [...] in the .txt; "
+                                 "the rest went on VBI lines the capture does not keep", got, fa.f.size, have, fa.f.blocks)
+                           : fmt("no block of it checked (%zu of %u bytes seen, unchecked), not written: its blocks went on VBI lines "
+                                 "the capture does not keep", got, fa.f.size);
         if (fa.f.missing.size() == (size_t)fa.f.blocks) fa.f.missing.clear();   // nothing checked: the list says nothing
-        try {
+        if (have) try {
             make_dirs(fdir);
             fa.f.path = path_join(fdir, safe);
             write_file(fa.f.path, bin.data(), bin.size());
@@ -644,7 +825,51 @@ void tvi3Build(TviStream& s, const std::string& dir, double fps)
             s.beacons.push_back("\"TV-INFORM\" inserter clock " + firstBeacon + " .. " + lastBeacon.substr(11) + ", at " + tvi3Hms(bFrame0 / fps) +
                                 " of the recording - test text TV-INFORM / THE RED FOX JUMPS OVER THE LAZY DOG");
     }
-    // texts: written as they came (the stream of the captured lines only)
+    // texts: the readable pieces of every line (and of the chains of lines) joined where they overlap - a
+    // capture keeps 1 of the service's ~11 lines a field, so a bulletin comes in pieces sent at different times
+    std::vector<std::vector<uint8_t>> withData;
+    for (int64_t k = 0; k < N; k++) if (has[k]) withData.emplace_back(S(k), S(k) + slen[k]);
+    {
+        std::vector<std::string> pieces = ft3Pieces(withData);
+        pieces.insert(pieces.end(), texts.begin(), texts.end());
+        texts.clear();
+        for (auto& t : ft3JoinTexts(pieces)) if (t.size() >= 12) texts.push_back(t);
+    }
+    // files of the inserter named by descriptors (also bodies whose record header went on a line not captured)
+    const Ft3Catalog cat = ft3Catalog(withData);
+    if (!cat.files.empty()) {
+        const std::string folder = cat.folders.empty() ? std::string() : cat.folders[0];
+        std::string fl = folder.empty() ? std::string() : "folder " + folder + "\r\n";
+        for (auto& f : cat.files) {
+            std::string l = f.size ? fmt("%-14s %7u bytes", f.name.c_str(), f.size) : fmt("%-14s    size not received", f.name.c_str());
+            s.catalog.push_back((folder.empty() ? std::string() : folder + "\\") + l);
+            fl += l + fmt("   (named on %d line%s)", f.copies, f.copies == 1 ? "" : "s") + "\r\n";
+        }
+        try {
+            make_dirs(path_join(dir, "tvinform_files"));
+            write_text(path_join(path_join(dir, "tvinform_files"), "catalog.txt"),
+                       "ТВ-информ fТ3: files of the inserter, as the file descriptors name them (the contents went on VBI lines "
+                       "the capture does not keep; their text is in tvinform_ft3_texts.txt / tvinform_meteo.txt)\r\n\r\n" + fl);
+        } catch (...) {}
+    }
+    // weather: the bulletins and their METAR reports in Russian
+    int metars = 0;
+    const std::string meteo = ft3MeteoText(texts, &metars);
+    std::string mpath;
+    if (!meteo.empty()) {
+        try {
+            make_dirs(dir);
+            mpath = path_join(dir, "tvinform_meteo.txt");
+            write_text(mpath, "Метеоданные ВМО из ТВ-информ fТ3 (бюллетени по заголовкам; сводки METAR по-русски)\r\n\r\n" + meteo);
+            s.files.push_back(mpath);
+        } catch (...) { mpath.clear(); }
+        std::string l;
+        for (char c : meteo) {
+            if (c == '\r') continue;
+            if (c == '\n') { s.meteo.push_back(l); l.clear(); } else l += c;
+        }
+        if (!l.empty()) s.meteo.push_back(l);
+    }
     std::string tpath;
     if (!texts.empty()) {
         std::string all;
@@ -661,10 +886,42 @@ void tvi3Build(TviStream& s, const std::string& dir, double fps)
     R.push_back("ТВ-информ fТ3 (GOST R 50822-95, 6.9375 MHz, 360 bits a line: 55 55 FB AC + 41 bytes), file transfer records");
     R.push_back(fmt("  %lld lines with the header, %lld of them idle (00 / FF); %lld record headers with a correct CRC-32", (long long)lines,
                     (long long)idle, (long long)hdrOk));
-    if (!seqs.empty())
-        R.push_back(fmt("  record numbers %lld..%lld (counted on past 65535): %.1f%% of them seen on these lines - the service sends on more VBI lines than the "
-                        "capture keeps (ГОСТ: 11 a field), so most records and nearly all file blocks are not in the recording",
-                        (long long)seqs.front(), (long long)seqs.back(), seen * 100));
+    if (!seqs.empty()) {
+        if (seen < 0.9)
+            R.push_back(fmt("  record numbers %lld..%lld (counted on past 65535): %.1f%% of them seen on these lines - the service sends on more VBI lines "
+                            "than the capture keeps (ГОСТ: 11 a field), so most records and nearly all file blocks are not in the recording",
+                            (long long)seqs.front(), (long long)seqs.back(), seen * 100));
+        else
+            R.push_back(fmt("  record numbers %lld..%lld (counted on past 65535): %.1f%% of them seen - the capture keeps the lines of the service",
+                            (long long)seqs.front(), (long long)seqs.back(), seen * 100));
+    }
+    {
+        // the order of the lines in the stream, as learnt from the headers cut by a line end
+        std::vector<std::pair<int, int>> place((size_t)perFrame);
+        for (auto& kv : lineOrd) place[kv.second] = kv.first;
+        std::string t;
+        int nl = 0;
+        for (int o = 0; o < perFrame; o++) {
+            if (!link[o].hits) continue;
+            const int to = ((o + link[o].d) % perFrame + perFrame) % perFrame, fr = (o + link[o].d) >= perFrame ? (o + link[o].d) / perFrame : 0;
+            t += fmt("%sf%d l%d -> f%d l%d%s", nl ? ", " : "", place[o].first, place[o].second, place[to].first, place[to].second,
+                     fr == 1 ? " of the next frame" : fr > 1 ? fmt(" %d frames on", fr).c_str() : "");
+            nl++;
+        }
+        for (auto& L : link)
+            if (L.hits) { if (L.drop) t += "; the last byte of a line is not data (fill)"; break; }
+        if (nl)
+            R.push_back(fmt("  the stream goes on from line to line (learnt from %d record headers cut by a line end, CRC-32): ", [&] {
+                            int h = 0;
+                            for (auto& L : link) h += L.hits;
+                            return h;
+                        }()) + t + fmt(" - %d of %d captured lines lead on", nl, perFrame));
+        else
+            R.push_back("  no captured line is followed in the stream by another captured line (no record header cut by a line end passes its CRC "
+                        "with any of them): the lines between went on lines the capture does not keep");
+    }
+    if (fixedBits || votedBlocks)
+        R.push_back(fmt("  mended: %d record bodies by turning back 1-2 bits, %d blocks by voting copies (each checked by its CRC-32)", fixedBits, votedBlocks));
     {
         static const char* tn[] = {"beacon", "?", "?", "file header (GRMC)", "?", "file description", "file block", "?", "?", "block (no CRC)"};
         std::string t = "  records:";
@@ -678,6 +935,15 @@ void tvi3Build(TviStream& s, const std::string& dir, double fps)
                     fmt(" - the recording starts at about %s", tvi3Hms(std::fmod(clockAtStart + 86400, 86400)).c_str()));
     }
     R.push_back(fmt("  files announced: %zu (%d complete)", files.size(), complete));
+    if (!cat.files.empty()) {
+        std::string t = fmt("  files of the inserter named on the lines: %zu", cat.files.size());
+        if (!cat.folders.empty()) t += " in " + cat.folders[0];
+        t += ":";
+        for (size_t i = 0; i < cat.files.size() && i < 12; i++) t += " " + cat.files[i].name;
+        if (cat.files.size() > 12) t += " ...";
+        R.push_back(t);
+    }
+    if (metars) R.push_back(fmt("  weather: %d METAR reports decoded into Russian%s", metars, mpath.empty() ? "" : (", in " + mpath).c_str()));
     for (auto& fa : files)
         R.push_back(fmt("    %-14s %7u bytes  %2d blocks, %2d received   id %08X  at %s", fa.f.name.c_str(), fa.f.size, fa.f.blocks, fa.f.have, fa.f.id,
                         tvi3Hms(fa.frame / fps).c_str()));
@@ -696,7 +962,7 @@ void tvi3Build(TviStream& s, const std::string& dir, double fps)
         if ((int)headings.size() > 60) R.push_back("    ...");
     }
     if (!texts.empty()) {
-        R.push_back(fmt("  readable text: %zu pieces%s", texts.size(), tpath.empty() ? "" : (", all in " + tpath).c_str()));
+        R.push_back(fmt("  readable text: %zu pieces (joined where they overlap)%s", texts.size(), tpath.empty() ? "" : (", all in " + tpath).c_str()));
         int shown = 0;
         for (auto& t : texts) {
             if (shown++ >= 25) break;

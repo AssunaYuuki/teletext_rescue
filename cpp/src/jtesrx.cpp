@@ -341,7 +341,7 @@ bool jtesReceive(const uint8_t* lines, int64_t rows, int n, int lpf, const std::
         for (int i = 0; i < (int)R.size(); i++)
             if (best[i] >= 0 && !R[i].idle) take(R[i], jobs[best[i]], outs[best[i]], false);
     }
-    for (auto& r : R) { st.found += r.found; st.idle += r.idle; }
+    for (auto& r : R) { st.found += r.found; st.idle += r.idle; if (r.idle) st.idleRows.push_back(r.line); }
 
     if (!quick) {
         // ---- a second channel learned from confident packets
@@ -596,14 +596,19 @@ bool jtesProbeRecording(VbiFile& vf, Slicer& sl, std::atomic<bool>* cancel, Jtes
         std::vector<JtesRxPacket> pk;
         std::string err;
         // the first 10 frames of the first piece say whether the rest is worth reading (a datacast line costs as
-        // much as a failed packet on every try)
+        // much as a failed packet on every try). The full reading, not the quick one: on a weak tape the bundled
+        // channel reads almost nothing and only the channel fitted to each line finds the packets (Betamax 1994,
+        // GV-USB2: 9 against 332); idle packets count too (Asahi 2001: 150 packets, 854 idle in 120 frames)
+        JtesRxStats st;
         int64_t head = std::min<int64_t>(rows, (int64_t)20 * lpf);
-        if (!jtesReceive(buf.data(), head, n, lpf, all, mode == 1, true, sl, pk, err)) return false;
-        if (pk.empty()) continue;
-        if (!jtesReceive(buf.data(), rows, n, lpf, all, mode == 1, true, sl, pk, err)) return false;
+        if (!jtesReceive(buf.data(), head, n, lpf, all, mode == 1, false, sl, pk, err, &st)) return false;
+        if (pk.empty() && st.idleRows.empty()) continue;
+        if (!jtesReceive(buf.data(), rows, n, lpf, all, mode == 1, false, sl, pk, err, &st)) return false;
         std::vector<int64_t> perSlot(lpf, 0);
         for (auto& p : pk) perSlot[p.row % lpf]++;
-        if ((int64_t)pk.size() > best) { best = (int64_t)pk.size(); bestSlots = perSlot; out.hauppauge = mode == 1; }
+        for (int64_t r : st.idleRows) perSlot[r % lpf]++;
+        int64_t got = (int64_t)(pk.size() + st.idleRows.size());
+        if (got > best) { best = got; bestSlots = perSlot; out.hauppauge = mode == 1; }
     }
     out.probePackets = best;
     if (best < 20) return false;

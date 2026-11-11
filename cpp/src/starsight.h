@@ -36,6 +36,7 @@ struct SsChannel {
 
 // Built-in channel names for schedules whose channel packets were not received. false if unknown.
 bool ssKnownChannel(int id, std::string& label, std::string& call);
+
 // Huffman-compressed StarSight text (titles, descriptions). complete is false
 // when a codeword is not in the table; the text then ends where it stopped.
 std::string ssHuffmanDecode(const uint8_t* p, size_t n, bool* complete);
@@ -147,6 +148,11 @@ struct SoftStream {
 };
 
 // Finds packets, repairs them, parses commands into db.
+// Channel names given by the user, for guides whose "channel data" command never arrived
+// (it is sent about once an hour). Read from "starsight_channels.txt" next to the recording
+// (or from the file named by TR_SSCHANNELS): one "id name" or "id=name" per line, '#' comments.
+// Returns how many channels were named.
+int ssApplyChannelNames(SsDatabase& db, const std::string& recordingPath);
 void ssDecodeStream(const SoftStream& s, SsDatabase& db, bool keepUnverified);
 
 // Packets whose CRC32 checks, allowing one repaired bit (used for calibration).

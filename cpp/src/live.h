@@ -16,6 +16,7 @@
 #include "jtesrx.h"
 #include "vbirepair.h"
 #include <atomic>
+#include <array>
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
@@ -29,6 +30,7 @@
 
 struct LiveMlse;
 struct LivePrior;
+struct LiveTpl;
 struct DecodeResult;
 
 
@@ -73,6 +75,11 @@ struct LivePage {
     int64_t frame = 0;       // last frame a row of it arrived
     int errors = 0;          // bytes that failed parity in the last transmission
     int counter = 0, of = 0; // the page's own "NN/MM" (a carousel under one subcode), 0 = none
+    int64_t tx = 0;          // the page's transmission (counted per page) that last went into this subpage
+    std::map<int, uint64_t> bad;   // while received: columns of a row that failed parity (bit per column)
+    // a subpage: up to 3 readings of every character with their votes (value, count); the row shows the
+    // strongest, so a tape error in one transmission does not replace what the others read
+    std::map<int, std::array<std::array<uint8_t, 6>, 40>> votes;
 };
 
 // key of a page's transmission while it is being received (subcode 0000: which subpage it is
@@ -90,6 +97,8 @@ struct LiveSnapshot {
     std::vector<std::pair<int, int>> list;      // page, subpages (all pages seen)
     Row header{};                               // last header row (rolling header, clock)
     bool hasHeader = false;
+    uint8_t clock[8] = {};                      // columns 32..39 of the headers, each kept from its last clean reading
+    bool hasClock = false;
     std::string service;                        // packet 8/30 status display
     std::string charset;                        // character set of the service, guessed from all its pages
     std::string channel;                        // name in the page headers (words every header carries)
@@ -97,10 +106,14 @@ struct LiveSnapshot {
     size_t t42Packets = 0;                      // packets written to the .t42 of the recording
     std::string captions;                       // CC1 text, last lines
     std::string vps, wss;                       // the VPS label (line 16) and WSS (line 23) read, "" = none
-    // the two top rows of the picture (line 23 of field 1 and 336 of field 2, luma): the line after the VBI window
-    // of cards that stop at 22 / 335 (Behold, SAA7231); picWss = WSS read on it in the last 2 s
-    std::vector<uint8_t> picRow[2];
-    bool picWss[2] = {};
+    // the top rows of the picture (line 23 of field 1 and 336 of field 2, luma): the lines after the VBI window
+    // of cards that stop at 22 / 335 (Behold, SAA7231). picWss = WSS read on it in the last 2 s; rows 2.. are the
+    // lines that follow (24, 337, 25 ...) - the VCR's own text or a data line above the window shows up there.
+    // How many rows are kept is set in the capture window (1..8).
+    static constexpr int kMaxPicRows = 8;
+    std::vector<uint8_t> picRow[kMaxPicRows];
+    bool picWss[kMaxPicRows] = {};
+    int picRows = 2;                            // how many of picRow[] are filled
     double packetsPerSecond = 0;
 };
 
@@ -123,6 +136,9 @@ struct LiveVps {
     std::vector<LiveVpsEvent> history, wssHistory;
 };
 
+class LiveDecoder;
+struct LiveGpuBatch;                            // live.cpp: the teletext lines of a frame read on the graphics card
+
 class LiveDecoder {
 public:
     LiveVps vpsInfo();
@@ -134,12 +150,23 @@ public:
     void push(const uint8_t* frame, int bytes);
     void stopWorker();
     void joinProbe();
+    // the templates being trained on this capture (a replayed recording waits for them as live time would)
+    void waitTemplates() { if (tplThread_.joinable()) tplThread_.join(); }
     // the top two rows of the picture (luma, w samples at fs): line 23 / 336, read for WSS and shown with the VBI
     // lines (from the capture thread, every picture frame)
     void pictureRows(const uint8_t* row0, const uint8_t* row1, int w, double fs);
     // the whole picture frame (YUY2): the row carrying line 23 / 336 is found (wherever the card's sync put it)
     // and read as above
     void pictureFrame(const uint8_t* p, int w, int h, int stride, double fs);
+    // what decodes the teletext lines of the live capture: the processor (as always) or the graphics card (OpenCL),
+// where the lines of a frame whose packet starts alike go to the card in one call. Off = the processor
+void setGpu(bool on);
+bool gpuActive();                            // the card took the work (a kernel was built)
+    int64_t gpuFrames() const { return gpuFrames_; }   // frames whose teletext lines the card read
+// how many top rows of the picture are kept and shown with the VBI lines (1..8; 2 = lines 23 / 336 as before).
+    // More rows show the VCR's own text or a data line that sits just above / below the driver's VBI window
+    void setPictureRows(int n);
+    int pictureRowsNow();
     // the lines are numbered d lines lower (+) or higher (-) than the card says: the picture was shifted on the way
     // (VCR, processor) and the driver keeps its window (Sync in the capture window); 0 = the card's numbering.
     // Kept until reset() (the geometry's own numbering again)
@@ -148,6 +175,12 @@ public:
     void setRepair(const VbiRepair& r);
     // copy for the window; page = which page to copy in full (0 = none)
     void snapshot(LiveSnapshot& s, int page);
+    // for tests: teletext packets (.t42, 42 bytes each) straight into the page store, as the lines would give them
+    void testPackets(const uint8_t* t42, size_t bytes)
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (size_t i = 0; i + 42 <= bytes; i += 42) { packet(t42 + i); if (i % (42 * 16) == 0) frames_++; }
+    }
     // .vbi recording of the frames as they come, and next to it <name>.t42 with the teletext packets
     // decoded live (42 bytes each, ready for any teletext tool); empty path stops it
     // <name>.raw.t42: every packet with a good address, in order, data bytes as sliced - also the 8-bit
@@ -187,7 +220,7 @@ public:
     void setReadAll(bool a) { readAll_ = a; }
     bool readAll() const { return readAll_; }
     bool manual() const { return manual_; }
-    ~LiveDecoder() { stopWorker(); joinProbe(); if (btThread_.joinable()) btThread_.join(); std::string e; record("", e); }
+    ~LiveDecoder() { stopWorker(); joinProbe(); tplJoin(); if (btThread_.joinable()) btThread_.join(); std::string e; record("", e); }
 
 private:
     struct LineOut {
@@ -235,7 +268,7 @@ private:
         int packets = 0, ccOk = 0, mlsePackets = 0;
         std::shared_ptr<LiveMlse> mlse;   // its own channel model
         std::shared_ptr<LiveMlse> tape;   // the tape decoder (wide channel, codewords), for a weak teletext line
-        int tapePackets = 0;
+        int tapePackets = 0, tplPackets = 0;
         double addrDiff = 0;              // share of the once-a-second checks where the tape decoder read another address
         double parityAvg = 0;             // parity errors in the text of the packets the narrow MLSE read (mean)
         double off = -1;     // where the teletext packet starts in this line (samples), -1 = not known
@@ -248,12 +281,25 @@ private:
     std::vector<LineAcc> acc_;              // the worker's own, outside the lock
     std::vector<LiveLineStat> lineStats_;   // their state for the window, under the lock
     std::map<int, std::map<int, LivePage>> pages_;
+    std::map<int, int64_t> pageTx_;   // transmissions of each page closed so far
+    // transmissions of a page under 0000 whose text differs from every subpage, seen once: a page of the rotation is
+    // made only when its text comes a second time (one copy may be a tape's damage, not another page)
+    std::map<int, std::vector<LivePage>> pending_;
     int open_[8] = {-1, -1, -1, -1, -1, -1, -1, -1};   // page being received per magazine
     int openSub_[8] = {};
     int openRow_[8] = {};   // last row received of that page in this transmission
+    // the row number a tape repair broke (12, 5, 14 or 7, 20, 9): the row before the last, whether the last
+    // one was new, both packets' places in the stream, the last packet itself and one row out of order held back
+    int prevRow_[8] = {};
+    bool lastNew_[8] = {};
+    size_t prevAt_[8] = {}, lastAt_[8] = {};
+    uint8_t lastPk_[8][42] = {}, skip_[8][42] = {};
+    bool hasSkip_[8] = {};
     bool openErase_[8] = {};   // its header had C4 (erase page)
     Row header_{};
     bool hasHeader_ = false;
+    uint8_t clock_[8] = {};
+    bool hasClock_ = false;
     std::string service_;
     std::string charset_;
     int64_t charsetAt_ = -1000;
@@ -281,6 +327,26 @@ private:
     int64_t probeAt_ = 0;
     std::map<int, std::string> probeKind_;   // TV line -> kind
     void startProbe();
+    // the templates of the recording's decoder (VbiReader) trained on this capture: its teletext lines are put on the
+    // bt8x8 grid (a random sample of the whole session so far) and trained in their own thread, again every 20 s
+    // while they read under 60%; then every teletext line is read with them first (a channel that loses 1010 -
+    // s_estr_8_c.vbi - reads 75% of its lines with the MLSE, 98% with the templates). The training on a short
+    // stretch is a lottery (that recording: 1% on frames 50-400, 22% from frame 2000, nothing from 4000)
+    std::shared_ptr<const LiveTpl> tpl_;      // under mu_ (set by the training thread)
+    std::shared_ptr<const LiveTpl> tplNow_;   // the worker's copy for the frame being decoded
+    std::vector<uint8_t> tplBuf_;             // the sample of lines, 2048 bytes each (reservoir of the session)
+    size_t tplSeen_ = 0;                      // lines offered to the sample so far
+    std::vector<char> tplLine_;               // the lines of the frame the templates read (teletext before the first training)
+    uint64_t tplRng_ = 0x9E3779B97F4A7C15ull;
+    double tplSrc_ = -1;                      // where the packets start in the capture (median of the lines, fixed)
+    int64_t tplAt_ = 0;                       // frame of the last training
+    std::atomic<int> tplGot_{-1};             // per cent of the sampled lines the templates in use read, -1 none
+    std::thread tplThread_;
+    std::atomic<bool> tplBusy_{false}, tplQuit_{false};
+    int tplTries_ = 0;
+    void tplGather(int index, const uint8_t* p);
+    void tplStart();
+    void tplJoin() { tplQuit_ = true; if (tplThread_.joinable()) tplThread_.join(); tplQuit_ = false; }
     // found files: the probe thread reads ТВ-информ on the frames it was given (contiguous 5 s chunks)
     BtCatalog bt_;                           // under mu_, fed by the worker
     // VPS / WSS: the last 250 readings voted (under mu_)
@@ -289,13 +355,32 @@ private:
     std::deque<std::string> vpsLast_;
     std::deque<int> wssLast_;
     int64_t vpsFrame_ = -1, wssFrame_ = -1;
-    std::vector<uint8_t> picRow_[2];                // under mu_: the picture's rows 23 / 336
+    std::vector<uint8_t> picRow_[8];                // under mu_: the picture's rows 23 / 336 and the ones after them
+    int picRowsWanted_ = 2, picRowsGot_ = 2;        // how many rows the capture window asks for / how many came
+    // the graphics card: the lines of a frame read on it (see setGpu). Only the decoding thread touches these
+    std::shared_ptr<LiveGpuBatch> gp_;
+    bool gpuWanted_ = true, gpuDead_ = false;   // the card reads whenever there is one
+    std::vector<std::array<uint8_t, 42>> gpuLine_;
+    std::vector<char> gpuHave_;
+    std::vector<char> gpuTried_;                    // the line went to the card this frame (read or not)
+    std::vector<std::array<uint8_t, 42>> gpuRaw_;   // an 8-bit data row the card read (good address, no parity)
+    std::vector<char> gpuRawHave_;
+    std::vector<double> gpuOff_;                    // where the card found the packet (-1 = not read)
+    void gpuFrame(const uint8_t* frame);            // read this frame's teletext lines on the card, when it is on
+    void gpuStart();
+    // the card's channel model, learnt in a thread of its own from the teletext lines of the last frames: the fast
+    // slicer reads a good signal without the MLSE, whose model then never learns - and the card waited for it
+    struct GpuLearn { std::mutex m; std::vector<double> prior, tapePrior; int n = 0, tapeN = 0; bool done = false; };
+    std::shared_ptr<GpuLearn> gpuLearn_;
+    int64_t gpuLearnAt_ = -1000000;                 // frame the last learning started at
+    std::atomic<int64_t> gpuFrames_{0};             // frames whose teletext lines the card read
     int baseFirstLine_ = 0;                         // g_.firstLine as reset() got it (setLineOffset moves g_'s)
     std::mutex repMu_;
     VbiRepairer repairer_;
     std::atomic<bool> repOn_{false};
     std::vector<uint8_t> repFrame_;
     int64_t syncSeen_ = -1, syncMoves_ = 0;         // frame the field sync was last in the window; numbering changes
+    int syncCand_ = 0, syncCandN_ = 0;              // numbering the field sync gave, frames in a row it gave it
     std::string vitcText_[64];                      // under mu_: the last VITC of each line and its frame
     int64_t vitcAt_[64] = {};
     SsDatabase ss_;                                 // StarSight (525) from the probe chunks, merged (probe thread)

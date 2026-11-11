@@ -21,6 +21,9 @@ bool ttBuild(const Bytes& stream, bool is525, const std::string& dir, const std:
              const std::function<void(const std::string&)>& log, std::string& err);
 // working folder for a recording's teletext project: %TEMP%\TeletextRescue\<name>_teletext
 std::string ttWorkDir(const std::string& recording);
+// where the pages of a recording are built: <recording folder>\<name>_teletext — next to the file itself,
+// so the person sees the folder where they keep their recordings; %TEMP% only if that folder cannot be made
+std::string ttPagesDir(const std::string& recording);
 
 // Clean pages (as vhs-teletext "squash" and the original program's "Clean stream"): damaged words
 // restored (built-in Russian / German / English dictionaries + the recording's own frequent words),

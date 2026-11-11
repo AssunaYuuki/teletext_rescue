@@ -44,10 +44,34 @@ void Project::set_charset2(const std::string &cs) {
     save_json(path_join(proj, "project.json"), meta, 1);
 }
 const Charset &Project::table(const Page *pg) const {
+    if (swapped(pg)) return *table2();
     int nat = (pg && pg->ex.nat >= 0) ? pg->ex.nat : national;
     return charset_table(charset, nat);
 }
 const Charset *Project::table2() const { return charset2.empty() ? nullptr : &charset_table(charset2, 0); }
+const Charset *Project::table2(const Page *pg) const { return swapped(pg) ? &charset_table(charset, 0) : table2(); }
+
+// Russian teletext sends no X/28 / M/29: the receivers took the set a row starts in from the national option of the
+// page header - 4 (most pages): Cyrillic, ESC to Latin; 0: Latin, ESC to Cyrillic (Ostankino 1993-95, ORT 1995-96:
+// "AO OPTKOMTORG" pages, English rows plain and Russian ones after an ESC). The page's words decide, read both ways;
+// on a tie (no words: pictures, tables) the national option does.
+bool Project::swapped(const Page *pg) const {
+    if (!pg || charset.rfind("cyr", 0) != 0 || !table2()) return false;
+    const Charset &c = charset_table(charset, 0);
+    const Charset *l = table2();
+    if ((*l)[0x21] >= 0x400) return false;   // the second set is not Latin
+    std::vector<const Rows *> vs;
+    for (auto &ver : pg->versions) vs.push_back(&ver.rows);
+    double v = 0;
+    int n = 0;
+    const bool sw = rows_start_latin(vs, c, *l, pg->ex.nat == 0 && national != 0, &v, &n);
+    if (getenv("TR_SWAP_DEBUG") && !pg->versions.empty() && pg->versions[0].rows.count(0)) {
+        std::string h;
+        for (int k = 8; k < 40; k++) h += (char)std::max(0x20, pg->versions[0].rows.at(0)[k] & 0x7F);
+        fprintf(stderr, "swap? [%s] nat %d/%d vote %.1f words %d -> %s\n", h.c_str(), pg->ex.nat, national, v, n, sw ? "SWAP" : "keep");
+    }
+    return sw;
+}
 
 const Json *Project::clock() const {
     const Json *c = extras["_meta"].find("clock");
@@ -150,7 +174,9 @@ std::string Project::row_text(const Row &b, const std::map<std::string, std::str
     int key = r >= 0 ? r : 1;
     Rows rows; rows[key] = b;
     Over f = fitted(rows, over, t);
-    auto m = row_texts(rows, t, table2(), &f);
+    // t may be the second set (a swapped page): ESC then switches to the first
+    const Charset *t2 = table2() && &t == table2() ? &table() : table2();
+    auto m = row_texts(rows, t, t2, &f);
     auto it = m.find(key);
     return it == m.end() ? "" : it->second;
 }
@@ -533,7 +559,22 @@ Bytes Project::to_t42(const Pages &pages, int &n) const {
         if (pg.deleted) continue;
         const std::string &pid = kv.first;
         int mag = pid[0] - '0', tens = pid[1] - '0', units = pid[2] - '0';
-        for (auto &s : pg.versions) {
+        // страницы карусели под одним субкодом (ТЕЛЕИНФ 100: три анонса под 0000): с одинаковым субкодом приёмник
+        // и любой декодер берут их за одну обновлённую страницу и оставляют последнюю — тогда все подстраницы такой
+        // страницы получают свои номера 0001, 0002 … по порядку (BCD, как у станций)
+        bool renumber = false;
+        { std::set<std::string> seen; for (auto &s : pg.versions) if (!seen.insert(s.s).second) renumber = true; }
+        int subNo = 0;
+        for (auto &s0 : pg.versions) {
+            Version sv;
+            const Version *sp = &s0;
+            if (renumber) {
+                sv = s0; ++subNo;
+                // S1 — единицы, S2 (3 бита) — десятки до 79, дальше S3/S4: номер не повторится
+                sv.s = fmt("%X%X%X%X", (subNo / 1280) % 4, (subNo / 80) % 16, (subNo / 10) % 8, subNo % 10);
+                sp = &sv;
+            }
+            const Version &s = *sp;
             Row hdr; hdr.fill(0x20);
             auto h = s.rows.find(0); if (h != s.rows.end()) hdr = h->second;
             put_mrag(out, mag, 0);
@@ -621,7 +662,7 @@ std::string Project::to_output_html(const Pages &pages) const {
         d["x"] = str_map_json(pg.ex.x26);
         d["note"] = service_note(pg);
         d["cs"] = from_u32(std::u32string(table(&pg).begin(), table(&pg).end()));
-        const Charset *t2 = table2();
+        const Charset *t2 = table2(&pg);
         d["cs2"] = t2 ? Json(from_u32(std::u32string(t2->begin(), t2->end()))) : Json();
         data[kv.first] = d; n++;
     }

@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <map>
 #include <set>
@@ -766,7 +767,7 @@ void gemstarGuide(std::vector<GemstarStream>& all)
             if (c.valid && !year) year = c.year, month = c.month, today = c.day;
         }
     for (auto& s : all) {
-        s.guide.clear(), s.shows.clear(), s.blocksGood = s.blocksBad = 0;
+        s.guide.clear(), s.shows.clear(), s.texts.clear(), s.blocksGood = s.blocksBad = 0;
         typeA(s, year, month);
         auto blocks = typeBBlocks(s);
         if (blocks.empty()) continue;
@@ -782,23 +783,100 @@ void gemstarGuide(std::vector<GemstarStream>& all)
         std::vector<std::string> lines, other;
         for (auto& g : msgs) {
             if (!g.complete || !seen.insert(g.m).second) continue;
+            if (const char* dm = getenv("TR_GSMSG")) {          // отладка: все расшифрованные сообщения
+                static FILE* fm = nullptr;
+                if (!fm) fm = fopen(dm, "wb");
+                if (fm) {
+                    fprintf(fm, "%02X %zu ", g.m[0], g.m.size());
+                    for (uint8_t v : g.m) fprintf(fm, "%02X", v);
+                    fprintf(fm, "\n");
+                    fflush(fm);
+                }
+            }
             types[g.m[0]]++;
             if (g.m[0] == 0) showInfo(s, g, y, m, y == year && m == month ? today : 0, lines);
             else if (g.m[0] == 9) {
                 std::string t = themes(g.m);
                 if (!t.empty()) other.push_back("    themes: " + t);
             } else {
-                std::string txt;
-                size_t run = 0;
-                std::string cur;
+                // типы новее FREQCCD_ 1.5: часть сообщений несёт сжатый текст Gemstar (2a4f), часть —
+                // открытые строки. Считаем «читаемость» (слова из 3+ букв) и берём лучший вариант
+                auto wordScore = [](const std::string& t) {
+                    int words = 0, run = 0;
+                    for (unsigned char c : t) {
+                        if (std::isalpha(c)) { run++; continue; }
+                        if (run >= 3) words++;
+                        run = 0;
+                    }
+                    if (run >= 3) words++;
+                    return (double)words / std::max<size_t>(1, t.size() / 6);
+                };
+                std::string rawTxt, cur;
                 for (uint8_t v : g.m) {
                     if (v >= 0x20 && v < 0x7F) { cur += (char)v; continue; }
-                    if (cur.size() >= 6) txt += (txt.empty() ? "" : " | ") + cur;
+                    if (cur.size() >= 6) rawTxt += (rawTxt.empty() ? "" : " | ") + cur;
                     cur.clear();
                 }
-                if (cur.size() >= 6) txt += (txt.empty() ? "" : " | ") + cur;
-                (void)run;
-                other.push_back(fmt("    type %02X (%s), %zu bytes%s%s", g.m[0], typeBName(g.m[0]), g.m.size(), txt.empty() ? "" : ": ", txt.c_str()));
+                if (cur.size() >= 6) rawTxt += (rawTxt.empty() ? "" : " | ") + cur;
+                // по блокам: каждый 64-байтовый блок сообщения может быть отдельной сжатой строкой
+                std::string blkTxt;
+                for (size_t b = 0; b + 16 <= g.m.size(); b += 64) {
+                    size_t n = std::min<size_t>(64, g.m.size() - b);
+                    std::string best;
+                    double bs = 0;
+                    for (size_t o = 0; o < std::min<size_t>(12, n); o++) {
+                        TextDecoder td;
+                        std::string d = clean(td.decode(g.m.data() + b + o, n - o));
+                        double sc = wordScore(d);
+                        if (sc > bs) bs = sc, best = std::move(d);
+                    }
+                    if (!best.empty() && wordScore(best) >= 0.9) blkTxt += (blkTxt.empty() ? "" : " ") + best;
+                }
+                std::string decTxt = blkTxt;
+                double decScore = wordScore(blkTxt);
+                for (size_t o = 0; o < std::min<size_t>(24, g.m.size()); o++) {
+                    TextDecoder td;
+                    std::string d = clean(td.decode(g.m.data() + o, std::min<size_t>(g.m.size() - o, 512)));
+                    if (d.size() < 8) continue;
+                    double sc = wordScore(d);
+                    if (sc > decScore) decScore = sc, decTxt = std::move(d);
+                }
+                std::string txt = rawTxt;
+                if (decScore >= 1.0) {                       // распаковка имеет смысл только когда текст явно читается
+                    for (char& ch : decTxt) if (ch == '\n') ch = ' ';
+                    txt = decTxt;
+                }
+                std::vector<std::string> segs, plain;
+                size_t a = 0;
+                int shown = 0;
+                while (a < txt.size() && shown < 40) {
+                    size_t e = txt.find(" | ", a);
+                    if (e == std::string::npos) e = txt.size();
+                    std::string seg = txt.substr(a, e - a);
+                    a = e + 3;
+                    while (!seg.empty() && seg.front() == ' ') seg.erase(seg.begin());
+                    while (!seg.empty() && seg.back() == ' ') seg.pop_back();
+                    if (seg.size() < 3) continue;
+                    // управляющие коды цвета/атрибутов идут одной буквой перед текстом: VVideo, CPress, D by
+                    if (seg.size() > 2 && std::strchr("CDVWH", seg[0]) && (seg[1] == ' ' || std::isupper((unsigned char)seg[1]))) {
+                        seg.erase(0, 1);
+                        while (!seg.empty() && seg.front() == ' ') seg.erase(seg.begin());
+                    }
+                    if (seg.size() < 3) continue;
+                    if (seg.size() > 400) seg = seg.substr(0, 400) + "...";
+                    segs.push_back("      " + seg);
+                    plain.push_back(seg);
+                    shown++;
+                }
+                if (segs.empty()) continue;                     // нечего показать — и заголовок не нужен
+                other.push_back(fmt("    type %02X (%s), %zu bytes:", g.m[0], typeBName(g.m[0]), g.m.size()));
+                other.insert(other.end(), segs.begin(), segs.end());
+                {   // то же самое, но структурой — окно программы показывает это списком и открывает по двойному щелчку
+                    GemstarText gt;
+                    gt.type = g.m[0], gt.bytes = g.m.size(), gt.frame = g.frame;
+                    gt.lines = std::move(plain);
+                    s.texts.push_back(std::move(gt));
+                }
             }
         }
         std::string tl;

@@ -70,7 +70,7 @@ static int replayCli(const std::vector<std::string>& args)
     for (int64_t f = 0; f < n; f++) {
         if (fread(frame.data(), 1, (size_t)fb, fi) != (size_t)fb) { n = f; break; }
         dec.feed(frame.data());
-        if (f % 125 == 124) dec.joinProbe();   // every 5 s chunk goes through the probe (live it runs beside)
+        if (f % 125 == 124) { dec.joinProbe(); dec.waitTemplates(); }   // every 5 s chunk goes through the probe (live it runs beside)
         if (f % 500 == 0) { fprintf(stderr, "\r%lld / %lld frames", (long long)f, (long long)n); }
     }
     fclose(fi);
@@ -252,6 +252,7 @@ int main(int argc, char** argv)
     std::string in, jsonOut, textOut, importJson, exportDir;
     bool cleanPages = false;
     std::string squashMode;   // --squash v1|v3|auto|<profile>: Clean pages by the VHSTTX squash
+    std::string destDir;      // --dest <dir>: where clean.t42 and the cleaned pages go (as the GUI's folder choice)
     std::string repairSpec;   // --repair noise=30,dropout=50: VBI repair (VHSTTX) before decoding
     for (size_t i = 0; i < args.size(); i++) {
         const std::string& a = args[i];
@@ -265,6 +266,7 @@ int main(int argc, char** argv)
         else if (a == "--again") opt.again = true;
         else if (a == "--clean") cleanPages = true;
         else if (a == "--squash") { cleanPages = true; squashMode = next(); }
+        else if (a == "--dest") { cleanPages = true; destDir = next(); }
         else if (a == "--json") jsonOut = next();
         else if (a == "--text") textOut = next();
         else if (a == "--export") exportDir = next();
@@ -357,7 +359,7 @@ int main(int argc, char** argv)
     if (cleanPages && !r.teletext.project.empty()) {
         // teletext pages cleaned as in the GUI's "Clean pages": <project>/clean
         try {
-            std::string note, out = ttClean(r.teletext.project, console_progress(), note, "", squashMode);
+            std::string note, out = ttClean(r.teletext.project, console_progress(), note, destDir, squashMode);
             printf("\nClean pages: %s\ncleaned project: %s\n", note.c_str(), out.c_str());
         } catch (std::exception& e) { fprintf(stderr, "clean: %s\n", e.what()); }
     }

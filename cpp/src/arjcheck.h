@@ -13,21 +13,37 @@ struct ArjEntry {
     bool ok = false;          // unpacked and its CRC-32 is right
     std::string why;          // when not: "header CRC", "data CRC", "encrypted", "cut off", ...
     uint32_t got = 0;         // bytes unpacked (all of size when whole; up to where the damage stopped it)
+    uint32_t unknown = 0;     // of them: bytes a hole in the packed data took (their place kept, the value not known)
+    int holes = 0;            // holes the unpacking went on past
     std::vector<uint8_t> data;   // what unpacked, also from a damaged archive
+    size_t at = 0;            // where its packed data starts in the archive
+    size_t hdr = 0;           // where its header (60 EA) starts
+    uint32_t crc = 0;         // the CRC-32 its header gives
 };
 struct ArjCheck {
     bool archive = false;     // starts as an ARJ archive (main header found)
     bool headerOk = false;    // the main header's CRC is right
     bool complete = false;    // the end of the archive reached
+    bool startLost = false;   // the archive's start did not come: its files from the first header that checks
     std::vector<ArjEntry> files;
     int good() const { int n = 0; for (auto& f : files) n += f.ok; return n; }
     std::string summary() const;   // "ARJ: 5 of 5 files right (CRC)" / "ARJ: header damaged" / ...
 };
-ArjCheck arjCheck(const std::vector<uint8_t>& data);
+// lost (when known): per byte of data, 1 = not received (a row of the broadcast that did not come); without it a run
+// of 8 and more zero bytes inside packed data is taken for that. Unpacking goes on past holes and to where a cut-off
+// archive ends; the bytes a hole took are counted in ArjEntry::unknown ("?" in a text, zero otherwise)
+ArjCheck arjCheck(const std::vector<uint8_t>& data, const std::vector<char>* lost = nullptr);
 // every file of the archive, whole or as far as it unpacks, into dir (made); names made safe; returns a list
 // "NAME  size  ok / CRC wrong / N of M bytes" for the report
 std::string arjExtract(const ArjCheck& c, const std::string& dir);
 uint32_t crc32Arj(const uint8_t* p, size_t n, uint32_t crc = 0);
+
+// Damaged files of an archive made whole where their CRC-32 can tell the right bytes: inside each file that does not
+// check, (1) where the copies read a byte differently (alts: per byte the other values read, may be null) every
+// combination, (2) one bit flipped in one byte (a tape's bit error), (3) one or two bytes not received (lost) with all
+// their values. Changes a; log: what was mended; at most `seconds` of work. Returns the files made whole.
+int arjRepair(std::vector<uint8_t>& a, const std::vector<char>* lost, const std::vector<std::vector<uint8_t>>* alts,
+              std::string& log, double seconds = 20);
 
 // Two or more receptions of the same file (each the file's size; 0 = a byte not read) made into one: a byte one copy
 // did not read comes from the others, where they read it differently the commonest value. An ARJ archive is chosen by

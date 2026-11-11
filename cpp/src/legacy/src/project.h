@@ -14,6 +14,7 @@ struct Project {
     void set_charset2(const std::string &cs);
     const Charset &table(const Page *pg = nullptr) const;
     const Charset *table2() const;
+    const Charset *table2(const Page *) const { return table2(); }   // (tt_page_html.inc; swapped pages: src/nabts only)
     const Json *clock() const;
     std::string air_time(double t) const;
     std::string rel(const std::string &p) const;

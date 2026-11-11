@@ -18,6 +18,27 @@ double ccParityRatio(const std::vector<uint8_t>& bytes, const std::vector<uint8_
     return n ? (double)ok / n : 0.0;
 }
 
+int ccKeepGoodStretches(std::vector<uint8_t>& bytes, const std::vector<uint8_t>& valid, double* share)
+{
+    // 240 bytes = 120 pairs = 4 s of one field: long enough for a ratio, short enough for a channel change
+    const size_t W = 240;
+    int good = 0;
+    size_t goodBytes = 0;
+    for (size_t a = 0; a < bytes.size(); a += W) {
+        const size_t b = std::min(bytes.size(), a + W);
+        size_t ok = 0, n = 0;
+        for (size_t i = a; i < b; i++) {
+            if (!valid.empty() && !valid[i]) continue;
+            n++;
+            ok += oddParity(bytes[i]);
+        }
+        if (n >= 40 && ok >= 0.85 * n) { good++; goodBytes += b - a; continue; }
+        for (size_t i = a; i < b; i++) bytes[i] = 0x80;   // a null with good parity
+    }
+    if (share) *share = bytes.empty() ? 0.0 : (double)goodBytes / bytes.size();
+    return good;
+}
+
 // Characters that differ from ASCII in the 608 basic set.
 static std::string ccChar(uint8_t c)
 {

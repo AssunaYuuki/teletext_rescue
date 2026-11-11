@@ -72,7 +72,9 @@ struct TviStream {
     std::vector<std::string> files;  // packet lines (Norpak): files received, as written to disk
     std::vector<TviFile> fileInfo;   // the same files: name, size, blocks received, time
     std::vector<std::string> beacons;   // Norpak: source beacon lines ("name", updated, version, times)
-    std::vector<std::string> texts;     // fТ3: readable text runs (WMO bulletins), as they came
+    std::vector<std::string> texts;     // fТ3: readable text (WMO bulletins), pieces joined where they overlap
+    std::vector<std::string> meteo;     // fТ3: the bulletins and their METAR reports in Russian (lines)
+    std::vector<std::string> catalog;   // fТ3: files of the inserter (folder, name, size), as the descriptors name them
 };
 
 void tviBuild(TviStream& s);  // fills pages, serial, entropy, report from words

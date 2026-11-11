@@ -13,8 +13,12 @@ struct Project {
     static bool is_project(const std::string &path);
     void set_charset(const std::string &cs);
     void set_charset2(const std::string &cs);
+    // the set a row of the page starts in and the one ESC switches to: a page that starts its rows in the second set
+    // (swapped) has them the other way round
     const Charset &table(const Page *pg = nullptr) const;
     const Charset *table2() const;
+    const Charset *table2(const Page *pg) const;
+    bool swapped(const Page *pg) const;
     const Json *clock() const;
     std::string air_time(double t) const;
     std::string rel(const std::string &p) const;

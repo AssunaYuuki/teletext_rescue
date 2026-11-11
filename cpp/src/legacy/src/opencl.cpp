@@ -8,6 +8,8 @@
 #define CL_API
 #endif
 #include <mutex>
+#include <cstdio>
+#include <string>
 #include <stdexcept>
 #include <cstdint>
 #include <tuple>
@@ -48,8 +50,71 @@ struct Api {
     FN(cl_int, clReleaseCommandQueue, (cl_command_queue))
     FN(cl_int, clReleaseContext, (cl_context))
     FN(cl_int, clGetKernelWorkGroupInfo, (cl_kernel, cl_device_id, cl_uint, size_t, void *, size_t *))
+    // for the cache of built programs (optional: without them every program is built from source)
+    FN(cl_int, clGetProgramInfo, (cl_program, cl_uint, size_t, void *, size_t *))
+    FN(cl_program, clCreateProgramWithBinary, (cl_context, cl_uint, const cl_device_id *, const size_t *, const unsigned char **, cl_int *, cl_int *))
 } api;
 #undef FN
+
+// ---------------------------------------------------------------- built programs kept on disk
+// Building a program from source costs the driver 0.5-2 s (NVIDIA: no cache of its own for OpenCL), and the
+// decoder builds several a recording: the binary of each is kept, keyed by device, driver, options and source
+// (%LOCALAPPDATA%\TeletextRescue\clcache, or TR_CLCACHE)
+const cl_uint CL_DRIVER_VERSION_ = 0x102D, CL_PROGRAM_BINARY_SIZES_ = 0x1165, CL_PROGRAM_BINARIES_ = 0x1166;
+std::string cl_cache_dir() {
+    if (const char *e = getenv("TR_CLCACHE")) return e;
+    const char *b = getenv("LOCALAPPDATA");
+    if (!b) b = getenv("TEMP");
+    return b ? std::string(b) + "/TeletextRescue/clcache" : std::string();
+}
+std::string cl_cache_file(cl_device_id d, const std::string &src, const std::string &opts) {
+    std::string dir = cl_cache_dir();
+    if (dir.empty()) return "";
+    char nm[256] = {0}, dv[256] = {0};
+    api.clGetDeviceInfo(d, CL_DEVICE_NAME, sizeof nm - 1, nm, nullptr);
+    api.clGetDeviceInfo(d, CL_DRIVER_VERSION_, sizeof dv - 1, dv, nullptr);
+    uint64_t h = 1469598103934665603ull;
+    for (const std::string &s : {std::string(nm), std::string(dv), opts, src}) {
+        for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
+        h ^= 0xFF; h *= 1099511628211ull;
+    }
+    char b[40]; snprintf(b, sizeof b, "/legacy_%016llx.bin", (unsigned long long)h);
+    return dir + b;
+}
+cl_program cl_cached_program(cl_context ctx, cl_device_id d, const std::string &file) {
+    if (file.empty() || !api.clCreateProgramWithBinary) return nullptr;
+    FILE *f = fopen(file.c_str(), "rb");
+    if (!f) return nullptr;
+    std::vector<unsigned char> bin;
+    unsigned char buf[65536]; size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) bin.insert(bin.end(), buf, buf + n);
+    fclose(f);
+    if (bin.empty()) return nullptr;
+    const unsigned char *p = bin.data(); size_t len = bin.size(); cl_int st = 0, e = 0;
+    cl_program pr = api.clCreateProgramWithBinary(ctx, 1, &d, &len, &p, &st, &e);
+    if (!pr || e || st) { if (pr) api.clReleaseProgram(pr); return nullptr; }
+    if (api.clBuildProgram(pr, 1, &d, "", nullptr, nullptr) != 0) { api.clReleaseProgram(pr); return nullptr; }
+    return pr;
+}
+void cl_keep_program(cl_program pr, const std::string &file) {
+    if (file.empty() || !api.clGetProgramInfo) return;
+    size_t len = 0;
+    if (api.clGetProgramInfo(pr, CL_PROGRAM_BINARY_SIZES_, sizeof len, &len, nullptr) != 0 || !len) return;
+    std::vector<unsigned char> bin(len);
+    unsigned char *p = bin.data();
+    if (api.clGetProgramInfo(pr, CL_PROGRAM_BINARIES_, sizeof p, &p, nullptr) != 0) return;
+    std::string dir = file.substr(0, file.find_last_of('/'));
+#ifdef _WIN32
+    for (size_t i = 0; i <= dir.size(); i++)   // the folders on the way
+        if (i == dir.size() || ((dir[i] == '/' || dir[i] == '\\') && i > 2)) CreateDirectoryA(dir.substr(0, i).c_str(), nullptr);
+#endif
+    std::string tmp = file + ".tmp" + std::to_string((uintptr_t)&bin);
+    FILE *f = fopen(tmp.c_str(), "wb");
+    if (!f) return;
+    bool ok = fwrite(bin.data(), 1, len, f) == len;
+    fclose(f);
+    if (!ok || std::rename(tmp.c_str(), file.c_str()) != 0) std::remove(tmp.c_str());
+}
 
 bool loaded = false, ok = false; std::string name; size_t lmem = 0, maxwg = 256;
 std::vector<cl_device_id> devs; std::vector<gpu::Device> infos;
@@ -115,6 +180,13 @@ void load() {
     LOAD(clReleaseMemObject) LOAD(clReleaseKernel) LOAD(clReleaseProgram) LOAD(clReleaseCommandQueue) LOAD(clReleaseContext)
     LOAD(clGetKernelWorkGroupInfo)
 #undef LOAD
+#ifdef _WIN32
+    api.clGetProgramInfo = (decltype(api.clGetProgramInfo))GetProcAddress(h, "clGetProgramInfo");
+    api.clCreateProgramWithBinary = (decltype(api.clCreateProgramWithBinary))GetProcAddress(h, "clCreateProgramWithBinary");
+#else
+    api.clGetProgramInfo = (decltype(api.clGetProgramInfo))dlsym(h, "clGetProgramInfo");
+    api.clCreateProgramWithBinary = (decltype(api.clCreateProgramWithBinary))dlsym(h, "clCreateProgramWithBinary");
+#endif
     cl_platform_id plats[16]; cl_uint np = 0;
     if (api.clGetPlatformIDs(16, plats, &np) != 0) return;
     for (cl_uint i = 0; i < np && i < 16; i++) {
@@ -227,14 +299,20 @@ void Buffer::read(void *p, size_t n) const {
 
 Kernel::Kernel(const std::string &src, const char *kname, const std::string &opts) {
     need();
-    const char *s = src.c_str(); size_t len = src.size(); cl_int e = 0;
-    prog = api.clCreateProgramWithSource(ctx, 1, &s, &len, &e);
-    if (!prog || e) throw std::runtime_error("clCreateProgramWithSource failed");
-    if (api.clBuildProgram((cl_program)prog, 1, &dev, opts.c_str(), nullptr, nullptr) != 0) {
-        std::string log(16384, 0); size_t n = 0;
-        api.clGetProgramBuildInfo((cl_program)prog, dev, CL_PROGRAM_BUILD_LOG, log.size(), log.data(), &n);
-        log.resize(n);
-        throw std::runtime_error("OpenCL build failed: " + log);
+    cl_int e = 0;
+    const std::string cache = cl_cache_file(dev, src, opts);
+    prog = cl_cached_program(ctx, dev, cache);
+    if (!prog) {
+        const char *s = src.c_str(); size_t len = src.size();
+        prog = api.clCreateProgramWithSource(ctx, 1, &s, &len, &e);
+        if (!prog || e) throw std::runtime_error("clCreateProgramWithSource failed");
+        if (api.clBuildProgram((cl_program)prog, 1, &dev, opts.c_str(), nullptr, nullptr) != 0) {
+            std::string log(16384, 0); size_t n = 0;
+            api.clGetProgramBuildInfo((cl_program)prog, dev, CL_PROGRAM_BUILD_LOG, log.size(), log.data(), &n);
+            log.resize(n);
+            throw std::runtime_error("OpenCL build failed: " + log);
+        }
+        cl_keep_program((cl_program)prog, cache);
     }
     k = api.clCreateKernel((cl_program)prog, kname, &e);
     if (!k || e) throw std::runtime_error(std::string("clCreateKernel failed: ") + kname);
