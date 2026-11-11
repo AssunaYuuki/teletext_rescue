@@ -28,7 +28,7 @@
   filters); ARJ archives unpacked through damage (lost start, cut-off end, holes) and mended by their CRCs,
   copies of a file under other names combined; TV-Inform fT3 files put together by themselves from a full
   capture (the order of the lines is learnt, single bit errors mended by CRC-32); Бизнес-Текст: open files of
-  the 1996 catalogue written as received, the key search no longer fooled by them.
+  the 1996 catalogue written as received, the key search no longer fooled by them; a catalogue entry received with its name damaged joins its file instead of making a second one, and the share read counts the blocks that never came.
 - Page editor: Ctrl+S also writes `<recording> edit.t42`. A `.t42` of one page opens.
 - **macOS and Linux**: the start screen is in the main window again (it went into a borderless window of its
   own, and the empty main window, once clicked, covered all the other windows); a window that is opened or

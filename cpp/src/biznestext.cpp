@@ -722,12 +722,14 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
                 catOf(on, ob, os, oc);
                 long orr = rowsOf(on);
                 if (orr < mr || (orr == mr && oc <= mc)) continue;   // joins the copy received more
-                if (mb > 0 && ob > 0 && mb != ob) continue;
-                if (ms > 0 && os > 0 && ms != os) continue;
-                if (ob <= 0 && os <= 0) continue;   // nothing in the catalogue to tell
                 int diff = 0;
                 if (on.size() == me.size()) for (size_t i = 0; i < on.size(); i++) diff += on[i] != me[i];
                 else diff = 99;
+                // the block count of a catalogue row read with its name damaged may be damaged too (live 25.05.96:
+                // "EX@MQCH1.ARJ 38 blocks" = EXAMPCH1.ARJ, 40): the same size and a name a character or two off decide
+                if (mb > 0 && ob > 0 && mb != ob && !(diff <= 2 && ms > 0 && ms == os)) continue;
+                if (ms > 0 && os > 0 && ms != os) continue;
+                if (ob <= 0 && os <= 0) continue;   // nothing in the catalogue to tell
                 long n;
                 double a = agree(me, on, n);
                 // ten rows and more the same bytes: the same file whatever the name ("AVTOZAWM.01!" = AVTOZAP.C01,
@@ -1018,8 +1020,11 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
         // = 129, each sent whole on page 601 - the generator's page changed before its catalogue rows) is not the
         // block it says: always the data of the block 16 further on (the round of 16 pages), so block b is taken as
         // not received when it reads as block b+16 (neighbouring blocks of disk leftovers may well be alike)
+        // (not for a file sent open: the test table BTEST*.TXT has blocks that differ only in their number, "Блок
+        // 0006" - 59 of its 75 blocks were left out, 21% read of a file received whole)
         std::vector<int> dropped;
         for (auto& x : D) {
+            if (open) break;
             auto y = D.find(x.first + 16);
             if (y == D.end()) continue;
             int n = 0, eq = 0;
@@ -1061,6 +1066,7 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
         std::string txt;
         std::vector<int> txtIn;   // the file's bytes, -1 = row not received
         long& bad = w.bytesBad;   // bytes of the blocks received that did not come or did not read
+        long lost = 0;            // bytes of the file not there at all: also the blocks that never came
         for (int b = 1; b <= nb; b++) {
             auto it = f.second.find(b);
             auto dt = D.find(b);
@@ -1072,6 +1078,7 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
             for (int o = 0; o < bb; o++) {
                 int v = dt != D.end() ? dt->second[o] : -1;
                 if (dt != D.end() && v < 0 && (size <= 0 || (long)bin.size() < size)) bad++;
+                if (v < 0 && (size <= 0 || (long)bin.size() < size)) lost++;
                 bin.push_back(v >= 0 ? (uint8_t)v : 0);
                 txtIn.push_back(v);
             }
@@ -1122,7 +1129,8 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
             openableCopy(w.path, true, &w.unread);
         }
         // how much is there, and does it check
-        w.readPct = bin.empty() ? 0 : 100.0 * (double)((long)bin.size() - std::min<long>(bad, (long)bin.size())) / bin.size();
+        // (of the whole file: EX@MQCH1.ARJ, 1 block of 38 received, said "100.0% read; every byte read")
+        w.readPct = bin.empty() ? 0 : 100.0 * (double)((long)bin.size() - std::min<long>(lost, (long)bin.size())) / bin.size();
         // an ARJ archive also when its start did not come (by its name, its files from the first header that checks);
         // the rows not received are told to the unpacking, which goes on past them
         std::vector<char> lostMask(txtIn.size(), 0);
@@ -1188,10 +1196,10 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
                 w.checkOk = info.lines > 0 && info.linesGood == info.lines && !info.repaired && un.empty();
             } else w.check = headBad ? "PCX: header damaged, does not decode" : "PCX: does not decode";
         } else if (isText) {
-            w.check = bad ? fmt("text: %ld bytes did not read", bad) : "text: every byte read";
-            w.checkOk = bad == 0;
+            w.check = lost ? fmt("text: %ld bytes did not read", lost) : "text: every byte read";
+            w.checkOk = lost == 0;
         } else {
-            w.check = bad ? "no check for this kind of file; bytes missing" : "no check for this kind of file; every byte read";
+            w.check = lost ? "no check for this kind of file; bytes missing" : "no check for this kind of file; every byte read";
             w.checkOk = false;
         }
         // old contents of the sender's disk: its directories and texts in leftovers/<name>.txt
@@ -1204,7 +1212,7 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
         }
         rep += fmt("%-14s %-32s %s  blocks %d of %d, rows %d of %d", w.name.c_str(), w.content.c_str(), w.decrypted ? "decrypted" : w.open ? "open     " : "as sent  ", w.blocksHave,
                    std::max(nb, 0), w.rowsHave, w.rows) + (w.rowsBad ? fmt(" (%d spoiled rows left out)", w.rowsBad) : std::string()) +
-               (bad ? fmt(", %ld bytes missing or not readable", bad) : std::string()) +
+               (lost ? fmt(", %ld bytes missing or not readable", lost) : std::string()) +
                (w.sumRight + w.sumMended + w.sumWrong ? fmt(", block sums %d right, %d mended, %d wrong", w.sumRight, w.sumMended, w.sumWrong) : std::string()) + (size > 0 ? fmt(", %ld bytes by the catalogue", size) : std::string()) +
                fmt("\n               %.1f%% read; check: %s%s", w.readPct, w.check.c_str(), w.checkOk ? "  [OK]" : "");
         for (size_t k = 0; k < dropped.size(); k++)
