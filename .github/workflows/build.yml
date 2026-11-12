@@ -27,7 +27,7 @@ jobs:
           - os: ubuntu-22.04
             name: TeletextRescue-linux-x86
             arch: i686
-          - os: macos-14
+          - os: macos-15
             name: TeletextRescue-macos-universal
     runs-on: ${{ matrix.os }}
     env:
