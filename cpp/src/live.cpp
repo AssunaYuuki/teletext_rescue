@@ -18,6 +18,7 @@ namespace legacy {
 #include <algorithm>
 #include <filesystem>
 #include <chrono>
+#include <ctime>
 #include <cmath>
 #include <atomic>
 #include <thread>
@@ -103,6 +104,18 @@ void lowPriority(bool lowest)
     SetThreadPriority(GetCurrentThread(), lowest ? THREAD_PRIORITY_LOWEST : THREAD_PRIORITY_BELOW_NORMAL);
 #else
     (void)lowest;
+#endif
+}
+
+// processor time of the whole process, in seconds (for the TR_LC_PROF / TR_GPUTIME studies)
+static double processCpuSeconds()
+{
+#ifdef _WIN32
+    FILETIME c, e, k, u;
+    GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
+    return ((((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime)) / 1e7;
+#else
+    return (double)std::clock() / CLOCKS_PER_SEC;
 #endif
 }
 
@@ -507,11 +520,7 @@ void LiveDecoder::feed(const uint8_t* frame)
     // lines then skip their own slicing and take the packet the card read (one kernel call for the whole frame)
     // study (TR_LC_PROF=1): processor time of the process spent in the card's call and in the lines' own decoding
     static const bool prof = getenv("TR_LC_PROF") != nullptr;
-    auto cpuNow = [] {
-        FILETIME c, e, k, u;
-        GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
-        return ((((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime)) / 1e7;
-    };
+    auto cpuNow = processCpuSeconds;
     static double pGpu = 0, pLines = 0, pRest = 0, pT = 0;
     double c0 = prof ? cpuNow() : 0;
     if (gpuWanted_ && !gpuDead_) { gpuStart(); if (gp_) gpuFrame(frame); }
@@ -1506,11 +1515,7 @@ void LiveDecoder::gpuFrame(const uint8_t* frame)
         try {
             static const bool timing = getenv("TR_GPUTIME") != nullptr;   // study: time of the card's calls
             auto t0 = std::chrono::steady_clock::now();
-            auto cpu = [] {
-                FILETIME c, e, k, u;
-                GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
-                return ((((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime)) / 1e7;
-            };
+            auto cpu = processCpuSeconds;
             const double c0 = timing ? cpu() : 0;
             res = bd.decode(rows, n, std::max(0.0, lo), std::max(lo, hi), nullptr, 0.5);
             if (timing) {
