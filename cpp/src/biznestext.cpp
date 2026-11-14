@@ -92,6 +92,18 @@ void BtCatalog::packet(const uint8_t* p, int64_t frame)
     std::string page = cur.page;
     cur.on = false;
     cur.closed = true;
+    // 9.12.93 (the earliest, «Российские университеты» channel): the same fields, but every byte is sent as
+    // its 7-bit character with odd parity + a check byte (also odd parity), not as two Hamming 8/4 nibbles;
+    // row 21 begins "****" where 1994 has AA AA AA AA. A pair whose bytes fail their parity reads -1 (the
+    // copies are voted as for the Hamming pairs)
+    auto oddp = [](uint8_t x) { x ^= x >> 4; x ^= x >> 2; x ^= x >> 1; return (x & 1) != 0; };
+    int stars = 0;
+    for (int k = 0; k < 4; k++) stars += (r21[2 * k] & 0x7F) == '*' && oddp(r21[2 * k]) && oddp(r21[2 * k + 1]);
+    const bool y93 = stars >= 3;
+    auto pairAt = [&](const std::vector<uint8_t>& q, int i) {
+        if (!y93) return ::pairAt(q, i);
+        return oddp(q[2 * i]) && oddp(q[2 * i + 1]) ? (int)(q[2 * i] & 0x7F) : -1;
+    };
     std::string nm;
     for (int k = 4; k < 15; k++) {
         int c = pairAt(r21, k);
@@ -109,6 +121,7 @@ void BtCatalog::packet(const uint8_t* p, int64_t frame)
         // closed: AA AA AA AA in Hamming pairs; open (BTEST on 25.05.96): plain spaces there, no Hamming pairs
         int aa = 0;
         for (int k = 0; k < 4; k++) aa += pairAt(r21, k) == 0xAA;
+        if (y93) aa = stars;
         if (aa >= 3) e.closed++;
         else e.open++;
     }

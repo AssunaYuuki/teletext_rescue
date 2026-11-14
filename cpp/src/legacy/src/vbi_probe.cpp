@@ -801,6 +801,14 @@ Json vbi_probe(const std::string &path, Progress &pr, int units, const std::stri
                 if (getenv("TR_DEBUG")) fprintf(stderr, "line %d (unknown) sine purity %.2f at %.2f MHz\n", tvl, pf.first, pf.second / 1e6);
                 if (pf.first > 0.3 && pf.second > 3.5e6 && pf.second < 5.0e6) { kind = fmt("test signal: SECAM colour identification (%.2f MHz)", pf.second / 1e6); best = ""; }
             }
+            // SECAM test signal with the colour subcarrier (D'R 4.41 / D'B 4.25 MHz) on the test lines 17-22 /
+            // 330-335: its phase turns over from frame to frame, so the line "changes" (neww: line 331 on every
+            // Russian channel) - a test signal, not a picture or data
+            if (!R.ntsc() && ((tvl >= 16 && tvl <= 22) || (tvl >= 329 && tvl <= 335)) && kind == "picture or unknown signal" && sig > 0.05 && !arows.empty()) {
+                auto pf = sine_purity(arows, lo, hi, R.fs);
+                if (getenv("TR_DEBUG")) fprintf(stderr, "line %d (unknown, test lines) sine purity %.2f at %.2f MHz\n", tvl, pf.first, pf.second / 1e6);
+                if (pf.first > 0.2 && pf.second > 4.1e6 && pf.second < 4.6e6) { kind = fmt("test signal with the SECAM colour subcarrier (%.2f MHz)", pf.second / 1e6); best = ""; }
+            }
             if ((tvl == 21 || tvl == 284) && sig > 0.01 && best.empty()) {
                 int ok = 0, b2[2]; size_t m = std::min<size_t>(40, Y.size());
                 for (size_t i = 0; i < m; i++) ok += cc_slice(Y[i], R.fs, b2);
