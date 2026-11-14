@@ -437,8 +437,8 @@ void LiveDecoder::startProbe()
                 }
                 for (auto& kv : names) kinds[kv.first] = kv.second;
                 std::remove(path.c_str());
-            }
-        } catch (...) {}
+            } else if (getenv("TR_DEBUG")) fprintf(stderr, "probe: cannot write %s\n", path.c_str());
+        } catch (std::exception& e) { if (getenv("TR_DEBUG")) fprintf(stderr, "probe: %s\n", e.what()); } catch (...) { if (getenv("TR_DEBUG")) fprintf(stderr, "probe: exception\n"); }
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (!kinds.empty()) {
