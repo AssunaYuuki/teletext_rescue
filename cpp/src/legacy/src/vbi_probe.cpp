@@ -786,7 +786,11 @@ Json vbi_probe(const std::string &path, Progress &pr, int units, const std::stri
                 bool secam_lines = !R.ntsc() && ((tvl >= 7 && tvl <= 15) || (tvl >= 320 && tvl <= 328));
                 if (getenv("TR_DEBUG")) fprintf(stderr, "line %d sine purity %.2f at %.2f MHz\n", tvl, pf.first, pf.second / 1e6);
                 if (pf.first > (secam_lines ? 0.3 : 0.5)) {
-                    if (secam_lines) kind = fmt("test signal: SECAM colour identification (%.2f MHz)", pf.second / 1e6);
+                    // SECAM identification is the D'R / D'B subcarrier, 3.9-4.75 MHz; a low peak on these lines is
+                    // something else (capture_2026-11-13_221918 lines 14/15: 0.8 MHz, changing every frame)
+                    bool idBand = pf.second > 3.5e6 && pf.second < 5.0e6;
+                    if (secam_lines && idBand) kind = fmt("test signal: SECAM colour identification (%.2f MHz)", pf.second / 1e6);
+                    else if (secam_lines) kind = fmt("unknown signal (%.2f MHz peak), not SECAM identification", pf.second / 1e6);
                     else kind = fmt("interference (%.2f MHz sine), not data", pf.second / 1e6);
                     best = "";
                 }
@@ -795,7 +799,7 @@ Json vbi_probe(const std::string &path, Progress &pr, int units, const std::stri
             if (!R.ntsc() && ((tvl >= 7 && tvl <= 15) || (tvl >= 320 && tvl <= 328)) && kind == "picture or unknown signal" && sig > 0.05 && !arows.empty()) {
                 auto pf = sine_purity(arows, lo, hi, R.fs);
                 if (getenv("TR_DEBUG")) fprintf(stderr, "line %d (unknown) sine purity %.2f at %.2f MHz\n", tvl, pf.first, pf.second / 1e6);
-                if (pf.first > 0.3) { kind = fmt("test signal: SECAM colour identification (%.2f MHz)", pf.second / 1e6); best = ""; }
+                if (pf.first > 0.3 && pf.second > 3.5e6 && pf.second < 5.0e6) { kind = fmt("test signal: SECAM colour identification (%.2f MHz)", pf.second / 1e6); best = ""; }
             }
             if ((tvl == 21 || tvl == 284) && sig > 0.01 && best.empty()) {
                 int ok = 0, b2[2]; size_t m = std::min<size_t>(40, Y.size());

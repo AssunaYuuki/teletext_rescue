@@ -327,6 +327,8 @@ static std::vector<std::string> tviLines(const std::vector<const TviChunk*>& ch,
     std::string cur;
     bool cyr = false;
     uint8_t prev = 0;
+    // (no [...] by frame gaps between Hamming chunks: tried on ostankino 1995 - the inserter's pace is uneven,
+    // gaps of 8 frames stood inside whole words; where chunks were lost cannot be told from the frames)
     for (auto* c : ch) {
         // a chunk that was sent (its header came) but not received (a dropout on the tape): [...], else the
         // words either side run together and the text looks mixed up
@@ -795,6 +797,43 @@ TviLineTest tviTestLine(const uint8_t* probe, int probeN, size_t frameBytes, siz
         // fТ1 without the idle carrier (ORT 2001, sample.vbi lines 329 / 330: white between the words): a carousel -
         // at least 3 in 10 sliced words come again in the probes, and there are at least 8 different words
         bool carousel = r == 0 && !capJob && h * 10 >= sig * 5 && rep * 10 >= h * 3 && seen.size() >= 8;
+        // a carousel changes its words from frame to frame; a waveform that stays the same in every frame is a
+        // constant signal whose slicing only varies with noise (europa.vbi line 16: three levels, frames differ
+        // by 6% of the swing)
+        if (carousel) {
+            auto at = [&](const uint8_t* p, int i) { return fmt ? (p[2 * i] | p[2 * i + 1] << 8) >> 8 : (int)p[i]; };
+            std::vector<double> d;
+            for (int i = 0; i + 1 < probeN; i++) {
+                const uint8_t* a = &probe[(size_t)i * frameBytes + lineOff];
+                const uint8_t* b = &probe[(size_t)(i + 1) * frameBytes + lineOff];
+                if (tviSwing(a, fmt, samples) < 0.10f || tviSwing(b, fmt, samples) < 0.10f) continue;
+                int lo = 255, hi = 0;
+                double s = 0;
+                for (int k = samples / 20; k < samples - samples / 20; k++) {
+                    int va = at(a, k);
+                    lo = std::min(lo, va); hi = std::max(hi, va);
+                    s += std::abs(va - at(b, k));
+                }
+                if (hi > lo) d.push_back(s / (samples - 2 * (samples / 20)) / (hi - lo));
+            }
+            if (d.size() >= 8) {
+                std::nth_element(d.begin(), d.begin() + d.size() / 2, d.end());
+                if (d[d.size() / 2] < 0.12) carousel = false;
+                if (getenv("TR_DEBUG")) fprintf(stderr, "tviTestLine carousel: frame-to-frame change %.3f of the swing\n", d[d.size() / 2]);
+            }
+        }
+        // the same word in nearly every frame, and not the idle carrier (55 / AA): a constant test or
+        // identification signal of the station (europa.vbi line 16: three levels, one word in 84% of the lines)
+        int most = 0, mostIdle = 0;
+        for (auto& kv : seen)
+            if (kv.second > most) {
+                most = kv.second;
+                mostIdle = 0;
+                for (uint8_t v : kv.first) mostIdle += v == 0x55 || v == 0xAA;
+            }
+        bool constant = h >= 10 && most * 10 >= h * 8 && mostIdle < 4;
+        if (getenv("TR_DEBUG")) fprintf(stderr, "tviTestLine rate %d: sig %d sliced %d pilot %d words %zu most %d (idle bytes %d)%s\n", r, sig, h, pre, seen.size(), most, mostIdle, constant ? " constant" : "");
+        if (constant && force < 0) continue;
         if ((sig * 10 >= probeN && ((h * 10 >= sig * 6 && pre * 10 >= h && strict) || carousel)) || force >= 0) { rate = r; hits = h; }
     }
     if (rate < 0) return out;

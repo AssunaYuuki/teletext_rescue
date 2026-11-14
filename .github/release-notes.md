@@ -26,3 +26,8 @@
 - **Teletext enhancements X/26** (issue #5): one wrong bit of a triplet is corrected, a bad triplet no longer
   loses the rest of the packet, and `.t42` export keeps the X/26 rows of each subpage (TVP2 1998: 185 pages with
   diacritics instead of 173, 43% more accented letters).
+- **Lines named right**: a constant signal of the station (the same waveform in every frame) is no longer taken
+  for a ТВ-информ carousel; a low-frequency signal on the SECAM identification lines 7-15 / 320-328 is shown as an
+  unknown signal instead of "SECAM colour identification (0.8 MHz)" (the identification is 3.9-4.75 MHz).
+- **Live**: the found files window refreshes when a file's text grows; the line probe says why it did not run
+  (`TR_DEBUG=1`).
