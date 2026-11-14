@@ -6,8 +6,10 @@
 namespace {
 
 constexpr uint32_t kMagic = 0x31435254;   // "TRC1"
-constexpr uint32_t kVersion = 23;          // bump when a saved structure changes (23: layout choice and captions of
-                                            // channel-changing NTSC captures - results saved before are decoded again)
+constexpr uint32_t kVersion = 26;          // bump when a saved structure changes (23: layout choice and captions of
+                                            // channel-changing NTSC captures - results saved before are decoded again;
+                                            // 24: the VPS report; 25: VPS text read through lost frames, time of the broadcast;
+                                            // 26: ТВ-информ files from damaged blocks, their text)
 
 // One archive type for both directions: R = reading.
 template <bool R> struct Ar {
@@ -113,7 +115,7 @@ template <bool R> void io(Ar<R>& a, GemstarStream& s)
 template <bool R> void io(Ar<R>& a, TviWord& w) { all(a, w.frame, w.lineNo, w.field, w.bytes, w.quality); }
 template <bool R> void io(Ar<R>& a, TviPage& p) { all(a, p.lineNo, p.field, p.copies, p.bytes); }
 template <bool R> void io(Ar<R>& a, TviChunk& c) { all(a, c.frame, c.header, c.kind, c.fixed, c.chars); }
-template <bool R> void io(Ar<R>& a, TviFile& f) { all(a, f.id, f.size, f.crc, f.blocks, f.have, f.name, f.shortName, f.time, f.path, f.note, f.missing); }
+template <bool R> void io(Ar<R>& a, TviFile& f) { all(a, f.id, f.size, f.crc, f.blocks, f.have, f.name, f.shortName, f.time, f.path, f.note, f.missing, f.damaged, f.unread, f.text); }
 template <bool R> void io(Ar<R>& a, TviStream& s) { all(a, s.rate, s.nbits, s.words, s.pages, s.serial, s.entropy, s.report, s.files, s.fileInfo, s.beacons); }
 // 5.7 Mbit/s, teletext, old engine
 template <bool R> void io(Ar<R>& a, FastPacket& p) { all(a, p.frame, p.lineNo, p.field, p.kind, p.syncErr, p.crc, p.bytes); }
@@ -139,7 +141,7 @@ template <bool R> void io(Ar<R>& a, DecodeResult& r)
 {
     all(a, r.path, r.source, r.captureNotes, r.geom, r.slicerName, r.sliceSeconds, r.totalSeconds, r.lines, r.db, r.captions,
         r.xds, r.silentRadio, r.amol, r.gemstar, r.tvinform, r.fieldsSwapped, r.fastPackets, r.fastReport, r.fastText,
-        r.nabtsT33, r.nabtsField, r.nabtsLine, r.legacy, r.teletext, r.colour, r.log, r.jtes, r.captionCues, r.vitc, r.vitcReport, r.lineForce, r.timeCode);
+        r.nabtsT33, r.nabtsField, r.nabtsLine, r.legacy, r.teletext, r.colour, r.log, r.jtes, r.captionCues, r.vitc, r.vitcReport, r.lineForce, r.timeCode, r.vpsReport);
 }
 
 // size and modification time of the recording: saved results only fit the same file

@@ -59,6 +59,9 @@ struct TviFile {
     std::string name, shortName, time, path;    // path = where it was written ("" = not written)
     std::string note;                           // what was made of it (a fax page as PNG, ...)
     std::vector<int> missing;                   // block numbers not received
+    std::vector<int> damaged;                   // blocks taken from a damaged copy (its CRC does not match)
+    std::vector<long> unread;                   // byte positions in the file not received or in a damaged packet
+    std::vector<std::string> text;              // a text file: its lines as UTF-8 ("[…]" where bytes did not come)
 };
 
 struct TviStream {

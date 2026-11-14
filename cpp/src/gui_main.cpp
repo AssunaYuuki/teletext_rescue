@@ -3,6 +3,8 @@
 // the "What is in" window and one window per service.
 #include "version.h"
 #include "gui_app.h"
+#include <cstring>
+#include "dvbts.h"
 #include "flac.h"
 #include "rescache.h"
 #include "slicer.h"
@@ -276,13 +278,13 @@ struct LedBoard : Window {
 
 // ================================================================ start screen
 struct StartActions {
-    std::function<void()> open_vbi, open_packets, pick_device, capture, view_lines;
+    std::function<void()> open_vbi, open_packets, open_ts, pick_device, capture, view_lines;
     std::function<void(const Json &)> open_recent;
 };
 
 struct StartScreen : Window {
     StartActions act;
-    HWND title, sub, b_vbi, b_pk, b_dev, b_cap, b_view, hint, rec_h, svc_h, formats;
+    HWND title, sub, b_vbi, b_pk, b_ts, b_dev, b_cap, b_view, hint, rec_h, svc_h, formats;
     std::vector<HWND> recent_btns; std::vector<Json> recent;
     std::vector<std::pair<std::string, std::string>> services = {
         {"StarSight", "StarSight programme guide \xE2\x80\x94 channels, schedules, titles (PBS, line 16)"},
@@ -302,6 +304,7 @@ struct StartScreen : Window {
             sub = label(hwnd, "StarSight, Silent Radio, captions and data\nhidden in the vertical blanking interval"); set_label_colour(sub, MUTED);
             b_vbi = button(hwnd, 1, "\xF0\x9F\x93\xBC  Open .vbi recording\xE2\x80\xA6", BTN_ACCENT);
             b_pk = button(hwnd, 3, "Open packets .t42 / .t34 / .t33\xE2\x80\xA6", BTN_BIG);
+            b_ts = button(hwnd, 6, "\xF0\x9F\x93\xA1  DVB stream .ts\xE2\x80\xA6", BTN_BIG);
             b_dev = button(hwnd, 2, "Decode on: graphics card or processor\xE2\x80\xA6", BTN_BIG);
             b_cap = button(hwnd, 4, "\xF0\x9F\x93\xBA  Capture card (live)\xE2\x80\xA6", BTN_BIG);
             b_view = button(hwnd, 5, "\xF0\x9F\x93\x88  View VBI lines (no decoding)\xE2\x80\xA6", BTN_LINK);
@@ -331,10 +334,11 @@ struct StartScreen : Window {
             MoveWindow(sub, px, y, rc.right - 2 * px - lw, S(hwnd, 44), TRUE); y += S(hwnd, 60);
             MoveWindow(b_vbi, px, y, S(hwnd, 260), S(hwnd, 44), TRUE);
             MoveWindow(b_pk, px + S(hwnd, 272), y, S(hwnd, 280), S(hwnd, 44), TRUE);
-            MoveWindow(b_dev, px + S(hwnd, 564), y, S(hwnd, 340), S(hwnd, 44), TRUE);
-            MoveWindow(b_cap, px + S(hwnd, 916), y, S(hwnd, 250), S(hwnd, 44), TRUE);
+            MoveWindow(b_ts, px + S(hwnd, 564), y, S(hwnd, 210), S(hwnd, 44), TRUE);
+            MoveWindow(b_cap, px + S(hwnd, 786), y, S(hwnd, 250), S(hwnd, 44), TRUE);
             y += S(hwnd, 50);
             MoveWindow(b_view, px, y, S(hwnd, 420), S(hwnd, 30), TRUE);
+            MoveWindow(b_dev, px + S(hwnd, 432), y, S(hwnd, 340), S(hwnd, 30), TRUE);
             y += S(hwnd, 36);
             MoveWindow(hint, px, y, std::min((int)rc.right - 2 * px, S(hwnd, 760)), S(hwnd, 40), TRUE); y += S(hwnd, 56);
             int cw = (rc.right - 2 * px - S(hwnd, 12)) / 2, ch = rc.bottom - y - S(hwnd, 40);
@@ -365,6 +369,7 @@ struct StartScreen : Window {
         case WM_COMMAND: {
             int id = LOWORD(w);
             if (id == 1) act.open_vbi(); else if (id == 2) act.pick_device(); else if (id == 3) act.open_packets(); else if (id == 4) act.capture(); else if (id == 5) act.view_lines();
+            else if (id == 6) act.open_ts();
             else if (id >= 100 && id - 100 < (int)recent.size()) { Json r = recent[id - 100]; act.open_recent(r); }
             return 0;
         }
@@ -380,6 +385,8 @@ struct RecWin : Window {
     std::vector<Service> svc;
     HWND h_title, h_sub, h_head, map_h, res_h, b_report, b_json, b_export, b_close, b_lines; std::vector<HWND> rbtn, rnote;
     RECT mapr{}, resr{};
+    bool dvb = false;                       // a DVB transport stream: its tables where a recording shows its lines
+    std::vector<std::string> dvbInfo;
     struct Row { int tv; std::string kind, text; double read; };
     std::vector<Row> rows;
     void build_rows()
@@ -409,15 +416,147 @@ struct RecWin : Window {
                 rows.push_back(r);
             }
     }
+    // a DVB stream where a recording shows its VBI lines: the facts of the stream, then each program as a table of its
+    // streams (PID, what it is, language, what the stream says, when it runs, packets), then the channels and programmes
+    void paint_dvb(HDC dc)
+    {
+        HFONT fn = font(hwnd, 9), fb = font(hwnd, 9, true), fh = font(hwnd, 10, true), fm = font(hwnd, 9, false, L"Consolas");
+        const int x = mapr.left + S(hwnd, 14), right = mapr.right - S(hwnd, 14), bottom = mapr.bottom - S(hwnd, 10);
+        int y = mapr.top + S(hwnd, 46);
+        if (dvbInfo.empty()) { text_out(dc, x, y, "The stream's tables were not read (decode it again).", MUTED, fn); return; }
+        auto wrap = [&](const std::string& t, int left, COLORREF c, HFONT f) {   // a paragraph, wrapped; returns false when out of room
+            std::wstring w = W(t);
+            RECT r{left, y, right, bottom}, calc = r;
+            HGDIOBJ o = SelectObject(dc, f);
+            DrawTextW(dc, w.c_str(), (int)w.size(), &calc, DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+            bool fits = calc.bottom <= bottom;
+            if (fits) { SetTextColor(dc, c); SetBkMode(dc, TRANSPARENT); DrawTextW(dc, w.c_str(), (int)w.size(), &r, DT_WORDBREAK | DT_NOPREFIX); y = calc.bottom; }
+            SelectObject(dc, o);
+            return fits;
+        };
+        auto cell = [&](const std::string& t, int left, int width, COLORREF c, HFONT f) {
+            std::wstring w = W(t);
+            RECT r{left, y, left + width - S(hwnd, 6), y + S(hwnd, 20)};
+            HGDIOBJ o = SelectObject(dc, f);
+            SetTextColor(dc, c); SetBkMode(dc, TRANSPARENT);
+            DrawTextW(dc, w.c_str(), (int)w.size(), &r, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+            SelectObject(dc, o);
+        };
+        auto after = [](const std::string& l, const char* key) { size_t k = l.find(key); return k == std::string::npos ? std::string() : l.substr(k + strlen(key)); };
+        // the facts of the stream: a line each, the name muted
+        struct Fact { std::string k, v; };
+        std::vector<Fact> facts;
+        for (auto& l : dvbInfo) {
+            if (l.rfind("MPEG transport stream: ", 0) == 0) facts.push_back({"Packets", after(l, ": ")});
+            else if (l.rfind("length by the clock", 0) == 0) facts.push_back({"Length", l.substr(l.rfind(' ') + 1)});
+            else if (l.rfind("time of the broadcast", 0) == 0) facts.push_back({"On the air", after(l, ": ") + " UTC"});
+            else if (l.rfind("network (NIT)", 0) == 0) facts.push_back({"Network", after(l, ": ")});
+            else if (l.rfind("errors: ", 0) == 0) facts.push_back({"Errors", after(l, ": ")});
+        }
+        for (auto& f : facts) {
+            if (y + S(hwnd, 20) > bottom) return;
+            cell(f.k, x, S(hwnd, 90), MUTED, fn);
+            cell(f.v, x + S(hwnd, 90), right - x - S(hwnd, 90), FG, fn);
+            y += S(hwnd, 20);
+        }
+        y += S(hwnd, 8);
+        // columns of a program's table
+        // what the stream says goes on a line of its own under it (it is long: "720x576, 16:9, 25 frames/s, up to 15 Mbit/s")
+        const int cPid = S(hwnd, 92), cTime = S(hwnd, 120), cPk = S(hwnd, 70), cLang = S(hwnd, 170);
+        const int cKind = std::max(S(hwnd, 120), right - x - cPid - cLang - cTime - cPk), cDet = 0;
+        auto kindColour = [](const std::string& k) {
+            return k.find("video") != std::string::npos ? RGB(0x4f, 0x8f, 0xd8) : k.find("audio") != std::string::npos ? RGB(0x2e, 0xb0, 0x6a)
+                 : k.find("teletext") != std::string::npos ? RGB(0xff, 0xa3, 0x1a) : k.find("subtitles") != std::string::npos ? RGB(0xb0, 0x7a, 0xe8) : RGB(0x8a, 0x8d, 0x93);
+        };
+        for (size_t i = 0; i < dvbInfo.size(); i++) {
+            const std::string& l = dvbInfo[i];
+            if (l.rfind("channel (SDT)", 0) == 0 || l.rfind("on the air (EIT)", 0) == 0 || l.rfind("next (EIT)", 0) == 0 || l.rfind("other PIDs", 0) == 0) {
+                if (!wrap(l, x, l.rfind("channel", 0) == 0 ? FG : MUTED, fn)) return;
+                y += S(hwnd, 4);
+                continue;
+            }
+            if (l.rfind("program ", 0) != 0) continue;
+            // the program: its name and number, the access systems under it
+            std::string head = l, ca;
+            size_t k = l.find(" conditional access ");
+            if (k != std::string::npos) { head = l.substr(0, k); ca = "conditional access: " + l.substr(k + 20); }
+            if (!head.empty() && head.back() == ':') head.pop_back();
+            y += S(hwnd, 4);
+            if (!wrap(head, x, FG, fh)) return;
+            if (!ca.empty() && !wrap(ca, x, MUTED, fn)) return;
+            y += S(hwnd, 6);
+            if (y + S(hwnd, 22) > bottom) return;
+            int cx = x;
+            for (auto& h : std::vector<std::pair<const char*, int>>{{"PID", cPid}, {"Stream", cKind}, {"Language", cLang}, {"Runs", cTime}, {"Packets", cPk}}) {
+                cell(h.first, cx, h.second, MUTED, fb);
+                cx += h.second;
+            }
+            y += S(hwnd, 20);
+            RECT ln{x, y, right, y + 1};
+            fill(dc, ln, LINE);
+            y += S(hwnd, 3);
+            for (size_t j = i + 1; j < dvbInfo.size() && dvbInfo[j].rfind("  PID ", 0) == 0; j++) {
+                if (y + S(hwnd, 22) > bottom) return;
+                std::string row = dvbInfo[j].substr(2);
+                size_t c = row.find(": ");
+                std::string pid = row.substr(4, c - 4), rest = row.substr(c + 2);
+                auto parts = split(rest, ';');
+                for (auto& q : parts) while (!q.empty() && q[0] == ' ') q.erase(0, 1);
+                std::string first = parts.empty() ? "" : parts[0], kind = first.substr(0, first.find(','));
+                if (kind.find(" (EN ") != std::string::npos) kind = kind.substr(0, kind.find(" (EN "));   // "DVB subtitles (EN 300 743)"
+                std::string lang, det, when, pk;
+                // the language(s): "language hun", teletext "ron initial page 100", subtitles ", hun"
+                auto items = split(first, ',');
+                for (size_t q = 1; q < items.size(); q++) {
+                    std::string it = items[q];
+                    while (!it.empty() && it[0] == ' ') it.erase(0, 1);
+                    if (it.rfind("component", 0) == 0) continue;
+                    if (it.rfind("language ", 0) == 0) it = it.substr(9);
+                    lang += (lang.empty() ? "" : ", ") + it;
+                }
+                for (size_t q = 1; q < parts.size(); q++) {
+                    const std::string& v = parts[q];
+                    if (v.find(" packets") != std::string::npos && v.find("subtitle") == std::string::npos && v.find("errors") == std::string::npos && v.find("scrambled") == std::string::npos) pk = v.substr(0, v.find(' '));
+                    else if (v.find(" - ") != std::string::npos && isdigit((unsigned char)v[0])) when = v;
+                    else det += (det.empty() ? "" : "; ") + v;
+                }
+                RECT chip{x + cPid, y + S(hwnd, 5), x + cPid + S(hwnd, 10), y + S(hwnd, 15)};
+                fill(dc, chip, kindColour(kind));
+                cell(pid, x, cPid, FG, fm);
+                cell(kind, x + cPid + S(hwnd, 16), cKind - S(hwnd, 16), FG, fn);
+                cell(lang, x + cPid + cKind, cLang, FG, fn);
+                cell(when, x + cPid + cKind + cLang, cTime, MUTED, fm);
+                cell(pk, x + cPid + cKind + cLang + cTime, cPk, MUTED, fm);
+                y += S(hwnd, 20);
+                if (!det.empty()) {   // the stream's own description, under its name
+                    if (y + S(hwnd, 18) > bottom) return;
+                    cell(det, x + cPid + S(hwnd, 16), right - x - cPid - S(hwnd, 16), MUTED, fn);
+                    y += S(hwnd, 18);
+                }
+                y += S(hwnd, 4);
+            }
+            y += S(hwnd, 6);
+        }
+    }
     LRESULT proc(UINT m, WPARAM w, LPARAM l) override
     {
         switch (m) {
         case WM_CREATE: {
             dark_window(hwnd);
-            build_rows();
+            dvb = isDvb(*R);
+            if (!dvb) build_rows();
             svc = services_of(*R);
             h_title = label(hwnd, file_name(*R)); SendMessageW(h_title, WM_SETFONT, (WPARAM)font(hwnd, 12, true), TRUE);
             double secs = R->geom.frames / frame_rate(*R);
+            if (dvb) {   // a DVB stream: its length, packets and programs, not frames of a capture card
+                dvbInfo = dvbInfoOf(*R);
+                std::string len, pk;
+                for (auto &l : dvbInfo) {
+                    if (l.rfind("length by the clock", 0) == 0) len = "length " + l.substr(l.rfind(' ') + 1);
+                    if (l.rfind("MPEG transport stream", 0) == 0) pk = l.substr(l.find(':') + 2);
+                }
+                h_sub = label(hwnd, "DVB transport stream" + (len.empty() ? "" : " \xC2\xB7 " + len) + (pk.empty() ? "" : " \xC2\xB7 " + pk) + fmt(" \xC2\xB7 read in %.1f s", R->totalSeconds));
+            } else
             h_sub = label(hwnd, fmt("%s \xC2\xB7 %lld frames \xC2\xB7 %.0f min %02.0f s \xC2\xB7 %s \xC2\xB7 %.0f s", formatName(R->geom.format),
                                     (long long)R->geom.frames, floor(secs / 60), fmod(secs, 60), R->slicerName.c_str(), R->totalSeconds));
             set_label_colour(h_sub, MUTED);
@@ -429,7 +568,7 @@ struct RecWin : Window {
                 SendMessageW(h_head, WM_SETFONT, (WPARAM)font(hwnd, 10, true), TRUE);
                 set_label_colour(h_head, ACCENT2);
             }
-            map_h = label(hwnd, "VBI lines"); SetPropW(map_h, L"card", (HANDLE)1); SendMessageW(map_h, WM_SETFONT, (WPARAM)font(hwnd, 12, true), TRUE);
+            map_h = label(hwnd, dvb ? "DVB stream" : "VBI lines"); SetPropW(map_h, L"card", (HANDLE)1); SendMessageW(map_h, WM_SETFONT, (WPARAM)font(hwnd, 12, true), TRUE);
             res_h = label(hwnd, "Results"); SetPropW(res_h, L"card", (HANDLE)1); SendMessageW(res_h, WM_SETFONT, (WPARAM)font(hwnd, 12, true), TRUE);
             int i = 0;
             for (auto &s : svc) {
@@ -444,6 +583,7 @@ struct RecWin : Window {
             EnableWindow(b_json, !R->db.empty());
             b_close = button(hwnd, IDCANCEL, "Close");
             b_lines = button(hwnd, 53, "\xF0\x9F\x93\x88  View VBI lines");
+            if (dvb) ShowWindow(b_lines, SW_HIDE);   // a stream has no VBI lines to look at
             return 0;
         }
         case WM_SIZE: {
@@ -478,6 +618,7 @@ struct RecWin : Window {
             RECT rc; GetClientRect(hwnd, &rc);
             HDC mem = CreateCompatibleDC(dc); HBITMAP bm = CreateCompatibleBitmap(dc, rc.right, rc.bottom); HGDIOBJ ob = SelectObject(mem, bm);
             fill(mem, rc, BG); fill(mem, mapr, PANEL); fill(mem, resr, PANEL);
+            if (dvb) { paint_dvb(mem); BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY); SelectObject(mem, ob); DeleteObject(bm); DeleteDC(mem); EndPaint(hwnd, &ps); return 0; }
             // two columns: field 1 on the left, field 2 on the right
             std::vector<const Row *> col[2];
             int f2 = R->geom.pal ? 313 : 263;
@@ -551,7 +692,7 @@ void recording_window(HWND owner, const ResultPtr &r)
 // ================================================================ main window
 namespace {
 enum {
-    M_OPEN_VBI = 1000, M_OPEN_PK = 1010, M_CAPTURE = 1011, M_VIEW_LINES = 1012, M_EXIT = 1001, M_DEVICE, M_UNVERIFIED, M_ABOUT, M_RECENT0 = 1100, M_FORMAT0 = 1200,
+    M_OPEN_VBI = 1000, M_OPEN_PK = 1010, M_CAPTURE = 1011, M_VIEW_LINES = 1012, M_OPEN_TS = 1013, M_BBC = 1014, M_BBC_OPEN = 1015, M_EXIT = 1001, M_DEVICE, M_UNVERIFIED, M_ABOUT, M_RECENT0 = 1100, M_FORMAT0 = 1200,
 };
 
 struct App : Window {
@@ -566,6 +707,8 @@ struct App : Window {
         HMENU fm = CreatePopupMenu();
         AppendMenuW(fm, MF_STRING, M_OPEN_VBI, L"Open .vbi recording\x2026");
         AppendMenuW(fm, MF_STRING, M_OPEN_PK, L"Open teletext / NABTS packets (.t42, .t34, .t33)\x2026");
+        AppendMenuW(fm, MF_STRING, M_OPEN_TS, L"Open a DVB stream (.ts, .m2ts; any name)\x2026");
+        AppendMenuW(fm, MF_STRING, M_BBC_OPEN, L"Open a BBC Micro program (.bbc, .ssd) \x2014 runs in the emulator\x2026");
         AppendMenuW(fm, MF_STRING, M_VIEW_LINES, L"View VBI lines (no decoding), set line types by hand\x2026");
         AppendMenuW(fm, MF_STRING, M_CAPTURE, L"Capture card (live)\x2026");
         rmenu = CreatePopupMenu();
@@ -580,6 +723,8 @@ struct App : Window {
         for (int i = 1; i < (int)VbiFormat::Count; i++) AppendMenuW(fmenu, MF_STRING, M_FORMAT0 + i, W(formatName((VbiFormat)i)).c_str());
         AppendMenuW(tm, MF_POPUP, (UINT_PTR)fmenu, L"Recording format (capture chip)");
         AppendMenuW(tm, MF_STRING, M_UNVERIFIED, L"Keep StarSight schedules from packets that fail the CRC");
+        AppendMenuW(tm, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(tm, MF_STRING, M_BBC, L"BBC Micro (runs telesoftware programs)\x2026");
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)tm, L"Tools");
         HMENU hm = CreatePopupMenu();
         AppendMenuW(hm, MF_STRING, M_ABOUT, L"About Teletext Rescue");
@@ -608,6 +753,7 @@ struct App : Window {
         StartActions a;
         a.open_vbi = [this] { menu_vbi(); };
         a.open_packets = [this] { menu_packets(); };
+        a.open_ts = [this] { menu_ts(); };
         a.pick_device = [this] { pick_device(true); };
         a.capture = [this] { capture_window(hwnd); };
         a.view_lines = [this] { view_lines(); };
@@ -617,6 +763,15 @@ struct App : Window {
         start = CreateWindowExW(0, L"TRStart", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, 10, 10, hwnd, nullptr, inst(), s);
         RECT rc; GetClientRect(hwnd, &rc);
         MoveWindow(start, 0, 0, rc.right, rc.bottom, TRUE);
+    }
+    // a DVB transport stream (satellite / cable / terrestrial recording): its teletext (EN 300 472); known by its
+    // contents, so a file of any name opens (GitHub issue 4: "...The Fall.ts.del")
+    void menu_ts()
+    {
+        std::string f = open_file(hwnd, "DVB stream", {{"DVB transport stream", "*.ts;*.mts;*.m2ts;*.trp;*.tp;*.del"}, {"All files", "*.*"}});
+        if (f.empty()) return;
+        if (!ts_packet_size(f)) { ask(hwnd, "DVB stream", "This file is not an MPEG transport stream (no sync bytes 0x47 every 188 / 192 / 204 bytes):\n" + f, MB_ICONERROR); return; }
+        open_vbi(f);
     }
     void menu_packets()
     {
@@ -755,7 +910,8 @@ struct App : Window {
         case WM_APP_CALL: { auto *f = (std::function<void()> *)l; (*f)(); delete f; return 0; }
         case WM_DROPFILES: {
             wchar_t buf[MAX_PATH]; DragQueryFileW((HDROP)w, 0, buf, MAX_PATH); DragFinish((HDROP)w);
-            open_vbi(N(buf));
+            if (is_bbc_file(N(buf))) bbc_open_file(hwnd, N(buf));   // a BBC program: the emulator runs it
+            else open_vbi(N(buf));
             return 0;
         }
         case WM_INITMENUPOPUP: if ((HMENU)w == rmenu) fill_recent(); return 0;
@@ -766,7 +922,14 @@ struct App : Window {
             switch (id) {
             case M_OPEN_VBI: menu_vbi(); break;
             case M_OPEN_PK: menu_packets(); break;
+            case M_OPEN_TS: menu_ts(); break;
             case M_CAPTURE: capture_window(hwnd); break;
+            case M_BBC: bbc_window(hwnd); break;
+            case M_BBC_OPEN: {
+                std::string p = open_file(hwnd, "A BBC Micro program", {{"BBC programs (*.bbc, *.ssd)", "*.bbc;*.ssd"}, {"All files", "*.*"}});
+                if (!p.empty()) bbc_open_file(hwnd, p);
+                break;
+            }
             case M_VIEW_LINES: view_lines(); break;
             case M_DEVICE: pick_device(true); break;
             case M_UNVERIFIED: unverified = !unverified; update_menu(); break;
@@ -806,6 +969,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int show)
         std::string a = narrow(argv[i]);
         if (a == "--capture") { capture_window(app.hwnd, true); break; }   // the capture window, started
         if (a == "--test-file" && i + 1 < argc) { capture_window(app.hwnd, false, narrow(argv[i + 1])); break; }   // a .vbi played to it
+        if (a.rfind("--", 0) != 0 && is_bbc_file(a)) { bbc_open_file(app.hwnd, a); break; }   // a BBC program: the emulator
         if (a.rfind("--", 0) != 0) { app.open_vbi(a); break; }
     }
     LocalFree(argv);

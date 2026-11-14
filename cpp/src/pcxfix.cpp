@@ -161,17 +161,37 @@ bool pcxDecode(const Bytes& d, const std::vector<long>& unread, Image& im, bool 
     for (auto& g : segs) have += (int)g.ls.size();
     int G = (int)segs.size() - 1, lost = N - have;
     bool repaired = G > 0 || lost > 0;
-    if (repaired && have < N / 4) {
-        // read less than a quarter: perhaps an encoder whose runs do cross lines - the plain decoding
+    // an encoder whose runs go on over the end of a line (and of a plane): the whole stream as one run of bytes gives
+    // exactly the picture's bytes («Бизнес-Текст» PAGE3.PCX: read line by line it comes out torn, though whole)
+    bool across = false;
+    if (unread.empty()) {
+        size_t total = 0;
+        int crossed = 0;
+        for (long at = 128; at < s.end;) {
+            uint8_t c = d[at++];
+            int run = 1;
+            if ((c & 0xC0) == 0xC0) { run = c & 0x3F; if (at < s.end) at++; }
+            if (run > 1 && total / bpl != (total + run - 1) / bpl) crossed++;
+            total += run;
+        }
+        across = crossed > 0 && total == (size_t)N * bpl;
+    }
+    if (across || (repaired && have < N / 4)) {
+        // read less than a quarter: perhaps an encoder whose runs do cross lines - the plain decoding, a run that
+        // does not end with its line going on in the next
         long at = 128;
         std::vector<uint8_t> line((size_t)bpl * planes);
+        int run = 0;
+        uint8_t v = 0;
         for (int y = 0; y < h; y++) {
             size_t n = 0;
             while (n < line.size()) {
-                uint8_t c = at < s.end ? d[at++] : 0, v = c;
-                int run = 1;
-                if ((c & 0xC0) == 0xC0) { run = c & 0x3F; v = at < s.end ? d[at++] : 0; }
-                while (run-- > 0 && n < line.size()) line[n++] = v;
+                if (run <= 0) {
+                    uint8_t c = at < s.end ? d[at++] : 0;
+                    v = c; run = 1;
+                    if ((c & 0xC0) == 0xC0) { run = c & 0x3F; v = at < s.end ? d[at++] : 0; if (run == 0) continue; }
+                }
+                while (run > 0 && n < line.size()) { line[n++] = v; run--; }
             }
             for (int p = 0; p < planes; p++) {
                 memcpy(L[y * planes + p].data(), line.data() + (size_t)p * bpl, bpl);

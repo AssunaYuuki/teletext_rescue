@@ -198,22 +198,32 @@ std::string analyse_blocks(const std::vector<std::pair<int, std::array<u8, 168>>
     // ECM: каждая половина (8 байт) приходит в своём блоке; номер c: c/2 — ECM, c&1 — половина
     struct Ecm { int u; int c; int ap; u8 e[16]; bool dec = false; u8 plain[16]; uint64_t cw = 0; };
     std::vector<Ecm> ecms;
-    std::map<int, std::pair<int, std::array<u8, 8>>> halves;
+    struct Half { int u, c, ap; std::array<u8, 8> h; };
+    std::vector<Half> H;
     int changes = 0; std::vector<int> change_u;
     for (auto &m : msgs) {
         const u8 *a = m1(m.second);
         int c = ((a[1] & 7) << 4) | (a[2] >> 4), ap = a[2] & 15;
         std::array<u8, 8> h; memcpy(h.data(), a + 3, 8);
-        halves[c] = {m.first, h};
+        H.push_back({m.first, c, ap, h});
         if (ap == 0) { changes++; change_u.push_back(m.first); }
-        if (c & 1) {
-            auto it = halves.find(c - 1);
-            if (it != halves.end() && m.first - it->second.first < 200) {
-                Ecm e; e.u = m.first; e.c = c >> 1; e.ap = ap;
-                memcpy(e.e, it->second.second.data(), 8); memcpy(e.e + 8, h.data(), 8);
-                ecms.push_back(e);
-            }
-        }
+    }
+    // An ECM is two 8-byte halves in slots c-1 (even) and c (odd). The same data line carries fresh
+    // per-field bytes in every slot each frame, so the two halves of one ECM must be paired by time:
+    // for each odd slot take the even-slot half nearest in time (a few frames away). A map keyed by
+    // slot would keep only the last value seen and mix halves from different ECMs (so almost none paired).
+    const int WIN = 75;                           // frames (~3 s at 25 Hz): one ECM's halves are adjacent
+    std::set<std::string> ecm_seen;
+    for (size_t i = 0; i < H.size(); i++) {
+        if (!(H[i].c & 1)) continue;              // odd slot = second half, pairs with even slot c-1
+        int bd = WIN + 1; const std::array<u8, 8> *bh = nullptr;
+        for (size_t j = 0; j < H.size(); j++)
+            if (H[j].c == H[i].c - 1) { int d = std::abs(H[j].u - H[i].u); if (d < bd) { bd = d; bh = &H[j].h; } }
+        if (!bh) continue;
+        Ecm e; e.u = H[i].u; e.c = H[i].c >> 1; e.ap = H[i].ap;
+        memcpy(e.e, bh->data(), 8); memcpy(e.e + 8, H[i].h.data(), 8);
+        if (!ecm_seen.insert(hexs(e.e, 16)).second) continue;   // same ECM read twice
+        ecms.push_back(e);
     }
     // ключ верный, если почти все ECM дают одинаковые данные программы (байты 4–11)
     std::string best; int nb = 0; const KnownKey *key = nullptr;
@@ -323,6 +333,20 @@ int syster_report(const Rec &R, const std::vector<int> &rows0, const std::string
             if (mx > 0 && act[r] >= 0.3 * mx && syster_check(R, r, uu) >= 0.3) detected.push_back(r);
     }
     if (!detected.empty()) rows = detected;
+    // Syster carries a pair of adjacent data lines per field (e.g. 15+16), repeated in the other field at
+    // +313 (328+329): one line holds the even parts 0,2,4,6,8, the other the odd parts 1,3,5,7,9. On a
+    // noisy capture only the strongest line clears the 0.3 detection bar (and its neighbour may be claimed
+    // by VPS), so no block completes for want of the odd half. Once Syster is confirmed on any line, add
+    // every other line that still shows a real (CRC-validated) Syster signal, at a much lower threshold.
+    if (!detected.empty()) {
+        std::vector<int> uu2;
+        for (int u = 0; u < R.n && uu2.size() < 12; u += std::max(1, R.n / 12)) uu2.push_back(u);
+        for (auto &kv : R.tv) {
+            int r = kv.first;
+            if (std::find(rows.begin(), rows.end(), r) != rows.end()) continue;
+            if (syster_check(R, r, uu2) >= 0.08) rows.push_back(r);
+        }
+    }
     // TR_SYSROWS=11,27 — debug: read these stored lines as well, whatever the detector called them
     if (const char *e = getenv("TR_SYSROWS")) {
         std::string s = e;

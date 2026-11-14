@@ -4,6 +4,7 @@
 // where (service, lines) and when they were found. One list for the "Found files and texts" window.
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -11,6 +12,7 @@ struct DecodeResult;
 struct TviStream;
 class BtCatalog;
 class TtDataPages;
+struct BtProgress;
 
 struct Find {
     enum Kind { File, Announced, Text, Test } kind = File;   // Announced = listed in a catalogue, data not received
@@ -27,6 +29,8 @@ struct Find {
     std::string note;                // one line more (what was made of it, missing blocks)
     std::vector<std::string> text;   // a text: its lines
     std::vector<long> unread;        // positions in the file of the bytes not received / not readable (when known)
+    // «Бизнес-Текст»: the file's blocks one by one and what was made of it (the table of files, gui_btfiles.cpp)
+    std::shared_ptr<const BtProgress> bt;
 };
 
 // a received file as Windows can open it: <file>.txt (DOS text as UTF-8), .png (PCX, fax TIFF), or a copy
@@ -53,6 +57,7 @@ void addBtFinds(std::vector<Find>& out, const BtCatalog& c, const std::string& w
                 const FindStatus& status = nullptr);
 // the same with files written earlier (live: written in a thread of their own)
 struct BtWritten;
+// nowFrame: the capture's frame now (live: the file on the air is marked)
 void addBtFinds(std::vector<Find>& out, const BtCatalog& c, const std::string& where, const std::vector<BtWritten>& written,
-                const std::string& keyNote);
+                const std::string& keyNote, int64_t nowFrame = -1);
 void addTtDataFinds(std::vector<Find>& out, const TtDataPages& t, const std::string& where);   // Hamming 8/4 data pages

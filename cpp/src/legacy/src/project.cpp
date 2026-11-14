@@ -419,7 +419,8 @@ Bytes Project::to_t42(const Pages &pages, int &n) const {
                 bool any = false; for (auto &f : pg.ex.flof) if (!f.empty()) any = true;
                 if (any) { Bytes x = x27_packet(mag, pg.ex.flof); out.insert(out.end(), x.begin(), x.end()); n++; }
             }
-            if (!pg.ex.x26.empty()) for (auto &q : x26_packets(mag, pg.ex.x26)) { out.insert(out.end(), q.begin(), q.end()); n++; }
+            if (const auto *ov = overlay(pg, &s); ov && !ov->empty())   // this subpage's X/26 (issue 5)
+                for (auto &q : x26_packets(mag, *ov)) { out.insert(out.end(), q.begin(), q.end()); n++; }
             for (auto &rb : s.rows) {
                 if (rb.first < 1 || rb.first > 24) continue;
                 put_mrag(out, mag, rb.first);

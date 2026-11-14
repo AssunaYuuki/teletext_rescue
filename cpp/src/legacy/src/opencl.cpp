@@ -227,6 +227,8 @@ void load() {
 }
 int best() {                                       // отдельная видеокарта лучше встроенной; потом — больше блоков и памяти
     int b = -1;
+    if (const char *want = getenv("TR_GPU"))       // TR_GPU=<часть имени>: эта видеокарта (как в slicer_gpu.cpp pickGpu)
+        for (int i = 0; i < (int)infos.size(); i++) if (*want && infos[i].name.find(want) != std::string::npos) return i;
     for (int i = 0; i < (int)infos.size(); i++) {
         auto key = [&](int j) { return std::make_tuple(!infos[j].integrated, (long long)infos[j].units * 1000 + (long long)(infos[j].mem_mb / 64)); };
         if (b < 0 || key(i) > key(b)) b = i;

@@ -136,6 +136,45 @@ const char* kJtesKernelSrc =
     "    jt_cand(lines + (size_t)jl[g] * n, n, pred, costs + (size_t)g * 1128, st + (size_t)g * 8, spb + (size_t)g * 8, cnt + g, fit + g);\n"
     "}\n";
 
+// The card to use among those of every vendor's OpenCL platform (NVIDIA, AMD, Intel): a card of its own before the
+// graphics built into the processor (a computer with an AMD or NVIDIA card often lists Intel's or the AMD
+// processor's first - taking the first GPU found put the work on the slow one), then the one with more compute
+// units and memory: the choice of the original engine (legacy opencl.cpp best()), so both read on the same card.
+// TR_GPU=<part of a name> takes that card. AMD names a device by its chip (Baffin, Ellesmere, gfx1030 ...): the
+// board name (CL_DEVICE_BOARD_NAME_AMD) is the one people know
+template <class GP, class GD, class GI>
+cl_device_id pickGpu(GP getPlatforms, GD getDevices, GI getInfo, std::string& name, uint64_t& memMB)
+{
+    cl_platform_id plats[16];
+    cl_uint np = 0;
+    if (getPlatforms(16, plats, &np) != 0) return nullptr;
+    const char* want = getenv("TR_GPU");
+    cl_device_id best = nullptr;
+    long long bestKey = -1;
+    for (cl_uint i = 0; i < np && i < 16; i++) {
+        cl_device_id d[16];
+        cl_uint nd = 0;
+        if (getDevices(plats[i], CL_DEVICE_TYPE_GPU, 16, d, &nd) != 0) continue;
+        for (cl_uint k = 0; k < nd && k < 16; k++) {
+            cl_uint unified = 0, units = 0;
+            cl_ulong mem = 0;
+            getInfo(d[k], 0x1035 /* CL_DEVICE_HOST_UNIFIED_MEMORY */, sizeof unified, &unified, nullptr);
+            getInfo(d[k], 0x1002 /* CL_DEVICE_MAX_COMPUTE_UNITS */, sizeof units, &units, nullptr);
+            getInfo(d[k], 0x101F /* CL_DEVICE_GLOBAL_MEM_SIZE */, sizeof mem, &mem, nullptr);
+            char nm[256] = {}, bn[256] = {};
+            size_t bl = 0;
+            getInfo(d[k], CL_DEVICE_NAME, sizeof nm - 1, nm, nullptr);
+            std::string n = nm;
+            if (getInfo(d[k], 0x4038 /* CL_DEVICE_BOARD_NAME_AMD */, sizeof bn - 1, bn, &bl) == 0 && bl > 1 && bn[0]) n = bn;
+            while (!n.empty() && n.back() == ' ') n.pop_back();
+            long long key = (unified ? 0 : 1LL << 40) + (long long)units * 1000 + (long long)(mem >> 26);
+            if (want && *want && n.find(want) != std::string::npos) key += 1LL << 50;
+            if (key > bestKey) { bestKey = key; best = d[k]; name = n; memMB = mem >> 20; }
+        }
+    }
+    return best;
+}
+
 class GpuSlicer : public Slicer {
 public:
     ~GpuSlicer() override
@@ -188,17 +227,9 @@ public:
 #undef LOAD
         GetProgramInfo_ = (decltype(GetProgramInfo_))(void*)GetProcAddress(dll_, "clGetProgramInfo");
         CreateProgramWithBinary_ = (decltype(CreateProgramWithBinary_))(void*)GetProcAddress(dll_, "clCreateProgramWithBinary");
-        cl_platform_id plats[8];
-        cl_uint np = 0;
-        if (GetPlatformIDs_(8, plats, &np) != 0 || np == 0) { err = "no OpenCL platforms"; return false; }
-        for (cl_uint i = 0; i < np && !dev_; i++) {
-            cl_uint nd = 0;
-            if (GetDeviceIDs_(plats[i], CL_DEVICE_TYPE_GPU, 1, &dev_, &nd) != 0 || nd == 0) dev_ = nullptr;
-        }
+        uint64_t memMB = 0;
+        dev_ = pickGpu(GetPlatformIDs_, GetDeviceIDs_, GetDeviceInfo_, devName_, memMB);
         if (!dev_) { err = "no OpenCL GPU device"; return false; }
-        char nm[256] = {};
-        GetDeviceInfo_(dev_, CL_DEVICE_NAME, sizeof nm - 1, nm, nullptr);
-        devName_ = nm;
         cl_int e = 0;
         ctx_ = CreateContext_(nullptr, 1, &dev_, nullptr, nullptr, &e);
         if (!ctx_) { err = "clCreateContext failed " + std::to_string(e); return false; }
@@ -601,22 +632,7 @@ bool gpuDeviceInfo(std::string& name, uint64_t& memMB)
     auto getPlatforms = (PFN_GetPlatformIDs)(void*)GetProcAddress(dll, "clGetPlatformIDs");
     auto getDevices = (PFN_GetDeviceIDs)(void*)GetProcAddress(dll, "clGetDeviceIDs");
     auto getInfo = (PFN_GetDeviceInfo)(void*)GetProcAddress(dll, "clGetDeviceInfo");
-    bool ok = false;
-    cl_platform_id plats[8];
-    cl_uint np = 0;
-    if (getPlatforms && getDevices && getInfo && getPlatforms(8, plats, &np) == 0)
-        for (cl_uint i = 0; i < np && !ok; i++) {
-            cl_device_id dev = nullptr;
-            cl_uint nd = 0;
-            if (getDevices(plats[i], CL_DEVICE_TYPE_GPU, 1, &dev, &nd) != 0 || nd == 0) continue;
-            char nm[256] = {};
-            cl_ulong mem = 0;
-            getInfo(dev, CL_DEVICE_NAME, sizeof nm - 1, nm, nullptr);
-            getInfo(dev, 0x101F /* CL_DEVICE_GLOBAL_MEM_SIZE */, sizeof mem, &mem, nullptr);
-            name = nm;
-            memMB = mem >> 20;
-            ok = true;
-        }
+    bool ok = getPlatforms && getDevices && getInfo && pickGpu(getPlatforms, getDevices, getInfo, name, memMB) != nullptr;
     FreeLibrary(dll);
     return ok;
 }

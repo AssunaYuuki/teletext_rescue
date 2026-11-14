@@ -197,7 +197,10 @@ Json extract_extras(const std::vector<Packet42> &st, Progress &pr) {
             int r_ = -1;
             for (int i = 0; i < 13; i++) {
                 int t = ham::h2418(p[3 + 3 * i], p[4 + 3 * i], p[5 + 3 * i]);
-                if (t < 0) break;
+                // a triplet the tape spoilt (two bit errors): skipped, the rest of the packet still read (it used to
+                // end the packet: from a VBI capture most X/26 accents were lost, issue 5). A spoilt one may have been
+                // a row address: the characters after it wait for the next row address
+                if (t < 0) { r_ = -1; continue; }
                 int addr = t & 0x3F, mode = (t >> 6) & 0x1F, data = (t >> 11) & 0x7F;
                 if (addr >= 40) {
                     if (mode == 0x1F) break;

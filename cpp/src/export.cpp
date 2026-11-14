@@ -56,6 +56,7 @@ std::string exportResult(const DecodeResult& r, const std::string& dir, Progress
         for (auto& v : svcs) put("captions_" + v + ".srt", captionsSrt(r, v));
     }
     if (!r.vitcReport.empty()) put("vitc.txt", join(r.vitcReport));
+    if (!r.vpsReport.empty()) put("vps.txt", join(r.vpsReport));
     if (!r.xds.empty()) put("xds.txt", join(r.xds));
     if (!r.silentRadio.empty()) {
         std::string s;

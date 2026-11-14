@@ -19,7 +19,11 @@ static MlseModel vhs_model() {
         if (a < 0 || b < 0) return 0;
         int row = (a >> 3) | (b << 1);
         if (row == 0) return i < 10 ? 1 : 2;
-        if (row <= 25) return 2;
+        if (row <= 25) {   // an 8-bit data row («Бизнес-Текст»: > 12 of 40 bytes fail parity) is left as read
+            int bad = 0;
+            for (int k = 2; k < 42; k++) bad += !odd_parity(p[k]);
+            return bad > 12 ? 0 : 2;
+        }
         if (row == 27) return i < 40 ? 1 : 0;
         if (row >= 26 && row <= 29) return i == 2 ? 1 : 0;
         return 0;

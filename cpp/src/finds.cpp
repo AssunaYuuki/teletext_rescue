@@ -9,6 +9,7 @@
 #include "png.h"
 #include "rar.h"
 #include "tvinform.h"
+#include "telesoft.h"
 #include "util.h"
 #include <algorithm>
 #include <cstring>
@@ -129,9 +130,16 @@ void addTviFinds(std::vector<Find>& out, const TviStream& t, const std::string& 
         x.service = svc; x.where = where;
         x.when = f.time.empty() ? "" : "written " + f.time;
         x.size = f.size; x.blocks = f.blocks; x.have = f.have;
-        x.status = f.have >= f.blocks ? "complete" : fmt("%d of %d blocks", f.have, f.blocks);
+        x.status = f.have >= f.blocks ? "complete" : fmt("%d of %d blocks", f.have, f.blocks) + (f.damaged.empty() ? "" : fmt(" + %zu damaged", f.damaged.size()));
         x.path = f.path;
         x.note = f.note;
+        x.text = f.text;
+        x.unread = f.unread;
+        if (!f.damaged.empty()) {
+            std::string m;
+            for (int b : f.damaged) m += (m.empty() ? "" : " ") + fmt("%d", b);
+            x.note += (x.note.empty() ? "" : "; ") + std::string("damaged blocks (CRC does not match): ") + m;
+        }
         if (!f.missing.empty()) {
             std::string m;
             for (int b : f.missing) m += (m.empty() ? "" : " ") + fmt("%d", b);
@@ -248,11 +256,28 @@ void addBtFinds(std::vector<Find>& out, const BtCatalog& c, const std::string& w
 }
 
 void addBtFinds(std::vector<Find>& out, const BtCatalog& c, const std::string& where, const std::vector<BtWritten>& written,
-                const std::string& keyNote)
+                const std::string& keyNote, int64_t nowFrame)
 {
     std::string svc = std::string(kBt) + " (teletext catalogue)";
     std::map<std::string, BtWritten> got;
-    for (auto& w : written) got[w.name] = w;
+    for (auto& w : written) if (w.carvedFrom.empty()) got[w.name] = w;
+    std::map<std::string, BtProgress> prog;
+    for (auto& p : c.progress(3, nowFrame)) prog[p.name] = p;
+    // the table of files: the blocks as they stand now, and what the last writing made of the file
+    auto table = [&](Find& x, const BtWritten* w) {
+        auto it = prog.find(x.name);
+        if (it == prog.end()) return;
+        BtProgress p = it->second;
+        p.kind = x.type;
+        if (w && w->rowsHave) {
+            p.written = true; p.decrypted = w->decrypted; p.open = w->open; p.checkOk = w->checkOk;
+            p.readPct = w->readPct; p.path = w->path; p.content = w->content; p.check = w->check;
+            if (w->blockBytes > 0 && w->blockBytes != p.blockBytes && p.size > 0) {   // the form the writing found
+                p.blockBytes = w->blockBytes;
+            }
+        }
+        x.bt = std::make_shared<const BtProgress>(std::move(p));
+    };
     for (auto& f : c.files()) {
         Find x;
         x.kind = Find::Announced;
@@ -285,6 +310,7 @@ void addBtFinds(std::vector<Find>& out, const BtCatalog& c, const std::string& w
                        (w.check.empty() ? "" : "; check: " + w.check);
             x.note = (w.text.empty() ? std::string("") : "text: " + w.text + "; ") + keyNote + "; " + x.note;
         }
+        table(x, g != got.end() ? &g->second : nullptr);
         out.push_back(x);
     }
     // files the catalogue does not name: one file sent under several names, its copies voted together
@@ -306,6 +332,23 @@ void addBtFinds(std::vector<Find>& out, const BtCatalog& c, const std::string& w
         x.status = fmt("%.1f%% read%s; one file sent as %s - all their copies voted together", w.readPct, w.checkOk ? ", checks OK" : "", names.c_str()) +
                    (w.decrypted ? ", decrypted" : w.open ? ", sent open (not encrypted)" : ", as sent (encrypted)") + (w.check.empty() ? "" : "; check: " + w.check);
         x.note = keyNote;
+        out.push_back(x);
+    }
+    // whole files of the sender's disk found inside the leftovers of the sent files (9.07.94: JINN.EXE, its READ.ME)
+    for (auto& w : written) {
+        if (w.carvedFrom.empty()) continue;
+        Find x;
+        x.kind = Find::File;
+        x.name = w.name;
+        x.path = w.path;
+        x.unread = w.unread;
+        x.type = fileTypeOf(w.path, w.name);
+        x.service = svc;
+        x.where = where + "; inside " + w.carvedFrom;
+        x.status = fmt("%.1f%% read; %s, found whole in the old disk contents of %s", w.readPct, w.content.c_str(), w.carvedFrom.c_str());
+        x.note = (w.carvedEntry.empty() ? std::string("no FAT entry of this size on the disk: named by where it lies")
+                                        : "FAT entry on the sender's disk: " + w.carvedEntry) +
+                 (w.text.empty() ? std::string() : "; text: " + w.text) + "; all the disk's directory entries: leftovers\\catalog.txt";
         out.push_back(x);
     }
     // a few packets 8/31 with noise for text are teletext rows read with a wrong address (Ukrainian
@@ -340,6 +383,30 @@ void prepareFinds(DecodeResult& r, const FindStatus& status)
 std::vector<Find> findsCompute(const DecodeResult& r, const FindStatus& status)
 {
     std::vector<Find> out;
+    // DVB subtitles drawn as pictures (decodeTs): one find a subtitle, shown as it was on the screen
+    if (isDvb(r)) {
+        std::string sd = path_join(legacyReportDir(r.path), "dvb_subtitles");
+        try {
+            if (exists(path_join(sd, "index.txt")))
+                for (auto& l : split(read_text(path_join(sd, "index.txt")), '\n')) {
+                    auto f = split(l, '\t');
+                    if (f.size() < 7) continue;
+                    double a = atof(f[3].c_str()), b = atof(f[4].c_str());
+                    Find x;
+                    x.kind = Find::File;
+                    x.name = f[0];
+                    x.type = "subtitle picture (" + f[1] + ")";
+                    x.service = "DVB subtitles (EN 300 743)";
+                    x.where = "PID " + f[2] + ", language " + f[1];
+                    x.when = fmt("%d:%04.1f - %d:%04.1f", (int)(a / 60), fmod(a, 60.0), (int)(b / 60), fmod(b, 60.0));
+                    x.status = fmt("%sx%s, shown %.1f s", f[5].c_str(), f[6].c_str(), b - a);
+                    x.path = path_join(sd, f[0]);
+                    std::error_code ec;
+                    x.size = (uint64_t)std::filesystem::file_size(std::filesystem::u8path(x.path), ec);
+                    out.push_back(x);
+                }
+        } catch (...) {}
+    }
     // the time code line (ORT 2001 line 6): the time on the air
     if (r.timeCode.size() >= 3) {
         Find x;
@@ -421,6 +488,11 @@ std::vector<Find> findsCompute(const DecodeResult& r, const FindStatus& status)
         std::string dir = !r.teletext.project.empty() ? path_join(dirname(r.teletext.project), "biznestext_files") : stem + "_biznestext_files";
         addBtFinds(out, c, (w.empty() ? "teletext lines" : w) + (merged.empty() ? "" : "; with " + merged), dir, status);
         addTtDataFinds(out, ttDataPagesOf(t42), w.empty() ? "teletext lines" : w);
+        {   // BBC Ceefax telesoftware: BBC BASIC programs, run in the BBC Micro window
+            std::string tdir = !r.teletext.project.empty() ? path_join(dirname(r.teletext.project), "telesoftware") : stem + "_telesoftware";
+            auto progs = telesoftOf(t42);
+            if (!progs.empty()) addTelesoftFinds(out, progs, w.empty() ? "teletext lines" : w, tdir);
+        }
         ItsIdl its = itsIdlOf(t42);
         if (its.found()) {
             // the packets X/31 are ITS data channels: the «Бизнес-Текст» descriptor made of them is noise
@@ -713,8 +785,19 @@ std::string openableCopy(const std::string& path, bool refresh, const std::vecto
     size_t text = 0, n = std::min<size_t>(d.size(), 4096);
     for (size_t i = 0; i < n; i++) text += d[i] >= 32 || d[i] == '\r' || d[i] == '\n' || d[i] == '\t' || d[i] == 0x1A;
     if (text * 100 >= n * 97) {
+        // Windows text (CP1251: р..я = F0-FF) or DOS (CP866: а..п = A0-AF, р..я = E0-EF)
+        size_t w = 0, dos = 0;
+        for (uint8_t c : d) { w += c >= 0xF2; dos += c >= 0xA0 && c <= 0xAF; }
+        auto win = [](uint8_t c) -> std::string {
+            if (c >= 0xC0) return from_cp(0x410 + (c - 0xC0));
+            if (c == 0xA8) return from_cp(0x401);
+            if (c == 0xB8) return from_cp(0x451);
+            if (c == 0xB9) return from_cp(0x2116);
+            if (c < 0x80) return std::string(1, (char)c);
+            return "?";
+        };
         std::string s;
-        for (uint8_t c : d) if (c != 0x1A) s += c == '\r' || c == '\n' || c == '\t' ? std::string(1, (char)c) : utf8Of866(c);
+        for (uint8_t c : d) if (c != 0x1A) s += c == '\r' || c == '\n' || c == '\t' ? std::string(1, (char)c) : w > dos ? win(c) : utf8Of866(c);
         try { write_file(path + ".txt", s.data(), s.size()); } catch (...) { return ""; }
         return path + ".txt";
     }

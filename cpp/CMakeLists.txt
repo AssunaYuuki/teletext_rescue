@@ -34,7 +34,7 @@ set_source_files_properties(${LEGACY} PROPERTIES COMPILE_OPTIONS "-w")
 # OpenCL is loaded at run time (OpenCL.dll / libOpenCL / OpenCL.framework), no SDK needed.
 set(CORE
   src/amol.cpp src/vitc.cpp src/gemstar.cpp src/gemguide.cpp src/jtes.cpp src/jtesrx.cpp src/tvinform.cpp src/tvinorpak.cpp src/tviftr3.cpp src/tvimeteo.cpp src/biznestext.cpp src/itsidl.cpp src/rar.cpp src/arjcheck.cpp src/finds.cpp src/pcxfix.cpp src/faxg4.cpp src/onair.cpp src/ttpages.cpp src/ttsquash.cpp src/vbirepair.cpp src/export.cpp
-  src/decoder.cpp src/ttdata.cpp src/starsight.cpp src/textservices.cpp src/silentradio.cpp src/ssjson.cpp src/rescache.cpp src/colour.cpp src/legacy_bridge.cpp src/services.cpp src/linecolour.cpp
+  src/decoder.cpp src/ttdata.cpp src/telesoft.cpp src/bbcmicro.cpp src/starsight.cpp src/textservices.cpp src/silentradio.cpp src/ssjson.cpp src/rescache.cpp src/colour.cpp src/legacy_bridge.cpp src/services.cpp src/linecolour.cpp
   src/live.cpp src/tvtime.cpp src/vbicodes.cpp
   src/flac.cpp src/vbifile.cpp src/slicer_cpu.cpp src/slicer_gpu.cpp src/fastdata.cpp src/fastmlse.cpp src/mlse.cpp
   src/speller.cpp src/ui/util.cpp src/ui/json.cpp
@@ -45,9 +45,9 @@ set(CORE
 if(WIN32)
   add_library(trcore STATIC ${CORE})
   target_include_directories(trcore PUBLIC src src/ui src/nabts)
-  set(LIBS trcore comctl32 uxtheme dwmapi gdi32 comdlg32 shell32 ole32 winhttp shlwapi advapi32 uuid winmm strmiids oleaut32)
+  set(LIBS trcore gdiplus comctl32 uxtheme dwmapi gdi32 comdlg32 shell32 ole32 winhttp shlwapi advapi32 uuid winmm strmiids oleaut32)
 
-  add_executable(TeletextRescue WIN32 src/gui_main.cpp src/gui_services.cpp src/gui_finds.cpp src/gui_nabts.cpp src/gui_teletext.cpp src/gui_lines.cpp src/gui_capture.cpp src/gui_repair.cpp src/gui_vps.cpp src/capture.cpp src/ui/gui_widgets.cpp src/app.rc)
+  add_executable(TeletextRescue WIN32 src/gui_main.cpp src/gui_services.cpp src/gui_finds.cpp src/gui_btfiles.cpp src/gui_nabts.cpp src/gui_teletext.cpp src/gui_lines.cpp src/gui_capture.cpp src/gui_repair.cpp src/gui_vps.cpp src/gui_bbc.cpp src/capture.cpp src/ui/gui_widgets.cpp src/app.rc)
   target_link_libraries(TeletextRescue ${LIBS})
   add_executable(trcli src/cli.cpp src/capture.cpp src/app.rc)
   target_link_libraries(trcli ${LIBS})

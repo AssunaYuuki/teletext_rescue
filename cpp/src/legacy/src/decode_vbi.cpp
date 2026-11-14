@@ -381,8 +381,11 @@ std::map<std::pair<int, int>, std::array<u8, 42>> VbiReader::decode_all(const st
             if (a < 0 || c < 0) continue;
             int row = (a >> 3) | (c << 1); int k0 = row == 0 ? 10 : 2;
             if (row > 25) continue;
-            bool bad = false; for (int k = k0; k < 42; k++) if (!odd_parity(b[k])) { bad = true; break; }
-            if (bad) todo.push_back(kv.first);
+            int nbad = 0; for (int k = k0; k < 42; k++) nbad += !odd_parity(b[k]);
+            // an 8-bit data row (a file sent in teletext, «Бизнес-Текст»: > 12 of 40 bytes fail parity) has no parity:
+            // the repair would make every even byte odd by one bit (BTEST: 73% of its even bytes spoilt)
+            if (row > 0 && nbad > 12) continue;
+            if (nbad) todo.push_back(kv.first);
         }
         pr.step(fmt("repairing damaged bytes: %zu lines", todo.size()));
         std::atomic<int> fixed{0};
@@ -447,7 +450,11 @@ void decode_vbi_project(const std::string &vbi_in, const std::string &out_in, in
     std::vector<Packet42> pk; int rej = 0;
     for (auto &kv : res) {
         auto &b = kv.second;
-        if (ham::fix[b[0]] < 0 || ham::fix[b[1]] < 0 || wst_par_bad(b.data()) > 10) { rej++; continue; }
+        // an 8-bit data row («Бизнес-Текст», rows 1-25 with > 12 bytes failing parity) stays in the stream as read: the
+        // files are put together from it (before, the byte repair had made it odd and so let it through)
+        int a0 = ham::fix[b[0]], a1 = ham::fix[b[1]], prow = a0 < 0 || a1 < 0 ? -1 : (a0 >> 3) | (a1 << 1);
+        bool data8 = prow >= 1 && prow <= 25 && wst_par_bad(b.data()) > 12;
+        if (a0 < 0 || a1 < 0 || (wst_par_bad(b.data()) > 10 && !data8)) { rej++; continue; }
         lp.v[(size_t)kv.first.first * lpf + kv.first.second] = (int32_t)pk.size();
         Packet42 p; memcpy(p.data(), b.data(), 42); pk.push_back(p);
     }

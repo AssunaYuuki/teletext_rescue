@@ -1,36 +1,28 @@
-**Windows 10/11:** `TeletextRescue-Setup-v1.4.exe` (64-bit) or `TeletextRescue-Setup-v1.4-x86.exe` (32-bit) — the program with windows and `trcli`; the same as zip: `TeletextRescue-windows-x64.zip`, `TeletextRescue-windows-x86.zip`.
+**Windows 10/11:** `TeletextRescue-Setup-v1.5.exe` (64-bit) or `TeletextRescue-Setup-v1.5-x86.exe` (32-bit) — the program with windows and `trcli`; the same as zip: `TeletextRescue-windows-x64.zip`, `TeletextRescue-windows-x86.zip`.
 **Linux** (x86_64, ARM64, x86) and **macOS** (Apple Silicon and Intel in one app): the program with windows (`TeletextRescue`, `Teletext Rescue.app`) and `trcli`. On macOS the first time: right click → Open, or `xattr -dr com.apple.quarantine "Teletext Rescue.app" trcli`.
 
-### What is new in 1.4
+### What is new in 1.5
 
-- **Russian teletext in the right alphabet**: Russian services sent no character-set packets, the receiver
-  took the set from the page header — most pages start their rows in Cyrillic and ESC switches to Latin, but
-  pages with national option 0 (Ostankino 1993-94, ORT 1995-96, TELEINF) start in Latin and switch to Cyrillic.
-  Every page is now read the way its words say (Russian and English dictionaries): English text is no longer
-  shown in Cyrillic letters and Russian text no longer as transliteration — in the pages, the HTML / PNG export
-  and in live.
-- **Teletext pages put together better**: pages that rotate several texts under one subcode (TELEINF 100) are
-  separate subpages again instead of a mix of letters; half-empty pages after voting fixed; every subpage keeps
-  its own number in the written `.t42`; rows with a damaged row number go back to their place; teletext on
-  lines 6 and 318 is read (Партнер-Телетекст, Donetsk 1999: 1.3% -> 0.27% errors).
-- **Live** (Windows): all teletext reading runs on the graphics card and the processor stays almost free;
-  the card starts reading after a few frames; the learnt templates are used live too; carousel pages are
-  kept apart; the capture window no longer flickers; no administrator rights needed (a card that wants them
-  asks for a restart).
-- **Graphics card**: the built OpenCL programs are kept, so a recording no longer waits 1-4 s for them on
-  every opening; short probes run on the processor.
-- **NTSC recordings**: the capture layout is found also without captions (a 720-sample reading of a
-  1440-sample capture no longer wins on Nielsen AMOL), captions of a recording that changes channels are no
-  longer thrown away, a crash on some PAL-looking NTSC captures fixed; Japanese teletext from GV-USB2
-  captures is found by the probe.
-- **Files found in the signal**: ITS / IBS data channels (packets X/31, TELEINF) and **InterTVNet**
-  (BCH + CRC, files, pieces `.@N`, the access list); a RAR unpacker of its own (RAR 2.9-4.x, LZ and PPMd,
-  filters); ARJ archives unpacked through damage (lost start, cut-off end, holes) and mended by their CRCs,
-  copies of a file under other names combined; TV-Inform fT3 files put together by themselves from a full
-  capture (the order of the lines is learnt, single bit errors mended by CRC-32); Бизнес-Текст: open files of
-  the 1996 catalogue written as received, the key search no longer fooled by them; a catalogue entry received with its name damaged joins its file instead of making a second one, and the share read counts the blocks that never came.
-- Page editor: Ctrl+S also writes `<recording> edit.t42`. A `.t42` of one page opens.
-- **macOS and Linux**: the start screen is in the main window again (it went into a borderless window of its
-  own, and the empty main window, once clicked, covered all the other windows); a window that is opened or
-  clicked comes to the front, as on Windows.
-
+- **ТВ-информ files from a damaged reception**: a file of the Norpak packet channel whose blocks failed their
+  CRC (a capture card that drops frames cuts the records short) is now written as it came, the damaged blocks
+  and bytes marked; a block whose header was lost is found at its place between its neighbours; a file whose
+  description did not come is put together from its blocks. Text files (Windows CP1251 or DOS CP866) are shown
+  in the report and in the found files — also in live — and written as `.txt`, `[…]` where bytes did not come
+  (ORT 20.01.2002: the РИА «Новости» news file `3GL16425.DOC`).
+- **VPS** is read in recordings: network and CNI, the station's own text (also through frames the capture
+  lost), the programme label, sound, the time of the broadcast from the teletext clock and how many frames the
+  capture lost (`vps.txt`). Lines in VPS form that carry a clock or a name (Eurosport) are no longer taken for
+  ТВ-информ. The live VPS window shows one name, the time on the air and lost frames.
+- **Graphics card**: live reads on the card from the first frame, also on channels without teletext; the card
+  is chosen among all of them (a separate card before the built-in one, NVIDIA, AMD or Intel; `TR_GPU=<part of
+  its name>` picks one).
+- **BBC Micro and Ceefax telesoftware**: programs sent in teletext (Ceefax 1984) are collected from recordings
+  and in live and run in a BBC Micro window of the program (File → Open a BBC Micro program, `.bbc` / `.ssd`).
+- **DVB streams (`.ts`)** are recognised by their contents whatever the name (issue #4): the tracks are described
+  and DVB subtitles are written as pictures; the start screen has a **DVB stream .ts…** button.
+- **Бизнес-Текст**: the 1995 form (29.12.1995, 25.05.1996) is decrypted; 1994 blocks whose rows were sent apart
+  are complete again; a **Files table** window shows every file of the catalogue block by block (recording and
+  live).
+- **Teletext enhancements X/26** (issue #5): one wrong bit of a triplet is corrected, a bad triplet no longer
+  loses the rest of the packet, and `.t42` export keeps the X/26 rows of each subpage (TVP2 1998: 185 pages with
+  diacritics instead of 173, 43% more accented letters).

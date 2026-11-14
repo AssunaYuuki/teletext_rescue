@@ -141,13 +141,17 @@ static void refine_bytes(const MlseDecoder::Pre &P, const MlseModel &M, const do
     std::vector<double> pm(NT); for (int i = 0; i < NT; i++) pm[i] = bits[i] * 2.0 - 1;
     std::vector<u8> data(M.nbytes);
     bytes_lsb(&bits[24], M.nbytes, data.data());
+    // правило кода смотрит на свободное чтение (адрес — уже перерешённый): по нему узнаётся 8-битный ряд данных
+    // («Бизнес-Текст»), у которого чётности нет, — а перерешённые байты текста всегда нечётные
+    std::vector<u8> view = data;
     std::vector<double> fixed;
     std::vector<int> pair;
     for (int b = 0; b < M.nbytes; b++) {
-        int code = M.code(data.data(), b);
+        view[0] = data[0]; if (M.nbytes > 1) view[1] = data[1];
+        int code = M.code(view.data(), b);
         if (!code) continue;
         // два первых байта (адрес пакета) — вместе: 16 × 16 вариантов, иначе ошибка в одном тянет другой
-        bool two = b == 0 && code == 1 && M.nbytes > 1 && M.code(data.data(), 1) == 1;
+        bool two = b == 0 && code == 1 && M.nbytes > 1 && M.code(view.data(), 1) == 1;
         int nb = two ? 2 : 1, NB = 8 * nb;
         const std::vector<int> *cand = code == 1 ? &HAM : &PAR;
         if (two) { if (pair.empty()) for (int x : HAM) for (int y : HAM) pair.push_back(x | (y << 8)); cand = &pair; }
@@ -310,13 +314,13 @@ static const char *REFINE_KERNEL = R"CL(
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
 #pragma OPENCL FP_CONTRACT OFF
 #define K1 (NTAP + 1)
-int wst_code(__local const uchar *p, int i, __global const int *hd) {
+int wst_code(__local const uchar *p, int i, __global const int *hd, int freeBad) {
     if (i < 2) return 1;
     int a = hd[p[0]], b = hd[p[1]];
     if (a < 0 || b < 0) return 0;
     int row = (a >> 3) | (b << 1);
     if (row == 0) return i < 10 ? 1 : 2;
-    if (row <= 25) return 2;
+    if (row <= 25) return freeBad > 12 ? 0 : 2;   // 8-bit data row: its bytes have no parity
     if (row == 27) return i < 40 ? 1 : 0;
     if (row >= 26 && row <= 29) return i == 2 ? 1 : 0;
     return 0;
@@ -334,10 +338,13 @@ __kernel void refine(__global const double *Y, __global const float *C, __global
     barrier(CLK_LOCAL_MEM_FENCE);
     for (int b = l; b < NBYTES; b += WG) { int v = 0; for (int q = 0; q < 8; q++) v |= bt[24 + b * 8 + q] << q; data[b] = (uchar)v; }
     barrier(CLK_LOCAL_MEM_FENCE);
+    // text bytes failing parity in the free reading (as refine_bytes on the processor): an 8-bit data row is not re-decided
+    int freeBad = 0;
+    for (int b = 2; b < NBYTES; b++) freeBad += !(popcount((uint)data[b]) & 1);
     for (int b = 0; b < NBYTES; b++) {
-        int code = wst_code(data, b, hd);
+        int code = wst_code(data, b, hd, freeBad);
         if (!code) continue;
-        int two = b == 0 && code == 1 && NBYTES > 1 && wst_code(data, 1, hd) == 1;
+        int two = b == 0 && code == 1 && NBYTES > 1 && wst_code(data, 1, hd, freeBad) == 1;
         int nb = two ? 2 : 1, NB = 8 * nb, ncand = two ? 256 : code == 1 ? 16 : 128;
         int b0 = 24 + b * 8, lo = max(0, b0 - RR), hi = min(NT, b0 + NB + LL);
         for (int idx = l; idx < (hi - lo) * NP; idx += WG) {

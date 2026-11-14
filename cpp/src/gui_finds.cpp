@@ -91,21 +91,28 @@ struct FindsWin : Window {
     {
         RECT rc; GetClientRect(hwnd, &rc);
         int p = S(hwnd, 14), y = hd.layout(hwnd);
-        if (act) { MoveWindow(act, p, y, rc.right - 2 * p, S(hwnd, 20), TRUE); y += S(hwnd, 26); }
+        auto put = [this](HWND c, int x, int y, int w, int h, bool show) {
+            RECT now{};
+            GetWindowRect(c, &now);
+            MapWindowPoints(nullptr, hwnd, (POINT *)&now, 2);
+            if (show && (now.left != x || now.top != y || now.right - now.left != w || now.bottom - now.top != h)) MoveWindow(c, x, y, w, h, TRUE);
+            if (show != (IsWindowVisible(c) != FALSE)) ShowWindow(c, show ? SW_SHOW : SW_HIDE);
+        };
+        if (act) { put(act, p, y, rc.right - 2 * p, S(hwnd, 20), true); y += S(hwnd, 26); }
         // the list: every row up to 40% of the window, never fewer than 6 rows (+ the scroll bar)
         int rows = (int)std::clamp<size_t>(items.size(), 6, 30);
         int lh = std::min(S(hwnd, 48) + rows * S(hwnd, 22), std::max(S(hwnd, 48) + 6 * S(hwnd, 22), (int)(rc.bottom * 2 / 5)));
-        MoveWindow(lst, p, y, rc.right - 2 * p, lh, TRUE); y += lh + S(hwnd, 10);
+        put(lst, p, y, rc.right - 2 * p, lh, true); y += lh + S(hwnd, 10);
         card = {p, y, rc.right - p, y + S(hwnd, 112)}; y = card.bottom + S(hwnd, 10);
         int h = std::max(0L, rc.bottom - y - p);
-        if (hasPic()) { pic = {p, y, rc.right - p, y + h}; ShowWindow(ed, SW_HIDE); }
-        else { pic = {}; MoveWindow(ed, p, y, rc.right - 2 * p, h, TRUE); ShowWindow(ed, SW_SHOW); }
-        InvalidateRect(hwnd, nullptr, TRUE);
+        if (hasPic()) pic = {p, y, rc.right - p, y + h}; else pic = {};
+        put(ed, p, y, rc.right - 2 * p, (int)h, !hasPic());
+        InvalidateRect(hwnd, nullptr, FALSE);
     }
     void fill_list()
     {
         SendMessageW(lst, WM_SETREDRAW, FALSE, 0);
-        ListView_DeleteAllItems(lst);
+        while (ListView_GetItemCount(lst) > (int)items.size()) ListView_DeleteItem(lst, ListView_GetItemCount(lst) - 1);
         for (size_t i = 0; i < items.size(); i++) {
             const Find &f = items[i];
             lv_set(lst, (int)i, 0, kind_name(f));
@@ -120,6 +127,7 @@ struct FindsWin : Window {
         }
         if (sel >= 0 && sel < (int)items.size()) ListView_SetItemState(lst, sel, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
         SendMessageW(lst, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(lst, nullptr, FALSE);
     }
     // everything known about a find that has no text of its own, one fact per line
     static std::string describe(const Find &f)
@@ -173,7 +181,7 @@ struct FindsWin : Window {
         std::string keep = sel >= 0 && sel < (int)items.size() ? items[sel].name : "";
         bool same = now.size() == items.size();
         for (size_t i = 0; same && i < now.size(); i++)
-            same = now[i].name == items[i].name && now[i].status == items[i].status && now[i].size == items[i].size;
+            same = now[i].name == items[i].name && now[i].status == items[i].status && now[i].size == items[i].size && now[i].text == items[i].text;
         if (same) return;
         items = std::move(now);
         sel = items.empty() ? -1 : 0;
@@ -238,6 +246,7 @@ struct FindsWin : Window {
             hd.add(hwnd, 503, "Save text\xE2\x80\xA6", 110);
             hd.add(hwnd, 504, "Rotate", 80);
             hd.add(hwnd, 505, "Combine with another reception\xE2\x80\xA6", 250);
+            hd.add(hwnd, 506, "Files table", 100);
             lst = listview(hwnd, 10, {{"Kind", 100}, {"Name", 170}, {"Short name", 100}, {"Type", 130}, {"Size", 80}, {"Status", 280},
                                       {"Service", 230}, {"Where", 170}, {"When", 150}});
             // the text wraps at the window's edge (an EDIT made with ES_AUTOHSCROLL never wraps)
@@ -275,6 +284,11 @@ struct FindsWin : Window {
             if (id == 501 && hasF) open_find(f->path);
             else if (id == 502 && hasF) open_path(f->path.substr(0, f->path.find_last_of("\\/")));
             else if (id == 504) { rot = !rot; shownPath.clear(); show(); }
+            else if (id == 506) {   // the «Бизнес-Текст» files block by block
+                if (source) bt_files_window_live(hwnd, source, activity, subtitle);
+                else if (has_bt_files(items)) bt_files_window(hwnd, items, subtitle);
+                else ask(hwnd, "Files table", "This recording has no \xC2\xAB\xD0\x91\xD0\xB8\xD0\xB7\xD0\xBD\xD0\xB5\xD1\x81-\xD0\xA2\xD0\xB5\xD0\xBA\xD1\x81\xD1\x82\xC2\xBB catalogue: the table shows the files of that service block by block.", MB_ICONINFORMATION);
+            }
             else if (id == 505 && hasF) {
                 // the same file received another time (another recording / live session of the same broadcast):
                 // each copy fills what the other did not read; an archive is chosen by its CRCs
@@ -308,6 +322,7 @@ struct FindsWin : Window {
 // no program for (.C01, .COD) is shown selected in its folder instead of the "how to open" question
 void open_find(const std::string &path)
 {
+    if (open_bbc_program(GetActiveWindow(), path)) return;   // telesoftware: runs in the BBC Micro window
     std::string o = openableCopy(path);
     if (!o.empty()) { open_path(o); return; }
     std::wstring w = W(path);
@@ -326,12 +341,28 @@ void open_finds(FindsWin *w, HWND owner)
 
 void finds_window(HWND owner, const ResultPtr &r)
 {
+    {   // one window: the table of every service's finds (the list window opens from its button)
+        auto items = findsOf(*r);
+        size_t files = 0, texts = 0;
+        for (auto &f : items) (f.kind == Find::File || f.kind == Find::Announced ? files : texts)++;
+        bt_files_window(owner, items, fmt("%zu files, %zu texts \xC2\xB7 ", files, texts) + file_name(*r));
+        return;
+    }
     auto *w = new FindsWin;
     w->items = findsOf(*r);
     size_t files = 0, texts = 0;
     for (auto &f : w->items) (f.kind == Find::File || f.kind == Find::Announced ? files : texts)++;
     w->title = "Found files and texts";
     w->subtitle = fmt("%zu files, %zu texts \xC2\xB7 ", files, texts) + file_name(*r);
+    open_finds(w, owner);
+}
+
+void finds_window_items(HWND owner, const std::vector<Find> &items, const std::string &subtitle)
+{
+    auto *w = new FindsWin;
+    w->items = items;
+    w->title = "Found files and texts";
+    w->subtitle = subtitle;
     open_finds(w, owner);
 }
 

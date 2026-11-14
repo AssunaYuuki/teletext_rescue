@@ -70,6 +70,8 @@ struct DecodeResult {
     VbiGeometry geom;
     std::string slicerName;
     double sliceSeconds = 0, totalSeconds = 0;
+    // a DVB transport stream: what its tables say (ts_info, a line each); also in <recording>_vbi/dvb_info.txt
+    std::vector<std::string> dvbInfo;
     std::vector<LineInfo> lines;
     SsDatabase db;
     std::vector<std::string> captions;
@@ -77,6 +79,7 @@ struct DecodeResult {
     std::vector<VitcCode> vitc;            // VITC time code, one per frame that has it
     std::vector<std::string> vitcReport;
     std::vector<std::string> timeCode;     // the time code line of ORT (line 6: 1 MHz burst + 25 symbols a second)
+    std::vector<std::string> vpsReport;    // VPS (line 16): [0] = the headline, then everything the line tells (vpsAnalyse)
     std::map<int, LineForce> lineForce;    // line types the user set by hand for this decoding
     std::vector<std::string> xds;
     std::vector<SilentRadioMessage> silentRadio;
@@ -100,5 +103,8 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
 std::string summarize(const DecodeResult& r);
 // the first lines of the report: colour system, ТВ-информ yes / no, teletext, other services
 std::vector<std::string> headline(const DecodeResult& r);
+// a DVB transport stream, not a VBI recording: no lines, frames, colour system - its streams and tables instead
+bool isDvb(const DecodeResult& r);
+std::vector<std::string> dvbInfoOf(const DecodeResult& r);   // r.dvbInfo, else read back from dvb_info.txt (saved results)
 // programme names and clocks from XDS, StarSight, AMOL and teletext (onair.cpp)
 std::vector<std::string> onAirSummary(const DecodeResult& r);

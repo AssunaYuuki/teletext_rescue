@@ -6,6 +6,7 @@
 #include "nabts/teletext.h"
 #include "biznestext.h"
 #include "ttdata.h"
+#include "telesoft.h"
 #include "finds.h"
 #include "tvinform.h"
 #include "tviftr3.h"
@@ -128,6 +129,14 @@ struct LiveVps {
     bool have = false, wssHave = false;       // read in the last 5 s
     bool everVps = false, everWss = false;    // read at all in this session
     uint8_t bytes[13] = {};                   // VPS bytes 3..15
+    std::string station;                      // the station's text sent in byte 4, a character a frame ("" = none)
+    int stationPeriod = 0;                    // frames a turn of that text
+    std::string name;                         // one name for people: "VIVA", "Eurosport" (vpsDisplayName)
+    std::string onAir;                        // date and clock of the teletext headers now ("Do 23.11.95 10:15:27"), "" = none
+    int stretches = 0, lossy = 0;             // stretches of ~4 s the station text was read on, of them with frames lost
+    int keepNum = 0, keepDen = 0;             // the capture kept keepNum frames of every keepDen there (2 of 3)
+    // other lines in the VPS format (Eurosport 1998: line 7 date and clock, line 8 "EUROSPORT"): TV line, what it says now
+    std::vector<std::pair<int, std::string>> dataLines;
     int wssBits = 0;
     int64_t reads = 0, wssReads = 0, frames = 0;
     int vpsLine = 0, wssLine = 0;             // TV line it is read on
@@ -353,13 +362,19 @@ private:
     LiveVps vps_;
     void voteCodes();
     std::deque<std::string> vpsLast_;
+    std::deque<std::pair<int64_t, uint8_t>> vpsB4_;   // (frame, byte 4) of the last readings: the station's text
     std::deque<int> wssLast_;
     int64_t vpsFrame_ = -1, wssFrame_ = -1;
+    int vpsChosen_ = -1;                       // the stored line VPS is read from (one line: vpsChosen_ in the frame loop)
+    std::map<int, std::pair<std::string, int64_t>> vpsData_;   // other VPS-format lines: TV line -> (text, frame), under mu_
+    std::map<int, int> vpsDataAt_;             // the byte the date of a clock line starts at (TV line -> place)
+    std::atomic<int> vpsChosenTv_{0};          // its TV line number, for the window
     std::vector<uint8_t> picRow_[8];                // under mu_: the picture's rows 23 / 336 and the ones after them
     int picRowsWanted_ = 2, picRowsGot_ = 2;        // how many rows the capture window asks for / how many came
     // the graphics card: the lines of a frame read on it (see setGpu). Only the decoding thread touches these
     std::shared_ptr<LiveGpuBatch> gp_;
     bool gpuWanted_ = true, gpuDead_ = false;   // the card reads whenever there is one
+    bool gpuGenericTried_ = false;              // the start-up model of a clean line was made (once a capture)
     std::vector<std::array<uint8_t, 42>> gpuLine_;
     std::vector<char> gpuHave_;
     std::vector<char> gpuTried_;                    // the line went to the card this frame (read or not)
@@ -398,6 +413,12 @@ private:
     std::vector<BtWritten> btWritten_;       // under mu_
     std::string btNote_;                     // under mu_
     TtDataPages td_;                         // Hamming 8/4 data pages (ТЕЛЕИНФ 790 / 795), the same
+    // BBC Ceefax telesoftware (under mu_): blocks as they come; programs made again at most every 5 s when new
+    // blocks came, written as <files>/telesoftware/<name>.bbc (a click runs them in the BBC Micro window)
+    TsCollector ts_;
+    size_t tsSeen_ = 0;
+    int64_t tsAt_ = -1000000;
+    std::vector<TsProgram> tsProgs_;
     std::map<int, TviStream> tviLive_;       // line index -> words so far (probe thread only)
     std::map<int, std::unique_ptr<Tvi3Slicer>> tvi3Slicers_;   // ТВ-информ fТ3 lines: their MLSE (probe thread only)
     TviStream tvi3Live_;                     // the fТ3 words of all its lines so far

@@ -11,6 +11,7 @@
 #include "slicer.h"
 #include "live.h"
 #include "legacy_bridge.h"
+#include "vbicodes.h"
 #include "ttpages.h"
 #include "teletext.h"
 #include <algorithm>
@@ -223,6 +224,37 @@ static bool decodeTs(const std::string& path, const DecodeOptions& opt, DecodeRe
         res.log.push_back(m);
         if (opt.log) opt.log(m);
     };
+    // everything the stream says about itself: in the report and in <recording>_vbi/dvb_info.txt
+    if (opt.progress) opt.progress(0, "Reading the tables of the transport stream (channels, streams, programmes)");
+    try {
+        auto info = ts_info(path);
+        std::string txt = "DVB transport stream: " + path + "\n\n";
+        for (auto& l : info) { note("DVB: " + l); txt += l + "\n"; }
+        res.dvbInfo = info;
+        std::string dir = legacyReportDir(opt.sourcePath.empty() ? path : opt.sourcePath);
+        make_dirs(dir);
+        write_text(path_join(dir, "dvb_info.txt"), txt);
+        // the DVB subtitles: pictures in <recording>_vbi/dvb_subtitles, with index.txt (when each was shown)
+        std::map<int, std::string> langs;
+        for (auto& l : info) {
+            size_t k = l.find("DVB subtitles (EN 300 743)"), q = l.find("PID 0x");
+            if (k == std::string::npos || q == std::string::npos) continue;
+            int pid = (int)strtol(l.c_str() + q + 6, nullptr, 16);
+            std::string rest = l.substr(k, l.find(';', k) - k), lang;
+            size_t c = rest.rfind(", ");
+            if (c != std::string::npos && rest.size() - c - 2 == 3) lang = rest.substr(c + 2);
+            if (!lang.empty()) langs[pid] = lang;
+        }
+        if (!langs.empty()) {
+            if (opt.progress) opt.progress(0, "DVB subtitles: drawing their pictures");
+            std::string sd = path_join(dir, "dvb_subtitles");
+            auto idx = ts_subtitles(path, sd, langs);
+            std::string it;
+            for (auto& l : idx) it += l + "\n";
+            if (!idx.empty()) write_text(path_join(sd, "index.txt"), it);
+            note(fmt("DVB subtitles: %zu pictures written to ", idx.size()) + sd);
+        }
+    } catch (std::exception& e) { note(std::string("DVB tables not read: ") + e.what()); }
     if (opt.progress) opt.progress(0, "Reading teletext from the transport stream");
     Progress pr;
     pr.on_progress = [&](long long a, long long b, const std::string&) { if (opt.progress && b) opt.progress((double)a / b, "Reading teletext from the transport stream"); };
@@ -234,7 +266,11 @@ static bool decodeTs(const std::string& path, const DecodeOptions& opt, DecodeRe
         return false;
     }
     note("DVB teletext (EN 300 472): " + std::to_string(pk.size()) + " packets");
-    if (pk.empty()) { err = "no DVB teletext in this transport stream"; return false; }
+    if (pk.empty()) {   // no teletext: the stream's tables are still the result
+        note("no DVB teletext in this transport stream");
+        res.totalSeconds = now() - t0;
+        return true;
+    }
     Bytes st;
     for (auto& p : pk) st.insert(st.end(), p.begin(), p.end());
     if (opt.progress) opt.progress(1, "Building the teletext pages");
@@ -486,9 +522,269 @@ static void saveReport(const DecodeResult& res, const DecodeOptions& opt, const 
     } catch (...) {}
 }
 
+// VPS (625 lines, line 16 of field 1): the line is found by its start code in the probe frames (any stored line:
+// a tape or a processor may move it by one), then read in every frame of the recording - first as everywhere
+// (vpsRead), the frames that fails by the more tolerant reading of a line known to be VPS. What all the frames
+// tell together (network, the station's text in byte 4, label, sound, every byte, changes, gaps) is the report.
+// Returns the stored line, -1 = no VPS.
+// Other lines in the VPS format (Eurosport 20.01.98: lines 7 / 320 date and clock, 8 / 321 " EUROSPORT " - the
+// satellite uplink's own lines, taken for ТВ-информ before) are read in the same pass: extra = (stored line, what it carries)
+struct VpsExtra { int row = -1; VpsDataFile data; double rate = 0; };
+static int vpsPass(VbiFile& vf, const VbiGeometry& g, int64_t frames, const std::vector<uint8_t>& probe, int probeN, const DecodeOptions& opt,
+                   VpsFile& out, double& rate, std::vector<VpsExtra>& extra)
+{
+    const int n = g.validSamples;
+    const double fs = g.lineSamples * g.lineRate;
+    std::vector<float> y(n);
+    auto load = [&](const uint8_t* p) { for (int i = 0; i < n; i++) y[i] = g.fmt == 1 ? (p[2 * i] | (p[2 * i + 1] << 8)) / 256.0f : (float)p[i]; };
+    int row = -1, best = 0;
+    uint8_t b[13];
+    std::vector<int> hitsOf(g.linesPerFrame, 0);
+    std::vector<int> labelOk(g.linesPerFrame, 0);   // probe readings that are a VPS label (a CNI of the register)
+    for (int l = 0; l < g.linesPerFrame; l++) {
+        auto it = opt.lineForce.find(l);
+        if (it != opt.lineForce.end() && it->second != LineForce::Auto) continue;   // set by hand to another signal
+        int hits = 0;
+        for (int i = 0; i < probeN; i++) {
+            load(probe.data() + (size_t)i * g.frameBytes() + (size_t)l * g.lineBytes);
+            if (vpsRead(y.data(), n, fs, b)) { hits++; labelOk[l] += !vpsCniName(vpsLabel(b).cni).empty(); }
+            if (i == 39 && hits == 0) break;   // nothing in 40 frames: not this line
+        }
+        hitsOf[l] = hits;
+    }
+    // the VPS line: read most often - of lines read about as often, one whose label names a network of the
+    // register, then the one nearest line 16 of its field
+    {
+        double bs = -1;
+        for (int l = 0; l < g.linesPerFrame; l++) {
+            if (!hitsOf[l]) continue;
+            int ln, fl;
+            lineOf(g, l, ln, fl);
+            double sc = hitsOf[l] + (labelOk[l] * 2 > hitsOf[l] ? 0.1 * probeN : 0) - 0.01 * probeN * std::abs(ln - 16);
+            if (sc > bs) { bs = sc; row = l; best = hitsOf[l]; }
+        }
+    }
+    if (row < 0 || best * 4 < probeN) return -1;
+    std::vector<int> others;
+    for (int l = 0; l < g.linesPerFrame; l++)
+        if (l != row && hitsOf[l] * 4 >= probeN) others.push_back(l);
+    std::vector<std::vector<VpsReading>> ord(others.size());
+    std::vector<VpsReading> rd;
+    std::vector<uint8_t> buf;
+    for (int64_t f = 0; f < frames;) {
+        if (opt.cancel && *opt.cancel) return -1;
+        int64_t got = vf.read(f, std::min<int64_t>(200, frames - f), buf);
+        if (got <= 0) break;
+        for (int64_t k = 0; k < got; k++) {
+            load(buf.data() + (size_t)k * g.frameBytes() + (size_t)row * g.lineBytes);
+            VpsReading x;
+            x.frame = f + k;
+            if (vpsRead(y.data(), n, fs, x.b)) rd.push_back(x);
+            else if (vpsReadKnown(y.data(), n, fs, x.b)) { x.second = true; rd.push_back(x); }
+            for (size_t o = 0; o < others.size(); o++) {
+                load(buf.data() + (size_t)k * g.frameBytes() + (size_t)others[o] * g.lineBytes);
+                VpsReading z;
+                z.frame = f + k;
+                if (vpsRead(y.data(), n, fs, z.b)) ord[o].push_back(z);
+            }
+        }
+        f += got;
+    }
+    if (rd.empty()) return -1;
+    int ln, fl;
+    lineOf(g, row, ln, fl);
+    out = vpsAnalyse(rd, frames, 25.0, ln, fl);
+    rate = (double)rd.size() / std::max<int64_t>(1, frames);
+    extra.clear();
+    for (size_t o = 0; o < others.size(); o++) {
+        if (ord[o].size() * 4 < (size_t)frames) continue;
+        int ln2, fl2;
+        lineOf(g, others[o], ln2, fl2);
+        VpsExtra e;
+        e.row = others[o];
+        e.rate = (double)ord[o].size() / std::max<int64_t>(1, frames);
+        e.data = vpsDataAnalyse(ord[o], frames, 25.0, ln2, fl2);
+        if (e.data.kind == "VPS-format data") {
+            // a second VPS label (ARD 23.11.95 line 329, the SECAM test tape on both fields): told as VPS
+            VpsFile v2 = vpsAnalyse(ord[o], frames, 25.0, ln2, fl2);
+            e.data.kind = "VPS (second line): " + v2.name;
+            e.data.report.insert(e.data.report.begin() + 2, "  As a VPS label   " + v2.head.substr(5));
+        }
+        extra.push_back(std::move(e));
+    }
+    return row;
+}
+
+// The real time of a recording for the VPS report: the clock and date of the teletext page headers (the decoder's
+// stream, else the live capture's .t42 next to the recording) and the VITC time code. A clock counts when it came
+// three times among the first / last readings (a tape's broken digits do not); the date is the commonest
+// "dd.mm.yy" of the headers. ARD 1995 tape: "Do 23.11.95" 10:15:27 .. 10:16:40 for a label 23.11 10:03
+static VpsClocks vpsClocksOf(const DecodeResult& res, const std::string& path)
+{
+    VpsClocks c;
+    std::string stem = path.substr(0, path.rfind('.'));
+    std::vector<std::string> cand;
+    if (!res.teletext.project.empty()) cand.push_back(path_join(res.teletext.project, "stream.t42"));
+    cand.push_back(stem + ".t42");
+    cand.push_back(stem + ".raw.t42");
+    Bytes s;
+    for (auto& p : cand) {
+        if (!exists(p)) continue;
+        try { s = read_file(p); } catch (...) { s.clear(); }
+        if (s.size() >= 42 * 50) break;
+    }
+    auto h4 = [](uint8_t b) { return ((b >> 1) & 1) | (((b >> 3) & 1) << 1) | (((b >> 5) & 1) << 2) | (((b >> 7) & 1) << 3); };
+    std::vector<int> secs;
+    std::map<std::string, int> dates;
+    for (size_t i = 0; i + 42 <= s.size() && secs.size() < 400000; i += 42) {
+        const uint8_t* p = &s[i];
+        int row = (h4(p[0]) | (h4(p[1]) << 4)) >> 3;
+        if (row != 0) continue;
+        char t[33];
+        for (int k = 0; k < 32; k++) { int ch = p[10 + k] & 0x7F; t[k] = ch >= 0x20 && ch < 0x7F ? (char)ch : ' '; }
+        t[32] = 0;
+        // HH:MM:SS (or HH:MM/SS, HH.MM.SS) at the end of the header
+        const char* e = t + 24;
+        auto dg = [](char ch) { return ch >= '0' && ch <= '9'; };
+        if (dg(e[0]) && dg(e[1]) && !dg(e[2]) && dg(e[3]) && dg(e[4]) && !dg(e[5]) && dg(e[6]) && dg(e[7])) {
+            int hh = (e[0] - '0') * 10 + e[1] - '0', mm = (e[3] - '0') * 10 + e[4] - '0', ss = (e[6] - '0') * 10 + e[7] - '0';
+            if (hh < 24 && mm < 60 && ss < 60) secs.push_back(hh * 3600 + mm * 60 + ss);
+        }
+        // a date: dd.mm.yy / dd.mm.yyyy / dd.mm. with the word before it (weekday)
+        for (int k = 0; k + 5 <= 24; k++) {
+            if (!(dg(t[k]) && dg(t[k + 1]) && t[k + 2] == '.' && dg(t[k + 3]) && dg(t[k + 4]))) continue;
+            if (k > 0 && dg(t[k - 1])) continue;
+            int dd = (t[k] - '0') * 10 + t[k + 1] - '0', mo = (t[k + 3] - '0') * 10 + t[k + 4] - '0';
+            if (dd < 1 || dd > 31 || mo < 1 || mo > 12) continue;
+            int end = k + 5;
+            if (end < 32 && t[end] == '.') { end++; while (end < 32 && dg(t[end]) && end < k + 10) end++; }
+            int st = k;
+            if (st >= 2 && t[st - 1] == ' ' && isalpha((unsigned char)t[st - 2])) { st -= 2; while (st > 0 && isalpha((unsigned char)t[st - 1])) st--; }
+            std::string d(t + st, t + end);
+            while (!d.empty() && d.back() == '.') d.pop_back();
+            dates[d]++;
+            break;
+        }
+    }
+    auto steady = [&](bool fromEnd) {
+        std::map<int, int> n;
+        for (size_t k = 0; k < secs.size() && k < 60; k++) {
+            int v = secs[fromEnd ? secs.size() - 1 - k : k];
+            if (++n[v] >= 3) return v;
+        }
+        return -1;
+    };
+    int a = steady(false), b = steady(true);
+    auto hms = [](int v) { return fmt("%02d:%02d:%02d", v / 3600, v / 60 % 60, v % 60); };
+    if (a >= 0) {
+        c.ttFrom = hms(a);
+        if (b >= 0) { c.ttTo = hms(b); c.ttSeconds = b >= a ? b - a : b + 86400 - a; }
+    }
+    int best = 0;
+    for (auto& d : dates) if (d.second > best && d.second >= 3) { best = d.second; c.ttDate = d.first; }
+    if (!res.vitc.empty()) {
+        const VitcCode& f = res.vitc.front();
+        const VitcCode& l = res.vitc.back();
+        c.vitcFrom = f.text(); c.vitcTo = l.text();
+        double fs = f.hour * 3600 + f.minute * 60 + f.second + f.fr / 25.0, ls = l.hour * 3600 + l.minute * 60 + l.second + l.fr / 25.0;
+        if (ls < fs) ls += 86400;
+        c.vitcSeconds = ls - fs;
+        c.vitcFrames = l.frame - f.frame;
+    }
+    return c;
+}
+
+// the VPS line in the line map (whatever else was guessed there: ТВ-информ fТ3 header look-alikes on viva.vbi, the old
+// engine's "interference (2.50 MHz sine)" for a label of all ones), its report and every frame's bytes in the results folder.
+// The report is made again with the clocks of the recording (teletext, VITC): the time of the broadcast and frames
+// the capture lost
+static void applyVps(DecodeResult& res, const DecodeOptions& opt, const std::string& path, int row, const VpsFile& v0, double rate,
+                     const std::vector<VpsExtra>& extra)
+{
+    if (row < 0) return;
+    VpsFile v = v0;
+    if (!v0.readings.empty()) {
+        VpsClocks ck = vpsClocksOf(res, opt.sourcePath.empty() ? path : opt.sourcePath);
+        // no teletext clock: the clock line in the VPS format (Eurosport 20.01.98 18:22:46)
+        for (auto& e : extra)
+            if (!e.data.clockFrom.empty()) {
+                if (ck.ttFrom.empty()) { ck.ttDate = e.data.date; ck.ttFrom = e.data.clockFrom; ck.ttTo = e.data.clockTo; ck.ttSeconds = e.data.seconds; }
+                else if (ck.ttDate.empty()) ck.ttDate = e.data.date;   // the teletext headers without a date (Eurosport's SPORTEXT)
+            }
+        v = vpsAnalyse(v0.readings, v0.frames, v0.fps, v0.line, v0.field, &ck);
+        if (!extra.empty()) {
+            v.report.push_back("");
+            for (auto& e : extra) {
+                for (auto& l : e.data.report) v.report.push_back(l);
+                v.report.push_back("");
+            }
+        }
+    }
+    // the other lines in the VPS format in the line map, in place of what was guessed there (ТВ-информ on Eurosport)
+    for (auto& e : extra) {
+        LineInfo* lx = nullptr;
+        for (auto& x : res.lines) if (x.index == e.row) lx = &x;
+        if (lx && lx->mode == MODE_TVINFORM) {
+            int ln = lx->lineNo, fl = lx->field;
+            res.tvinform.erase(std::remove_if(res.tvinform.begin(), res.tvinform.end(), [&](const TviStream& t) {
+                                   return !t.words.empty() && t.words[0].lineNo == ln && t.words[0].field == fl;
+                               }), res.tvinform.end());
+        }
+        if (!lx) {
+            res.lines.emplace_back();
+            lx = &res.lines.back();
+            lx->index = e.row;
+            lineOf(res.geom, e.row, lx->lineNo, lx->field);
+        }
+        lx->mode = MODE_TEST + 1;
+        lx->detectRate = e.rate;
+        lx->tviRate = 1;
+        lx->kind = e.data.kind;
+    }
+    LineInfo* li = nullptr;
+    for (auto& x : res.lines) if (x.index == row) li = &x;
+    if (li && li->mode == MODE_TVINFORM) {
+        int ln = li->lineNo, fl = li->field;
+        res.tvinform.erase(std::remove_if(res.tvinform.begin(), res.tvinform.end(), [&](const TviStream& t) {
+                               return !t.words.empty() && t.words[0].lineNo == ln && t.words[0].field == fl;
+                           }), res.tvinform.end());
+    }
+    if (!li) {
+        res.lines.emplace_back();
+        li = &res.lines.back();
+        li->index = row;
+        lineOf(res.geom, row, li->lineNo, li->field);
+    }
+    li->mode = MODE_TEST + 1;
+    li->detectRate = rate;
+    li->tviRate = 1;
+    li->kind = "VPS: " + v.name + (v.name.rfind("CNI ", 0) == 0 ? "" : fmt(" (CNI %03X)", v.cni));
+    std::sort(res.lines.begin(), res.lines.end(), [](const LineInfo& a, const LineInfo& b) { return a.index < b.index; });
+    res.vpsReport.clear();
+    res.vpsReport.push_back(v.head);
+    res.vpsReport.insert(res.vpsReport.end(), v.report.begin(), v.report.end());
+    try {
+        std::string dir = legacyReportDir(opt.sourcePath.empty() ? path : opt.sourcePath);
+        make_dirs(dir);
+        std::string t = v.head + "\r\n\r\n";
+        for (auto& l : v.report) t += l + "\r\n";
+        write_text(path_join(dir, "vps.txt"), t);
+        write_text(path_join(dir, "vps_frames.csv"), v.csv);
+        res.legacy.results.erase(std::remove_if(res.legacy.results.begin(), res.legacy.results.end(), [](const LegacyResult& x) { return x.kind == "vps"; }),
+                                 res.legacy.results.end());
+        res.legacy.results.push_back({"VPS (network, label, station text)", "vps", path_join(dir, "vps.txt"), v.head.substr(5)});
+        res.legacy.results.push_back({"VPS, every frame (table)", "vps", path_join(dir, "vps_frames.csv"), "the 13 bytes of every frame read"});
+    } catch (...) {}
+}
+
 bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult& res, std::string& err)
 {
     if (ends_with_i(path, ".ts") || ends_with_i(path, ".mts") || ends_with_i(path, ".m2ts")) return decodeTs(path, opt, res, err);
+    // a transport stream under another name (GitHub issue 4: "...The Fall.ts.del" was read as a bttv VBI recording):
+    // known by its sync bytes, not by the name
+    if (!ends_with_i(path, ".vbi") && !ends_with_i(path, ".t42") && !ends_with_i(path, ".t34") && !ends_with_i(path, ".t33") && !is_flac(path) &&
+        ts_packet_size(path))
+        return decodeTs(path, opt, res, err);
     if (ends_with_i(path, ".t42") || ends_with_i(path, ".t34") || ends_with_i(path, ".t33")) return decodeStream(path, opt, res, err);
     if (is_flac(path)) {
         // FLAC-compressed capture: unpacked once to x_vbi/x.vbi next to it, then read as a plain recording
@@ -811,6 +1107,20 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
         vf.read(f, 1, one);
         std::copy(one.begin(), one.end(), probe.begin() + (size_t)i * g.frameBytes());
     }
+    // VPS first: its line is no ТВ-информ, captions or data line whatever those tests say of it
+    VpsFile vpsFile;
+    double vpsRate = 0;
+    int vpsRow = -1;
+    std::vector<VpsExtra> vpsExtra;
+    if (g.pal) {
+        progress(0, "VPS: reading its line in every frame");
+        vpsRow = vpsPass(vf, g, frames, probe, probeN, opt, vpsFile, vpsRate, vpsExtra);
+        if (opt.cancel && *opt.cancel) { err = "cancelled"; return false; }
+        if (vpsRow >= 0) {
+            note(vpsFile.head);
+            for (auto& l : vpsFile.report) note(l);
+        }
+    }
     std::vector<float> out;
     auto cpu = makeCpuSlicer(opt.threads);
     cpu->run(probe.data(), probeN, g, all, out, err);
@@ -960,6 +1270,12 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
         for (auto& a : gemLines) used |= a.index == l;
         for (auto& a : vitcLines) used |= a.index == l;
         const LineForce fc = forced(l);
+        if (l == vpsRow) continue;   // read as VPS in the frames of the recording
+        {   // the other lines in the VPS format (an uplink's clock / name lines): no ТВ-информ, captions or data either
+            bool isExtra = false;
+            for (auto& e : vpsExtra) isExtra |= e.row == l;
+            if (isExtra) continue;
+        }
         // 625 lines: the fТ1 idle carrier (1010 at 1.73 MHz) also passes the caption-rate test
         // (live SECAM capture 2026, Channel 1 line 19), so a caption line is tried here too
         if (capJob && !(g.pal && fc == LineForce::Auto)) used = true;
@@ -1109,6 +1425,7 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
         if (g.pal) {   // the old engine may still find teletext, VPS, Syster ...
             if (!runLegacy(res, opt, path, note, err)) return false;
             liveTeletext(res, opt, path, note);
+            applyVps(res, opt, path, vpsRow, vpsFile, vpsRate, vpsExtra);   // after the teletext: its clock goes in the VPS report
             recheckCharset(res, note);
             res.totalSeconds = now() - t0;
             saveReport(res, opt, path);
@@ -1777,15 +2094,58 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
     }
     if (g.pal && !runLegacy(res, opt, path, note, err)) return false;
     if (g.pal) liveTeletext(res, opt, path, note);
+    if (g.pal) applyVps(res, opt, path, vpsRow, vpsFile, vpsRate, vpsExtra);   // after the teletext: its clock goes in the VPS report
     recheckCharset(res, note);
     res.totalSeconds = now() - t0;
     saveReport(res, opt, path);
     return true;
 }
 
+bool isDvb(const DecodeResult& r) { return r.slicerName == "DVB transport stream"; }
+
+std::vector<std::string> dvbInfoOf(const DecodeResult& r)
+{
+    if (!r.dvbInfo.empty() || !isDvb(r)) return r.dvbInfo;
+    std::vector<std::string> v;
+    try {
+        std::string t = read_text(path_join(legacyReportDir(r.path), "dvb_info.txt"));
+        size_t a = t.find("\n\n");   // after the title line
+        for (auto& l : split(a == std::string::npos ? t : t.substr(a + 2), '\n')) if (!l.empty()) v.push_back(l);
+    } catch (...) {}
+    return v;
+}
+
 std::vector<std::string> headline(const DecodeResult& r)
 {
     std::vector<std::string> h;
+    if (isDvb(r)) {   // a DVB stream: its programs, then the teletext
+        auto info = dvbInfoOf(r);
+        std::string prog, tt;
+        for (auto& l : info) {
+            if (l.rfind("channel (SDT)", 0) == 0 && prog.empty()) prog = "Channel: " + l.substr(l.find(':') + 2);
+            if (l.find("teletext (EN 300 472)") != std::string::npos && tt.empty()) tt = l.substr(l.find("PID"), l.find(')') - l.find("PID") + 1);
+        }
+        if (!prog.empty()) h.push_back(prog.substr(0, prog.find(';')));
+        h.push_back(r.teletext.pages ? "Teletext: yes" + (tt.empty() ? std::string() : ", " + tt) + ", " + std::to_string(r.teletext.pages) + " pages"
+                                     : std::string("Teletext: none in this stream"));
+        // the subtitles drawn as pictures (index.txt, a line a picture)
+        int subs = 0;
+        std::set<std::string> subLang;
+        try {
+            for (auto& l : split(read_text(path_join(path_join(legacyReportDir(r.path), "dvb_subtitles"), "index.txt")), '\n')) {
+                auto f = split(l, '\t');
+                if (f.size() >= 2) { subs++; subLang.insert(f[1]); }
+            }
+        } catch (...) {}
+        for (auto& l : info)
+            if (l.find("DVB subtitles") != std::string::npos) {
+                std::string ls;
+                for (auto& x : subLang) ls += (ls.empty() ? "" : ", ") + x;
+                h.push_back(subs ? fmt("DVB subtitles: %d pictures", subs) + (ls.empty() ? "" : " (" + ls + ")") : std::string("DVB subtitles: in the stream, none whole in this recording"));
+                break;
+            }
+        return h;
+    }
     std::string sys = r.geom.pal ? "625 lines, 25 frames/s" : "525 lines, 30 frames/s";
     if (r.slicerName.find("stream") != std::string::npos || r.slicerName.find("DVB") != std::string::npos) sys.clear();
     if (!sys.empty())
@@ -1821,9 +2181,11 @@ std::vector<std::string> headline(const DecodeResult& r)
                     (r.teletext.pages ? ", " + std::to_string(r.teletext.pages) + " pages" : ""));
     else
         h.push_back("Teletext: none");
+    if (!r.vpsReport.empty()) h.push_back(r.vpsReport[0]);
     std::vector<std::string> other;
     for (auto& li : r.lines) {
-        if (li.mode == MODE_TVINFORM || li.mode == MODE_TEST || li.kind.rfind("TV-Inform", 0) == 0 || li.kind.find("WST") != std::string::npos || li.kind == "Teletext stream" ||
+        if (!r.vpsReport.empty() && li.kind.rfind("VPS", 0) == 0) continue;
+        if (li.mode == MODE_TVINFORM ||li.mode == MODE_TEST || li.kind.rfind("TV-Inform", 0) == 0 || li.kind.find("WST") != std::string::npos || li.kind == "Teletext stream" ||
             li.kind.rfind("picture", 0) == 0 || li.kind.rfind("Test", 0) == 0)
             continue;
         if (std::find(other.begin(), other.end(), li.kind) == other.end()) other.push_back(li.kind);
@@ -1855,6 +2217,8 @@ std::string summarize(const DecodeResult& r)
     }
     std::string s;
     char b[512];
+    if (isDvb(r)) snprintf(b, sizeof b, "File: %s\r\nDVB transport stream, read in %.2f s\r\n\r\n", r.path.c_str(), r.totalSeconds);
+    else
     snprintf(b, sizeof b, "File: %s\r\nFormat: %s, %lld frames (%.1f min)\r\nDecoder: %s, slicing %.2f s, total %.2f s\r\n\r\n",
              r.path.c_str(), formatName(r.geom.format), (long long)r.geom.frames,
              r.geom.frames / (r.geom.pal ? 25.0 : 29.97) / 60.0,
@@ -1875,8 +2239,18 @@ std::string summarize(const DecodeResult& r)
         for (auto& l : air) s += "  " + l + "\r\n";
         s += "\r\n";
     }
-    s += "Lines:\r\n";
+    if (isDvb(r)) {   // the stream's tables instead of the VBI lines
+        s += "DVB transport stream:\r\n";
+        for (auto& l : dvbInfoOf(r)) s += "  " + l + "\r\n";
+        s += "\r\n";
+    }
+    if (r.vpsReport.size() > 1) {
+        for (size_t i = 1; i < r.vpsReport.size(); i++) s += r.vpsReport[i] + "\r\n";
+        s += "\r\n";
+    }
+    if (!isDvb(r)) s += "Lines:\r\n";
     for (auto& li : r.lines) {
+        if (isDvb(r)) break;
         snprintf(b, sizeof b, "  line %2d field %d  %-13s %3.0f%%  %s\r\n", li.lineNo, li.field,
                  li.mode == MODE_CC ? "32xfH (608)" : li.mode == MODE_FAST ? (r.geom.pal ? "444xfH (MLSE)" : "364xfH (MLSE)")
                  : li.mode == MODE_AMOL ? "64xfH (AMOL)" : li.mode == MODE_GEMSTAR ? "64/32xfH" : li.mode == MODE_TVINFORM ? (li.tviRate == 0 ? "111xfH" : li.tviRate == 1 ? "222xfH" : "444xfH (fТ3)")

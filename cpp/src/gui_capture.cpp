@@ -109,6 +109,7 @@ struct CaptureWin : Window {
     HWND c_lay = nullptr;
     size_t findsShown = 0;                       // finds counted at the last check
     bool findsOpened = false;                    // the window opened by itself once
+    bool btOpened = false;                       // the «Бизнес-Текст» table opened by itself once
     ULONGLONG findsAt = 0;
     Capture cap;
     LiveDecoder dec;
@@ -367,7 +368,8 @@ struct CaptureWin : Window {
         if (f.size() == findsShown) return;
         findsShown = f.size();
         set_text(b_finds, fmt("\xF0\x9F\x93\x81  Found (%zu)", f.size()));
-        if (!f.empty() && !findsOpened) { findsOpened = true; open_finds(); }
+        // one window for every service's finds (the table), by itself once when the first find comes
+        if (!f.empty() && !findsOpened) { findsOpened = true; open_bt_files(); }
     }
     // "Services" says how many have something; the menu lists them all
     void services_button()
@@ -385,6 +387,14 @@ struct CaptureWin : Window {
         GetWindowRect(b_services, &br);
         TrackPopupMenu(m, TPM_LEFTALIGN | TPM_TOPALIGN, br.left, br.bottom, 0, hwnd, nullptr);
         DestroyMenu(m);
+    }
+    void open_bt_files()
+    {
+        LiveDecoder *d = &dec;
+        HWND me = hwnd;
+        bt_files_window_live(hwnd, [d, me] { return IsWindow(me) ? d->finds() : std::vector<Find>(); },
+                             [d, me] { return IsWindow(me) ? d->btStatus() : std::string(); },
+                             "files and texts of every service, their blocks as they come \xC2\xB7 written to " + dec.filesDir());
     }
     void open_finds()
     {
@@ -455,7 +465,7 @@ struct CaptureWin : Window {
         dec.setManual(false);   // a test file is decoded like the card's signal; a line set by hand (right click) still wins
         vbi_note();
         if (cap.isFile()) note = "test file: decoded as live; right click on a line to set its signal by hand";
-        findsShown = 0; findsOpened = false;
+        findsShown = 0; findsOpened = false; btOpened = false;
         startedAt = GetTickCount64();
         subShown = kAutoSub;
         set_text(b_start, "\xE2\x96\xA0  Stop");
@@ -1384,7 +1394,7 @@ struct CaptureWin : Window {
                     if (was) start(false);
                 }
                 break;
-            case ID_FINDS: open_finds(); break;
+            case ID_FINDS: open_bt_files(); break;
             case ID_NABTS: if (auto r = dec.pages525()) nabts_window(hwnd, r); break;
             case ID_JTES: if (auto r = dec.pages525()) jtes_window(hwnd, r); break;
             case ID_SSLIVE: if (auto r = dec.pages525()) starsight_window(hwnd, r); break;

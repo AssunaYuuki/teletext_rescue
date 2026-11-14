@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <map>
 
 static float sampleAt(const uint8_t* p, int fmt, int i) { return fmt == 1 ? (float)(p[2 * i] | (p[2 * i + 1] << 8)) : (float)p[i]; }
@@ -146,19 +147,45 @@ std::vector<std::string> vitcReport(const std::vector<VitcCode>& codes, bool pal
              codes.front().text().c_str(), at(codes.front().frame).c_str(), codes.back().text().c_str(), at(codes.back().frame).c_str(),
              codes.front().drop ? ", drop frame (29.97)" : "");
     r.push_back(b);
+    // frames the capture lost: the code runs ahead of the recording by a frame or two again and again (a card that
+    // keeps 2 frames of 3: Eurosport 13.11 - 40 s of code in 26.7 s). Told once instead of hundreds of breaks
+    int small = 0, others = 0;
+    int64_t ahead = 0;
+    for (size_t i = 1; i < codes.size(); i++) {
+        int64_t d = vitcToCount(codes[i], pal) - (vitcToCount(codes[i - 1], pal) + (codes[i].frame - codes[i - 1].frame));
+        if (d >= 1 && d <= 3) { small++; ahead += d; }
+        else if (d) others++;
+    }
+    const bool lossy = small >= 10 && small >= 4 * others;
+    if (lossy) {
+        int64_t span = codes.back().frame - codes.front().frame;
+        snprintf(b, sizeof b, "  FRAMES LOST BY THE CAPTURE: the code runs %lld frames ahead of the recording in %d small jumps - %lld of every %lld frames of the "
+                              "broadcast are not in the recording (the card or the computer did not keep up)",
+                 (long long)ahead, small, (long long)ahead, (long long)(span + ahead));
+        if (span > 0) {
+            // as a simple fraction when it is one (1 of every 3)
+            double q = (double)ahead / (span + ahead);
+            for (int den = 2; den <= 6; den++)
+                if (std::fabs(q * den - std::lround(q * den)) < 0.04 * den && std::lround(q * den) >= 1) {
+                    snprintf(b + strlen(b), sizeof b - strlen(b), ", about %ld of every %d", std::lround(q * den), den);
+                    break;
+                }
+        }
+        r.push_back(b);
+    }
     // breaks: the code does not count on with the frames (an edit, a pause, a new tape)
     int breaks = 0;
     for (size_t i = 1; i < codes.size(); i++) {
         int64_t want = vitcToCount(codes[i - 1], pal) + (codes[i].frame - codes[i - 1].frame);
         if (vitcToCount(codes[i], pal) == want) continue;
+        if (lossy && vitcToCount(codes[i], pal) - want >= 1 && vitcToCount(codes[i], pal) - want <= 3) continue;   // told above
         if (++breaks <= 30) {
             std::string a = codes[i - 1].text(), c = codes[i].text();
             snprintf(b, sizeof b, "  break at recording %s: %s -> %s", at(codes[i].frame).c_str(), a.c_str(), c.c_str());
             r.push_back(b);
         }
     }
-    if (breaks > 30) r.push_back("  ... " + std::to_string(breaks - 30) + " more breaks");
-    if (!breaks) r.push_back("  the code counts on without a break");
+    if (!breaks) r.push_back(lossy ? "  no other break (no edit or pause in the code)" : "  the code counts on without a break");
     std::map<uint32_t, int> ub;
     for (auto& c : codes) if (c.user) ub[c.user]++;
     if (!ub.empty()) {

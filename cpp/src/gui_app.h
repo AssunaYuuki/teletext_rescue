@@ -55,11 +55,24 @@ void tvinform_window(HWND owner, const ResultPtr &r);
 void finds_window(HWND owner, const ResultPtr &r);
 void finds_window_live(HWND owner, std::function<std::vector<Find>()> source, const std::string &subtitle,
                        std::function<std::string()> activity = nullptr);   // activity: a live status line
+// «Бизнес-Текст»: the files of the catalogue as a table, every block drawn (gui_btfiles.cpp); the live one asks
+// source() every second
+bool has_bt_files(const std::vector<Find> &items);
+void bt_files_window(HWND owner, const std::vector<Find> &items, const std::string &subtitle);
+void finds_window_items(HWND owner, const std::vector<Find> &items, const std::string &subtitle);   // the list window of these finds
+void bt_files_window_live(HWND owner, std::function<std::vector<Find>()> source, std::function<std::string()> activity,
+                          const std::string &subtitle);
 void vps_window_live(HWND owner, std::function<LiveVps()> source);   // VPS / WSS of the capture
 void teletext_window(HWND owner, const ResultPtr &r);
 void nabts_window(HWND owner, const ResultPtr &r);
 void data_window(HWND owner, const ResultPtr &r, const std::string &kind);
 void text_window(HWND owner, const std::string &title, const std::string &sub, const std::string &body);
+// the BBC Micro emulator (gui_bbc.cpp): program = BBC BASIC text typed in and run ("" = the machine only)
+void bbc_window(HWND owner, const std::string &program = "", const std::string &name = "");
+// a BBC program file (<name>.bbc: *EXEC text, .ssd: a DFS disc) run in the BBC Micro window at once; false = not one
+bool open_bbc_program(HWND owner, const std::string &path);
+bool is_bbc_file(const std::string &path);   // .bbc or .ssd
+void bbc_open_file(HWND owner, const std::string &path);
 // capture card: picture and VBI decoded live, recording (gui_capture.cpp)
 void capture_window(HWND owner, bool start = false, const std::string& testFile = "");
 std::function<void(const std::string &)> &open_recording_hook();   // the main window opens a recording with it

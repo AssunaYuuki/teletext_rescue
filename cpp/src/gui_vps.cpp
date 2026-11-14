@@ -57,7 +57,7 @@ struct VpsWin : Window {
     {
         RECT rc; GetClientRect(hwnd, &rc);
         int p = S(hwnd, 14), y = hd.layout(hwnd);
-        cardV = {p, y, rc.right - p, y + S(hwnd, 236)}; y = cardV.bottom + S(hwnd, 10);
+        cardV = {p, y, rc.right - p, y + S(hwnd, 304)}; y = cardV.bottom + S(hwnd, 10);
         cardW = {p, y, rc.right - p, y + S(hwnd, 92)}; y = cardW.bottom + S(hwnd, 10);
         MoveWindow(lst, p, y, rc.right - 2 * p, std::max(0L, rc.bottom - y - p), TRUE);
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -104,12 +104,25 @@ struct VpsWin : Window {
         } else {
             VpsLabel l = vpsLabel(v.bytes);
             std::string name = vpsCniName(l.cni);
-            text_out(dc, x, y, (name.empty() ? std::string("network not in the register") : name) + (v.have ? "" : "   (no VPS for the last 5 s)"), v.have ? FG : MUTED, big);
+            // one name: the register's when the station's text is that name (VIVA, "Eurospor"), else the station's own
+            std::string title = !v.name.empty() ? v.name : name.empty() ? std::string("network not in the register") : name;
+            text_out(dc, x, y, title + (v.have ? "" : "   (no VPS for the last 5 s)"), v.have ? FG : MUTED, big);
             y += S(hwnd, 32);
             text_out(dc, x, y, fmt("line %d  \xC2\xB7  read in %.0f%% of the frames lately  \xC2\xB7  %lld lines read", v.vpsLine ? v.vpsLine : 16, v.vpsRate * 100, (long long)v.reads), ACCENT2, small);
             y += S(hwnd, 24);
             std::string c = country(l.cni);
             row(dc, x, y, "Network (CNI)", fmt("%03X", l.cni), (c.empty() ? std::string("") : c + ", ") + (name.empty() ? "not in the ETSI TS 101 231 register" : "ETSI TS 101 231 register: " + name));
+            if (!v.onAir.empty())
+                row(dc, x, y, "On the air", v.onAir, "date and clock of the teletext page headers of this channel");
+            for (auto& dl : v.dataLines)
+                row(dc, x, y, fmt("Line %d", dl.first), dl.second, "a line in the VPS format that is no VPS label: the station's or the satellite uplink's own (clock / name)");
+            if (v.lossy > 0)
+                row(dc, x, y, "FRAMES LOST", fmt("%d of every %d kept", v.keepNum, v.keepDen),
+                    fmt("in %d of the last %d stretches of 4 s the card or the computer dropped frames: teletext and data miss them too", v.lossy, v.stretches));
+            if (!v.station.empty())
+                row(dc, x, y, "Station text", "\"" + v.station + "\"", fmt("byte 4: one character a frame, %d frames a turn (%.2f s); the station's own name", v.stationPeriod, v.stationPeriod / 25.0));
+            else
+                row(dc, x, y, "Station text", "none", v.bytes[1] ? "byte 4 carries no repeating text" : "byte 4 is 00: this station sends no name of its own");
             std::string lab, note;
             if (l.day == 0 && l.month == 15 && l.minute == 63 && l.hour >= 28) {
                 static const char *const sp[] = {"continuation code", "interruption code", "record inhibit", "timer control code"};
@@ -121,11 +134,16 @@ struct VpsWin : Window {
                 note = "the programme on the air, by its announced start: a VPS recorder set for it records while this is sent";
             } else {
                 lab = fmt("%02d.%02d  %02d:%02d", l.day, l.month, l.hour, l.minute);
-                note = "not a date: a special or damaged label";
+                note = "not a date and not one of the four service codes: the broadcaster's own filling (or a damaged label)";
             }
             row(dc, x, y, "Programme label", lab, note);
-            static const char *const snd[] = {"not given", "mono", "stereo", "two sound channels (bilingual)"};
-            row(dc, x, y, "Sound", snd[l.sound], "byte 5, bits 7-6");
+            {
+                auto bin = [](int val, int nb) { std::string s; for (int i = nb - 1; i >= 0; i--) s += ((val >> i) & 1) ? '1' : '0'; return s; };
+                int pil = ((v.bytes[8] & 0x3F) << 14) | (v.bytes[9] << 6) | (v.bytes[10] >> 2);
+                row(dc, x, y, "Label bits (PIL)", fmt("%05X", pil), "day " + bin(l.day, 5) + "  month " + bin(l.month, 4) + "  hour " + bin(l.hour, 5) + "  minute " + bin(l.minute, 6));
+                static const char *const snd[] = {"not given", "mono", "stereo", "two sound channels (bilingual)"};
+                row(dc, x, y, "Sound", snd[l.sound], "byte 5, bits 7-6 = " + bin(v.bytes[2] >> 6, 2) + "; its other bits " + bin((v.bytes[2] >> 4) & 3, 2) + " " + bin(v.bytes[2] & 15, 4));
+            }
             row(dc, x, y, "Programme type", l.pty == 0xFF || l.pty == 0 ? fmt("%02X (none)", l.pty) : fmt("%02X", l.pty), "byte 15");
             row(dc, x, y, "Source data", fmt("%02X %02X", v.bytes[0], v.bytes[1]), "bytes 3-4: source and control data between the broadcasters");
             std::string hex;
@@ -173,7 +191,11 @@ struct VpsWin : Window {
             if (LOWORD(w) == 601) {
                 std::string t;
                 if (v.everVps) {
-                    t += "VPS: " + vpsText(v.bytes) + "\r\n";
+                    std::string vt = vpsText(v.bytes);
+                    size_t c = vt.find(" (CNI ");
+                    t += "VPS: " + (v.name.empty() || c == std::string::npos ? vt : v.name + vt.substr(c)) + (v.onAir.empty() ? "" : " \xC2\xB7 on the air " + v.onAir) + "\r\n";
+                    if (!v.station.empty()) t += "Station text: \"" + v.station + "\"\r\n";
+                    if (v.lossy) t += fmt("Frames lost by the capture: %d of every %d kept\r\n", v.keepNum, v.keepDen);
                 }
                 if (v.everWss) t += "WSS: " + wssText(v.wssBits) + "\r\n";
                 for (auto &e : v.history) t += e.time + "  VPS  " + e.text + "\r\n";

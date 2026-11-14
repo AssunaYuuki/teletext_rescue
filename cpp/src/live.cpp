@@ -56,13 +56,63 @@ struct LiveMlse {
                 if (a < 0 || b < 0) return 0;
                 int row = (a >> 3) | (b << 1);
                 if (row == 0) return i < 10 ? 1 : 2;
-                if (row <= 25) return 2;
+                // an 8-bit data row («Бизнес-Текст»: > 12 of 40 bytes fail parity in the free reading) keeps its bytes:
+                // re-decided among odd-parity bytes it lost about half of them (BTEST: 73% of the even ones)
+                if (row <= 25) {
+                    int bad = 0;
+                    for (int k = 2; k < 42; k++) bad += !(__builtin_popcount(p[k]) & 1);
+                    return bad > 12 ? 0 : 2;
+                }
                 if (row == 27) return i < 40 ? 1 : 0;
                 if (row >= 26 && row <= 29) return i == 2 ? 1 : 0;
                 return 0;
             };
         }
         return m;
+    }
+    // The model the graphics card starts with, before this capture's own lines taught it anything: the channel of
+    // a clean broadcast line, learnt by this same MLSE from packets made here (NRZ at spb samples a bit, edges as
+    // soft as a 5 MHz channel leaves them). The card then learns the capture's own channel from the packets it
+    // reads. Empty when the made lines did not read (then the card waits for the processor's model, as before)
+    static void generic(double spb, int ns, bool tape, std::vector<double>& prior, int& n)
+    {
+        prior.clear(); n = 0;
+        const int os = 8, nb = 45 * 8;
+        const double off = std::min(24.0, ns - (nb + 1) * spb - 2);   // the packet nearly fills a line (1401 of 1440 samples at 27 MHz)
+        if (off < 6) return;
+        LiveMlse m(spb, tape);
+        uint32_t rnd = 12345;
+        auto next = [&] { rnd = rnd * 1664525u + 1013904223u; return rnd >> 16; };
+        for (int k = 0; k < 16; k++) {
+            uint8_t pk[45] = {0x55, 0x55, 0x27};
+            pk[3] = ham::CODEWORDS[(next() & 7) | 8]; pk[4] = ham::CODEWORDS[next() & 15];   // rows 1 and up: text
+            for (int i = 5; i < 45; i++) {
+                int c = 0x20 + next() % 0x5F;
+                pk[i] = (uint8_t)((__builtin_popcount(c) & 1) ? c : c | 0x80);
+            }
+            // the bits, low one first, at os points a sample; two box filters of 0.6 bit soften the edges
+            std::vector<float> w((size_t)ns * os, 0.f), t;
+            for (size_t i = 0; i < w.size(); i++) {
+                double b = ((double)i / os - off) / spb;
+                int q = (int)std::floor(b);
+                if (q >= 0 && q < nb) w[i] = (pk[q / 8] >> (q % 8)) & 1 ? 1.f : 0.f;
+            }
+            const int box = std::max(1, (int)std::lround(0.6 * spb * os));
+            for (int pass = 0; pass < 2; pass++) {
+                t.assign(w.size(), 0.f);
+                double s = 0;
+                for (size_t i = 0; i < w.size(); i++) {
+                    s += w[i];
+                    if (i >= (size_t)box) s -= w[i - box];
+                    t[i >= (size_t)box / 2 ? i - box / 2 : 0] = (float)(s / box);
+                }
+                w.swap(t);
+            }
+            std::vector<float> y((size_t)ns);
+            for (int i = 0; i < ns; i++) y[i] = 60.f + 120.f * w[(size_t)i * os];
+            m.dec.decode(y.data(), ns, off - 4, off + 4, 0.5);
+        }
+        if (m.dec.n >= 6 && m.dec.has_prior()) { prior = m.dec.prior; n = m.dec.n; }
     }
 };
 
@@ -476,10 +526,11 @@ void LiveDecoder::reset(const VbiGeometry& g)
     for (auto& t : probeTT_) t = false;
     master_.reset();
     bt_ = BtCatalog();
-    vpsLast_.clear(); wssLast_.clear(); vpsFrame_ = wssFrame_ = -1;
+    vpsLast_.clear(); vpsB4_.clear(); vpsData_.clear(); vpsDataAt_.clear(); vpsChosen_ = -1; wssLast_.clear(); vpsFrame_ = wssFrame_ = -1;
     vps_ = LiveVps();
     btWritten_.clear(); btNote_.clear(); btFrames_ = -1; btRows_ = 0;
     td_ = TtDataPages();
+    ts_ = TsCollector(); tsSeen_ = 0; tsAt_ = -1000000; tsProgs_.clear();
     tviLive_.clear();
     tvi3Slicers_.clear(); tvi3Live_ = TviStream(); tvi3Lines_.clear();
     tviFinds_.clear();
@@ -574,14 +625,51 @@ void LiveDecoder::feed(const uint8_t* frame)
             if (raw_) fwrite(out[l].pk, 1, 42, raw_);
             bt_.packet(out[l].pk, frames_);
             td_.packet(out[l].pk);
+            ts_.packet(out[l].pk);
         } else if (out[l].raw) {
             if (raw_) fwrite(out[l].rpk, 1, 42, raw_);
             bt_.packet(out[l].rpk, frames_);
         }
         if (out[l].cc && l < L / 2) cc(out[l].ccv[0], out[l].ccv[1]);
+        // VPS from ONE line: ARD 23.11.95 sends a second VPS line on 329 (field 2) with other bytes (CNI 0C0, 10:00
+        // against DC4, 10:03 on line 16) - voted together they gave a label neither line sends. The line read best
+        // lately; of lines read as well the one nearest line 16 of its field (Eurosport 13.11: the ТВ-информ lines
+        // 7, 8, 320, 321 pass the start-code test in every frame too, with a label of their own), field 1 before
+        // field 2; the line chosen before stays while it reads about as well (no flapping between two)
+        if (l == 0) {
+            int prev = vpsChosen_;
+            vpsChosen_ = -1;
+            double best = 0;
+            for (int q = 0; q < L && q < (int)acc_.size(); q++) {
+                int tv = tvLineOf(g_, q), ln = tv > 313 ? tv - 313 : tv;
+                double s = acc_[q].vpsGood - 0.02 * std::abs(ln - 16) + (tv <= 313 ? 0.005 : 0);
+                if (acc_[q].vpsGood > 0.2 && s > best) { best = s; vpsChosen_ = q; }
+            }
+            if (prev >= 0 && prev < (int)acc_.size() && vpsChosen_ >= 0 && prev != vpsChosen_ && acc_[prev].vpsGood > 0.2) {
+                int tv = tvLineOf(g_, prev), ln = tv > 313 ? tv - 313 : tv;
+                if (acc_[prev].vpsGood - 0.02 * std::abs(ln - 16) + (tv <= 313 ? 0.005 : 0) >= best - 0.1) vpsChosen_ = prev;
+            }
+            vpsChosenTv_ = vpsChosen_ >= 0 ? tvLineOf(g_, vpsChosen_) : 0;
+        }
+        if (out[l].vps && vpsChosen_ >= 0 && l != vpsChosen_) {
+            // not the VPS line: an uplink's clock or name line in the same format (Eurosport 20.01.98)
+            VpsData d;
+            int tv = tvLineOf(g_, l);
+            auto at = vpsDataAt_.find(tv);
+            bool isData = vpsDataOf(out[l].vpsb, d, at == vpsDataAt_.end() ? -1 : at->second);
+            const std::string reg = vpsCniName(vpsLabel(out[l].vpsb).cni);
+            if (isData && d.clock) { vpsDataAt_[tv] = d.at; vpsData_[tv] = {vpsDataText(d), frames_}; }
+            else if (!reg.empty()) {   // a second VPS label (ARD 23.11.95 line 329: WDR)
+                std::string t = vpsText(out[l].vpsb);
+                vpsData_[tv] = {"second VPS label: " + t.substr(0, t.find(" \xC2\xB7 source data")), frames_};
+            } else if (isData && d.text.size() >= 5) vpsData_[tv] = {vpsDataText(d), frames_};
+            out[l].vps = false;
+        }
         if (out[l].vps) {
             vpsLast_.push_back(std::string((const char*)out[l].vpsb, 13));
             if (vpsLast_.size() > 250) vpsLast_.pop_front();
+            if (vpsB4_.empty() || vpsB4_.back().first != frames_) vpsB4_.push_back({frames_, out[l].vpsb[1]});
+            if (vpsB4_.size() > 400) vpsB4_.pop_front();
             vpsFrame_ = frames_;
         }
         if (out[l].wss) {
@@ -679,6 +767,8 @@ LiveDecoder::LineOut LiveDecoder::line(int index, const uint8_t* p)
     // code, read before teletext is tried; a line next to them too (a tape or a processor moves the picture by one)
     const int tv = tvLineOf(g_, index);
     if (g_.pal && !noTT && ((tv >= 15 && tv <= 17) || a.kind == "VPS") && vpsRead(raw.data(), n, fs, res.vpsb)) res.vps = ok = true;
+    // a line that reads as VPS in most frames: the frames the tape spoiled, by the more tolerant reading
+    if (g_.pal && !noTT && !ok && a.kind == "VPS" && a.vpsGood > 0.5 && vpsReadKnown(raw.data(), n, fs, res.vpsb)) res.vps = ok = true;
     if (g_.pal && !noTT && !ok && ((tv >= 22 && tv <= 24) || a.kind == "WSS") && wssRead(raw.data(), n, fs, res.wssv)) res.wss = ok = true;
     a.vpsGood = 0.95 * a.vpsGood + 0.05 * res.vps;
     a.wssGood = 0.95 * a.wssGood + 0.05 * res.wss;
@@ -784,6 +874,11 @@ LiveDecoder::LineOut LiveDecoder::line(int index, const uint8_t* p)
                 if (!a.tape) a.tape = std::make_shared<LiveMlse>(spb, true);
                 auto r = a.tape->dec.decode(raw.data(), n, std::max(0.0, known - tapeWin), known + tapeWin, 0.5);
                 if (r.data.size() != 42 || !r.good || !usable(r.data.data())) return;
+                // an 8-bit data row (its text was not re-decided): for the .raw.t42 and the files, not a text packet
+                if (ham::dec[r.data[0]] >= 0 && ham::dec[r.data[1]] >= 0 && parityBad(r.data.data()) > 12) {
+                    if (!res.raw) { std::copy(r.data.begin(), r.data.end(), res.rpk); res.raw = true; }
+                    return;
+                }
                 std::copy(r.data.begin(), r.data.end(), pk);
                 got = true; a.mlsePackets++; a.tapePackets++;
                 a.off = a.off < 0 ? r.off : 0.9 * a.off + 0.1 * r.off;
@@ -911,6 +1006,43 @@ void LiveDecoder::voteCodes()
         bool same = vps_.have && std::equal(b + 2, b + 13, vps_.bytes + 2);
         std::copy(b, b + 13, vps_.bytes);
         vps_.have = true;
+        // the station's text of byte 4 (a character a frame): over the last 16 s of readings
+        while (!vpsB4_.empty() && frames_ - vpsB4_.front().first > 400) vpsB4_.pop_front();
+        // (read through frames the capture lost: a turn has one marked character; how many were lost is told too)
+        VpsTextStats st;
+        vps_.station = vpsStationText(std::vector<std::pair<int64_t, uint8_t>>(vpsB4_.begin(), vpsB4_.end()), &vps_.stationPeriod, &st);
+        vps_.stretches = st.stretches; vps_.lossy = st.lossy; vps_.keepNum = st.keepNum; vps_.keepDen = st.keepDen;
+        vps_.name = vpsDisplayName(vps_.station, vpsLabel(b).cni);
+        // the time on the air: the teletext headers' date (dd.mm.yy with its weekday) and clock
+        vps_.onAir.clear();
+        if (hasClock_) {
+            std::string clk;
+            for (int k = 0; k < 8; k++) clk += clock_[k] >= 0x20 && clock_[k] < 0x7F ? (char)clock_[k] : ' ';
+            std::string date;
+            if (hasHeader_) {
+                std::string t;
+                for (int k = 8; k < 32; k++) t += header_[k] >= 0x20 && header_[k] < 0x7F ? (char)header_[k] : ' ';
+                auto dg = [](char c) { return c >= '0' && c <= '9'; };
+                for (size_t k = 0; k + 5 <= t.size(); k++) {
+                    if (!(dg(t[k]) && dg(t[k + 1]) && t[k + 2] == '.' && dg(t[k + 3]) && dg(t[k + 4])) || (k && dg(t[k - 1]))) continue;
+                    size_t e = k + 5, s0 = k;
+                    if (e < t.size() && t[e] == '.') { e++; while (e < t.size() && dg(t[e]) && e < k + 10) e++; }
+                    if (s0 >= 2 && t[s0 - 1] == ' ' && isalpha((unsigned char)t[s0 - 2])) { s0 -= 2; while (s0 && isalpha((unsigned char)t[s0 - 1])) s0--; }
+                    date = t.substr(s0, e - s0);
+                    while (!date.empty() && date.back() == '.') date.pop_back();
+                    break;
+                }
+            }
+            while (!clk.empty() && clk.front() == ' ') clk.erase(0, 1);
+            vps_.onAir = (date.empty() ? "" : date + "  ") + clk;
+        }
+        // the other VPS-format lines read in the last 5 s; a clock line gives the time on the air when teletext does not
+        vps_.dataLines.clear();
+        for (auto& kv : vpsData_)
+            if (frames_ - kv.second.second < 125 && !kv.second.first.empty()) {
+                vps_.dataLines.push_back({kv.first, kv.second.first});
+                if (vps_.onAir.empty() && isdigit((unsigned char)kv.second.first[0])) vps_.onAir = kv.second.first + "  (clock line " + std::to_string(kv.first) + ")";
+            }
         if (!same) vps_.pending = 0;
         else if (++vps_.pending == 1 && (vps_.history.empty() || vps_.history.back().key != key))
             vps_.history.push_back({now(), frames_, key, vpsText(b)});
@@ -939,7 +1071,7 @@ LiveVps LiveDecoder::vpsInfo()
     if (frames_ - picWssAt_[0] < 50) v.wssLine = 23;   // read on the picture's top row (the VBI window ends at 22)
     v.everVps = vps_.have; v.everWss = vps_.wssHave;
     for (auto& ls : lineStats_) {
-        if (ls.kind == "VPS") { v.vpsLine = ls.lineNo; v.vpsRate = ls.good; }
+        if (ls.kind == "VPS" && (!v.vpsLine || ls.lineNo == vpsChosenTv_)) { v.vpsLine = ls.lineNo; v.vpsRate = ls.good; }
         if (ls.kind == "WSS") { v.wssLine = ls.lineNo; v.wssRate = ls.good; }
     }
     return v;
@@ -1396,7 +1528,7 @@ struct LiveGpuBatch {
 void LiveDecoder::setGpu(bool on)
 {
     gpuWanted_ = on;
-    if (!on) { gp_.reset(); gpuDead_ = false; }
+    if (!on) { gp_.reset(); gpuDead_ = false; gpuGenericTried_ = false; }
     else gpuStart();                            // nothing happens before the processor has learnt the model
 }
 bool LiveDecoder::gpuActive()
@@ -1423,6 +1555,17 @@ void LiveDecoder::gpuStart()
         }
     }
     if (prior.empty() && master_ && master_->has_prior() && master_->n >= 6) { prior = master_->prior; n = (int)master_->n; }
+    // (tried and dropped: putting the models learnt by the processor from this capture's lines in place of the
+    // start-up ones once they are ready - ntv.vbi from frame 0: 5002 packets against 5325 without; the card's own
+    // learning from the packets it reads does better)
+    // nothing learnt yet (the first frames, or a capture with no teletext at all): the card starts at once with the
+    // model of a clean line and learns this capture's channel from what it reads - the processor is not kept
+    // reading and searching until there is teletext (the user: "it still decodes on the processor")
+    if (!gp_ && prior.empty() && !gpuGenericTried_) {
+        gpuGenericTried_ = true;
+        LiveMlse::generic(spb, g_.validSamples, false, prior, n);
+        if (!prior.empty()) LiveMlse::generic(spb, g_.validSamples, true, tapePrior, tapeN);
+    }
     if (!gp_ && !prior.empty()) {
         try {
             auto g = std::make_shared<LiveGpuBatch>();
@@ -1692,7 +1835,13 @@ void LiveDecoder::snapshot(LiveSnapshot& s, int page)
     s.header = header_; s.hasHeader = hasHeader_;
     memcpy(s.clock, clock_, sizeof clock_); s.hasClock = hasClock_;
     // VPS / WSS (voted in voteCodes), shown while they come
-    s.vps = vps_.have && frames_ - vpsFrame_ < 125 ? vpsText(vps_.bytes) : "";
+    // one name first (the register's when the station text is that name, else the station's own: "NOVY.TV. (CNI 7C5) · ...")
+    s.vps.clear();
+    if (vps_.have && frames_ - vpsFrame_ < 125) {
+        std::string t = vpsText(vps_.bytes);
+        size_t c = t.find(" (CNI ");
+        s.vps = vps_.name.empty() || c == std::string::npos ? t : vps_.name + t.substr(c);
+    }
     s.wss = vps_.wssHave && frames_ - wssFrame_ < 125 ? wssText(vps_.wssBits) : "";
     s.service = service_;
     s.charset = charset_;
@@ -1782,10 +1931,12 @@ std::vector<Find> LiveDecoder::finds()
     std::vector<BtWritten> written;
     std::string note;
     bool write = false;
+    int64_t now = -1;
     {
         std::lock_guard<std::mutex> lk(mu_);
         out = tviFinds_;
         bt = bt_;
+        now = frames_;
         td = td_;
         written = btWritten_;
         note = btNote_;
@@ -1813,8 +1964,22 @@ std::vector<Find> LiveDecoder::finds()
             btBusy_ = false;
         });
     }
-    addBtFinds(out, bt, "teletext lines", written, note);
+    addBtFinds(out, bt, "teletext lines", written, note, now);
     addTtDataFinds(out, td, "teletext lines");
+    // telesoftware: made again when new blocks came (at most every 5 s), the files written then
+    std::vector<TsProgram> ts;
+    bool tsWrite = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (ts_.blocksSeen() != tsSeen_ && frames_ - tsAt_ >= 25 * 5) {
+            tsProgs_ = ts_.programs();
+            tsSeen_ = ts_.blocksSeen();
+            tsAt_ = frames_;
+            tsWrite = true;
+        }
+        ts = tsProgs_;
+    }
+    if (!ts.empty()) addTelesoftFinds(out, ts, "teletext lines", path_join(filesDir(), "telesoftware"), tsWrite);
     return out;
 }
 
@@ -1837,6 +2002,7 @@ std::string LiveDecoder::btStatus(bool shortForm)
         return s;
     }
     s += fmt("catalogue of %zu files, blocks of %d of them received (%ld rows)", fl.size(), bt_.filesWithData(), rows);
+    if (long m = bt_.mendedRows()) s += fmt(", %ld rows sent apart from their blocks put back", m);
     if (!now.empty()) s += "  \xC2\xB7  " + std::string(frames_ - at < 25 * 10 ? "on the air now: " : "last sent: ") + now;
     if (btBusy_) s += "  \xC2\xB7  finding the key and writing the files\xE2\x80\xA6";
     else if (!btWritten_.empty()) s += fmt("  \xC2\xB7  %zu files written, %d decrypted \xE2\x86\x92 ", btWritten_.size(), dec) + dir;

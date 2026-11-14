@@ -116,18 +116,33 @@ bool checked(HWND h) { return g_check[h]; }
 void set_button_style(HWND h, BtnStyle st) { g_btn[h].st = st; InvalidateRect(h, nullptr, FALSE); }
 void set_checked(HWND h, bool v) { g_check[h] = v; InvalidateRect(h, nullptr, FALSE); }
 
+void buffer_label(HWND h);
+// every label is drawn whole in memory (lbl_sub): no flicker when its text or the window around it changes
 HWND label(HWND parent, const std::string &text, int id, DWORD extra) {
     HWND h = CreateWindowExW(0, L"STATIC", W(text).c_str(), WS_CHILD | WS_VISIBLE | SS_NOPREFIX | extra, 0, 0, 10, 10, parent, (HMENU)(INT_PTR)id, g_inst, nullptr);
     SendMessageW(h, WM_SETFONT, (WPARAM)font(parent), TRUE);
+    buffer_label(h);
     return h;
 }
-void set_label_colour(HWND h, COLORREF c) { g_label_col[h] = c; InvalidateRect(h, nullptr, TRUE); }
+void set_label_colour(HWND h, COLORREF c) {
+    auto it = g_label_col.find(h);
+    if (it != g_label_col.end() && it->second == c) return;
+    g_label_col[h] = c; InvalidateRect(h, nullptr, FALSE);
+}
 
 // a label whose text changes several times a second (a status line): the STATIC control erases its background
 // and then draws the text, which flickers; this one draws the whole line in memory and puts it on at once
 static LRESULT CALLBACK lbl_sub(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
     if (m == WM_ERASEBKGND) return 1;
     if (m == WM_SETTEXT) {
+        // the same text again (a status set every timer tick): nothing to draw
+        if (l) {
+            int n = GetWindowTextLengthW(h);
+            std::wstring t((size_t)n + 1, 0);
+            GetWindowTextW(h, t.data(), n + 1);
+            t.resize((size_t)n);
+            if (t == (const wchar_t *)l) return TRUE;
+        }
         LRESULT r = DefSubclassProc(h, m, w, l);
         InvalidateRect(h, nullptr, FALSE);
         return r;
@@ -148,7 +163,13 @@ static LRESULT CALLBACK lbl_sub(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DW
         std::wstring t((size_t)n + 1, 0);
         GetWindowTextW(h, t.data(), n + 1);
         t.resize((size_t)n);
-        DrawTextW(mem, t.c_str(), (int)t.size(), &rc, DT_LEFT | DT_TOP | DT_NOPREFIX | DT_WORDBREAK | DT_END_ELLIPSIS);
+        // the label's own alignment (SS_CENTER, SS_RIGHT, SS_CENTERIMAGE)
+        LONG st = GetWindowLongW(h, GWL_STYLE);
+        UINT fl = DT_NOPREFIX | DT_END_ELLIPSIS;
+        int kind = st & SS_TYPEMASK;
+        fl |= kind == SS_CENTER ? DT_CENTER : kind == SS_RIGHT ? DT_RIGHT : DT_LEFT;
+        fl |= (st & SS_CENTERIMAGE) ? DT_VCENTER | DT_SINGLELINE : DT_TOP | DT_WORDBREAK;
+        DrawTextW(mem, t.c_str(), (int)t.size(), &rc, fl);
         BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, of);
         SelectObject(mem, ob); DeleteObject(bm); DeleteDC(mem);
@@ -206,12 +227,19 @@ HWND listview(HWND parent, int id, const std::vector<std::pair<std::string, int>
     }
     return h;
 }
+// a row beyond the list's end is added; a cell already there is written only when its text changes (a list updated
+// in place every few seconds then does not flash)
 void lv_set(HWND lv, int row, int col, const std::string &s) {
     std::wstring t = W(s);
-    if (col == 0) {
+    if (col == 0 && row >= ListView_GetItemCount(lv)) {
         LVITEMW it{}; it.mask = LVIF_TEXT | LVIF_PARAM; it.iItem = row; it.pszText = t.data(); it.lParam = row;
         ListView_InsertItem(lv, &it);
-    } else ListView_SetItemText(lv, row, col, t.data());
+        return;
+    }
+    wchar_t now[1024] = L"";
+    ListView_GetItemText(lv, row, col, now, 1024);
+    if (t.size() < 1023 && t == now) return;
+    ListView_SetItemText(lv, row, col, t.data());
 }
 LRESULT lv_custom_draw(LPARAM lp, const std::function<COLORREF(int)> &tc) {
     auto *cd = (NMLVCUSTOMDRAW *)lp;
@@ -224,7 +252,17 @@ LRESULT lv_custom_draw(LPARAM lp, const std::function<COLORREF(int)> &tc) {
     return CDRF_DODEFAULT;
 }
 
-void set_text(HWND h, const std::string &s) { SetWindowTextW(h, W(s).c_str()); }
+void set_text(HWND h, const std::string &s) {
+    std::wstring w = W(s);
+    int n = GetWindowTextLengthW(h);
+    if (n == (int)w.size()) {
+        std::wstring now((size_t)n + 1, 0);
+        GetWindowTextW(h, now.data(), n + 1);
+        now.resize((size_t)n);
+        if (now == w) return;
+    }
+    SetWindowTextW(h, w.c_str());
+}
 std::string get_text(HWND h) {
     int n = GetWindowTextLengthW(h);
     std::wstring w(n + 1, 0); GetWindowTextW(h, w.data(), n + 1); w.resize(n);
@@ -548,6 +586,8 @@ void Window::register_class(const std::wstring &cls, HBRUSH bg) {
 }
 HWND Window::create(const std::wstring &cls, const std::string &title, DWORD style, int w, int h, HWND parent, DWORD ex) {
     register_class(cls);
+    // a window does not paint over its controls: they are not drawn twice on every repaint (flicker)
+    style |= WS_CLIPCHILDREN;
     return CreateWindowExW(ex, cls.c_str(), W(title).c_str(), style, CW_USEDEFAULT, CW_USEDEFAULT, w, h, parent, nullptr, g_inst, this);
 }
 

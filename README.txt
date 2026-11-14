@@ -1,4 +1,4 @@
-Teletext Rescue 1.4 — recovers teletext, programme guides, captions and other data hidden in VBI recordings
+Teletext Rescue 1.5 — recovers teletext, programme guides, captions and other data hidden in VBI recordings
 
 Author: AssunaYuuki
 Teletext Rescue — Copyright (c) 2026 AssunaYuuki.

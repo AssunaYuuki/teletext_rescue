@@ -360,6 +360,79 @@ bool joinBlock(const TviNorpak& o, uint32_t id, int block, int len, std::vector<
     return false;
 }
 
+// a received file as text lines (UTF-8), when it is text: Windows (CP1251, the РИА «Новости» news of ORT 2002)
+// or DOS (CP866) Cyrillic, told apart by the bytes р..я (F0-FF in CP1251; in CP866 they are E0-EF and
+// а..п A0-AF). Bytes that did not come (unread) show as "[…]" - a damaged packet whose bytes still look like
+// text is kept as it is (mostly right: one or two bytes wrong)
+std::vector<std::string> fileText(const std::vector<uint8_t>& d, const std::vector<long>& unread)
+{
+    std::vector<uint8_t> bad(d.size(), 0);
+    for (long p : unread) if (p >= 0 && (size_t)p < d.size()) bad[(size_t)p] = 1;
+    size_t n = 0, txt = 0, w = 0, dos = 0;
+    for (size_t i = 0; i < d.size(); i++) {
+        if (bad[i] || !d[i]) continue;
+        uint8_t c = d[i];
+        n++;
+        txt += c >= 0x20 || c == '\r' || c == '\n' || c == '\t';
+        w += c >= 0xF2;
+        dos += c >= 0xA0 && c <= 0xAF;
+    }
+    if (n < 16 || txt * 100 < n * 95) return {};
+    bool win = w >= dos;
+    // a packet that passed its own check but stands in the wrong place (1tv 2002: 27 bytes of another
+    // bundle in the middle of a word): bytes no text has (control codes, CP1251 80-BF but Ё ё № « »), two or
+    // more of them close together - the stretch between them is not this text either
+    auto odd = [&](uint8_t c) {
+        if (c == '\r' || c == '\n' || c == '\t' || c == 0) return false;
+        if (c < 0x20 || c == 0x7F) return true;
+        return win && c >= 0x80 && c < 0xC0 && c != 0xA8 && c != 0xB8 && c != 0xB9 && c != 0xAB && c != 0xBB && c != 0x96 && c != 0x97 && c != 0x93 && c != 0x94;
+    };
+    for (size_t i = 0; i < d.size();) {
+        if (bad[i] || !odd(d[i])) { i++; continue; }
+        size_t j = i, last = i;
+        int cnt = 1;
+        for (size_t k = i + 1; k < d.size() && k <= last + 6; k++)
+            if (!bad[k] && odd(d[k])) { last = k; cnt++; }
+        if (cnt >= 2) for (size_t k = i; k <= last; k++) bad[k] = 1;
+        j = last + 1;
+        i = j;
+    }
+    auto ch = [&](uint8_t c) -> std::string {
+        if (c < 0x80) return c >= 0x20 || c == '\t' ? std::string(1, (char)c) : "";
+        if (win) {
+            if (c >= 0xC0) return from_cp(0x410 + (c - 0xC0));
+            if (c == 0xA8) return from_cp(0x401);
+            if (c == 0xB8) return from_cp(0x451);
+            if (c == 0xB9) return from_cp(0x2116);
+            if (c == 0xAB || c == 0xBB) return from_cp(c == 0xAB ? 0xAB : 0xBB);
+            if (c == 0x96 || c == 0x97) return from_cp(c == 0x96 ? 0x2013 : 0x2014);
+            if (c == 0x93 || c == 0x94) return "\"";
+            return "?";
+        }
+        if (c < 0xB0) return from_cp(0x410 + (c - 0x80));
+        if (c >= 0xE0 && c < 0xF0) return from_cp(0x440 + (c - 0xE0));
+        if (c == 0xF0) return from_cp(0x401);
+        if (c == 0xF1) return from_cp(0x451);
+        return "?";
+    };
+    std::vector<std::string> lines(1);
+    for (size_t i = 0; i < d.size();) {
+        if (bad[i]) {
+            size_t j = i, t = 0;
+            while (j < d.size() && bad[j]) { t += d[j] >= 0x20 && d[j] != 0x7F ? (d[j] < 0x80 || d[j] >= 0xC0 || !win) : (d[j] == '\r' || d[j] == '\n'); j++; }
+            if (t * 10 >= (j - i) * 9) { for (size_t k = i; k < j; k++) { if (d[k] == '\n') lines.emplace_back(); else lines.back() += ch(d[k]); } }
+            else if (lines.back().size() < 5 || lines.back().compare(lines.back().size() - 5, 5, "[\xE2\x80\xA6]")) lines.back() += "[\xE2\x80\xA6]";
+            i = j;
+            continue;
+        }
+        if (d[i] == '\n') lines.emplace_back();
+        else if (d[i]) lines.back() += ch(d[i]);
+        i++;
+    }
+    while (!lines.empty() && lines.back().find_first_not_of(' ') == std::string::npos) lines.pop_back();
+    return lines;
+}
+
 void norpakFiles(TviNorpak& o, const std::string& outDir)
 {
     const auto& S = o.stream;
@@ -368,10 +441,24 @@ void norpakFiles(TviNorpak& o, const std::string& outDir)
     std::map<uint32_t, TviFile> desc;
     std::map<uint32_t, std::map<int, std::map<std::vector<uint8_t>, int>>> blocks;
     std::map<uint32_t, std::vector<uint8_t>> index;   // type 1 record of a file id (sent before its description)
+    // every record whose header passed its CRC: a record cut short by bundles that never came (the capture
+    // lost frames: 1tv 20.01.2002) ends where the next one begins
+    std::vector<size_t> marks;
+    std::map<uint32_t, std::string> nameOnly;         // 8.3 name of a description whose data failed its CRC
+    std::map<uint32_t, std::map<int, uint32_t>> lens; // block lengths from intact headers (the last block is short)
     for (size_t i = 0; i + 19 <= S.size(); i++) {
         if (!(S[i] == 0xD5 && S[i + 1] == 0xF3 && S[i + 2] == 0xC9) || crc16arc(&S[i + 3], 14) != u16(i + 17)) continue;
+        marks.push_back(i);
         int type = S[i + 3];
         uint32_t id = u32(i + 4), len = u16(i + 13);
+        if (type == 3 && len >= 1 && len <= 256) lens[id][(int)u16(i + 9)] = len;
+        if (type == 7 && len >= 13 && i + 19 + 13 <= S.size() && !nameOnly.count(id)) {
+            std::string nm;
+            int k = 0;
+            for (; k < 12 && S[i + 19 + k] > ' ' && S[i + 19 + k] < 0x7F && !strchr("/\\:*?\"<>|", S[i + 19 + k]); k++) nm += (char)S[i + 19 + k];
+            size_t dot = nm.find('.');
+            if (k >= 3 && (k == 12 || S[i + 19 + k] == ' ' || S[i + 19 + k] == 0) && dot != std::string::npos && dot >= 1 && dot <= 8 && nm.size() - dot <= 4) nameOnly[id] = nm;
+        }
         if ((type != 1 && type != 3 && type != 7) || len > 512 || i + 19 + len > S.size() || crc16arc(&S[i + 19], len) != u16(i + 15)) continue;
         const size_t d = i + 19;
         if (type == 1) {
@@ -404,6 +491,60 @@ void norpakFiles(TviNorpak& o, const std::string& outDir)
             if (!f.name.empty() && f.size && f.blocks && (uint64_t)f.blocks * 256 >= f.size) desc[id] = f;
         }
     }
+    // files whose description did not come whole (or at all) but whose blocks did, with intact headers: the
+    // size from the short last block when it came, else whole blocks up to the highest one seen
+    for (auto& kv : lens) {
+        if (desc.count(kv.first) || kv.second.empty()) continue;
+        TviFile f;
+        f.id = kv.first;
+        auto nm = nameOnly.find(kv.first);
+        f.shortName = f.name = nm != nameOnly.end() ? nm->second : fmt("tvinform_%08X.bin", kv.first);
+        int top = kv.second.rbegin()->first;
+        uint32_t lastLen = kv.second.rbegin()->second;
+        if (top > 4096) continue;
+        f.blocks = top + 1;
+        f.size = (uint32_t)top * 256 + lastLen;
+        if (lastLen == 256) f.note = "the description of the file did not come: its size is not known (the blocks up to the last one seen)";
+        else f.note = "the description of the file did not come intact: size from its last block";
+        desc[kv.first] = f;
+    }
+    // a block no copy of which came intact: the copy whose header is intact, its bytes up to the next record
+    // (the most bytes from packets that passed their check wins). Its CRC does not match - it goes into the
+    // file marked damaged, the bytes that did not come or came in a failed packet listed as unread
+    auto damagedCopy = [&](uint32_t id, int b, size_t len, std::vector<uint8_t>& d, std::vector<uint8_t>& ok) {
+        long best = -1;
+        for (size_t k = 0; k < marks.size(); k++) {
+            size_t i = marks[k];
+            if (S[i + 3] != 3 || u32(i + 4) != id || (int)u16(i + 9) != b || u16(i + 13) != len) continue;
+            size_t end = std::min({i + 19 + len, k + 1 < marks.size() ? marks[k + 1] : S.size(), S.size()});
+            if (end <= i + 19) continue;
+            long sc = 0;
+            for (size_t p = i + 19; p < end; p++) sc += 1 + 2 * o.valid[p];
+            if (sc <= best) continue;
+            best = sc;
+            d.assign(len, 0); ok.assign(len, 0);
+            for (size_t p = i + 19; p < end; p++) { d[p - i - 19] = S[p]; ok[p - i - 19] = o.valid[p]; }
+        }
+        if (best > 0) return true;
+        // its header did not come, but the record stands where it has to: right after an intact block b-1
+        // (275 bytes on) and right before the next record, which is block b+1 of the same file (1tv 2002 block 2:
+        // header lost, 197 of its 275 bytes there)
+        for (size_t k = 0; k + 1 < marks.size(); k++) {
+            size_t i = marks[k], j = marks[k + 1];
+            if (S[i + 3] != 3 || u32(i + 4) != id || (int)u16(i + 9) != b - 1 || u16(i + 13) != 256) continue;
+            if (S[j + 3] != 3 || u32(j + 4) != id || (int)u16(j + 9) != b + 1) continue;
+            size_t a = i + 275 + 19;
+            if (j <= a) continue;
+            size_t end = std::min(a + len, j);
+            long sc = 0;
+            for (size_t p = a; p < end; p++) sc += 1 + 2 * o.valid[p];
+            if (sc <= best) continue;
+            best = sc;
+            d.assign(len, 0); ok.assign(len, 0);
+            for (size_t p = a; p < end; p++) { d[p - a] = S[p]; ok[p - a] = o.valid[p]; }
+        }
+        return best > 0;
+    };
     for (auto& kv : desc) {
         TviFile f = kv.second;
         std::vector<uint8_t> data;
@@ -417,13 +558,23 @@ void norpakFiles(TviNorpak& o, const std::string& outDir)
             if (it != bl.end())
                 for (auto& c : it->second)
                     if (c.second > n && c.first.size() == len) { n = c.second; best = &c.first; }
-            std::vector<uint8_t> joined;
+            std::vector<uint8_t> joined, ok;
             if (!best && joinBlock(o, kv.first, b, (int)len, joined)) { best = &joined; f.joined++; }
             if (best) { data.insert(data.end(), best->begin(), best->end()); f.have++; }
-            else { data.insert(data.end(), len, 0); f.missing.push_back(b); }
+            else if (damagedCopy(kv.first, b, len, joined, ok)) {
+                for (size_t k = 0; k < len; k++) if (!ok[k]) f.unread.push_back((long)(data.size() + k));
+                data.insert(data.end(), joined.begin(), joined.end());
+                f.damaged.push_back(b);
+            } else {
+                for (size_t k = 0; k < len; k++) f.unread.push_back((long)(data.size() + k));
+                data.insert(data.end(), len, 0);
+                f.missing.push_back(b);
+            }
         }
         data.resize(f.size);
-        if (!outDir.empty() && f.have) {
+        while (!f.unread.empty() && f.unread.back() >= (long)f.size) f.unread.pop_back();
+        f.text = fileText(data, f.unread);
+        if (!outDir.empty() && (f.have || !f.damaged.empty())) {
             std::string dir = path_join(outDir, "tvinform_files");
             make_dirs(dir);
             f.path = path_join(dir, f.name);
@@ -431,6 +582,17 @@ void norpakFiles(TviNorpak& o, const std::string& outDir)
             // a fax TIFF (Hydromet maps): a picture, and the TIFF again with a whole directory
             std::string note, stem = f.path.substr(0, f.path.rfind('.'));
             if (faxTiffToPng(data, stem + ".png", f.missing.empty() ? "" : stem + "_fixed.tif", note)) f.note = note + " -> " + stem + ".png";
+            // a text: as UTF-8 for Notepad, "[…]" where bytes did not come
+            if (!f.text.empty()) {
+                std::string t;
+                for (auto& l : f.text) {
+                    std::string x = l;
+                    while (!x.empty() && x.back() == '\r') x.pop_back();
+                    t += x + "\r\n";
+                }
+                write_text(f.path + ".txt", t);
+                f.note += (f.note.empty() ? "" : "; ") + std::string("text -> ") + f.path + ".txt";
+            }
         }
         o.files.push_back(f);
     }
@@ -438,8 +600,10 @@ void norpakFiles(TviNorpak& o, const std::string& outDir)
     if (o.files.empty()) return;
     R.push_back(fmt("  files sent (records D5 F3 C9 07 / 03): %zu", o.files.size()));
     for (auto& f : o.files) {
-        R.push_back(fmt("    %s (%s)  %u bytes, written %s  - %d of %d blocks received", f.name.c_str(), f.shortName.c_str(), f.size, f.time.c_str(),
-                        f.have, f.blocks) + (f.joined ? fmt(" (%d of them put together from damaged copies, CRC checked)", f.joined) : "") +
+        R.push_back(fmt("    %s", f.name.c_str()) + (f.shortName != f.name ? " (" + f.shortName + ")" : "") + fmt("  %u bytes", f.size) +
+                    (f.time.empty() ? "" : ", written " + f.time) + fmt("  - %d of %d blocks received", f.have, f.blocks) +
+                    (f.joined ? fmt(" (%d of them put together from damaged copies, CRC checked)", f.joined) : "") +
+                    (f.damaged.empty() ? "" : fmt(", %zu damaged (taken as they came, CRC does not match)", f.damaged.size())) +
                     (f.path.empty() ? "" : "  -> " + f.path));
         if (!f.note.empty()) R.push_back("      " + f.note);
         // index record: 6-byte big-endian numbers (ORT 2002: 27 of them, 01AED0A5..01AF5D84, unsorted, all
@@ -466,6 +630,21 @@ void norpakFiles(TviNorpak& o, const std::string& outDir)
             std::string m;
             for (int b : f.missing) m += (m.empty() ? "" : " ") + fmt("%d", b);
             R.push_back("      blocks not received in this recording (zeros in the file): " + m);
+        }
+        if (!f.damaged.empty()) {
+            std::string m;
+            for (int b : f.damaged) m += (m.empty() ? "" : " ") + fmt("%d", b);
+            R.push_back(fmt("      damaged blocks: %s (%zu bytes of the file did not come or came in a damaged packet)", m.c_str(), f.unread.size()));
+        }
+        if (!f.text.empty()) {
+            R.push_back("      text:");
+            size_t shown = 0;
+            for (auto& l : f.text) {
+                if (shown++ >= 24) { R.push_back(fmt("        ... (%zu lines in all)", f.text.size())); break; }
+                std::string x = l;
+                while (!x.empty() && x.back() == '\r') x.pop_back();
+                R.push_back("        " + x);
+            }
         }
     }
 }

@@ -61,6 +61,31 @@ struct BtWritten {
     std::string content;
     // a file put together from copies sent under several names (MOSCOW1-4.ARJ -> MOSCOW_combined.ARJ): their names
     std::vector<std::string> combinedOf;
+    // a whole file of the sender's disk found inside the leftovers of a sent file (JINN.EXE in TOVAR.C01): where
+    // ("TOVAR.C01 @49152") and the FAT entry that named it ("" = none of that size)
+    std::string carvedFrom, carvedEntry;
+};
+
+// how far each file of the catalogue has come, block by block (the table of files, live and for a recording)
+struct BtProgress {
+    std::string name, page, date;   // 8.3 name, the catalogue page heard most, DD.MM.YY hh:mm:ss
+    long size = -1;                 // bytes, by the catalogue
+    int blocks = 0;                 // the file's blocks (by its size; the catalogue's count without one)
+    int blockBytes = 800;           // file bytes a block (1996: 400)
+    // one character a block: '.' nothing yet, 'p' some of its rows, 'r' every row once, 'c' sure (1994: the bytes add up
+    // to the sum of row 23; else every row in two copies that agree), 'x' every row but the sum is wrong
+    std::string map;
+    int blocksHave = 0, blocksWhole = 0, blocksSure = 0, sumWrong = 0;
+    int rows = 0, rowsHave = 0;     // rows of the file / received
+    int mended = 0;                 // rows sent apart from their block (a transmission with no rows 21-23) put back by the sum
+    int announced = 0;              // catalogue transmissions heard
+    int64_t first = -1, last = -1;  // frames it was heard
+    int nowBlock = -1;              // the block on the air now, when it is this file's (live)
+    // from the files written last (writeFiles), filled in by the caller
+    bool written = false, decrypted = false, open = false, checkOk = false;
+    double readPct = 0;
+    std::string path, content, check, kind;
+    std::string service;            // the table of files of all services: which one brought it
 };
 
 class BtCatalog {
@@ -83,6 +108,11 @@ public:
     // another recording of the same transmission (a file of the same name and date in both catalogues)
     bool sameFiles(const BtCatalog& o) const;
     void merge(const BtCatalog& o);   // its catalogue entries and block copies join these
+    // every file of the catalogue (heard at least minCopies times) with its blocks, most announced first; nowFrame =
+    // the frame of the capture now (live: the file on the air is marked), -1 = none
+    std::vector<BtProgress> progress(int minCopies = 3, int64_t nowFrame = -1) const;
+    int64_t lastFrame() const { return lastFrame_; }
+    long mendedRows() const;          // rows put back into their blocks from split transmissions
     // assembles the files from their blocks (each byte voted over the copies), finds the key and writes
     // <dir>/<name> (+ <name>.txt when it is text); note = how the key was found
     // status: what is being done now, for a progress window ("decrypting and writing AKC.C01 (3 of 19)")
@@ -100,9 +130,28 @@ private:
         int64_t first = -1, last = -1;
         int open = 0, closed = 0;   // transmissions whose row 21 starts AA AA AA AA (Hamming pairs: closed) / not (sent open)
     };
-    struct Cur { std::string page; std::map<int, std::vector<uint8_t>> rows, data; int last = 0; bool on = false; };
+    // headless: rows that came with no header before them (after the catalogue rows of the page, or out of order)
+    struct Cur { std::string page; std::map<int, std::vector<uint8_t>> rows, data; int last = 0; bool on = false, closed = false, headless = false; };
     using Row40 = std::array<uint8_t, 40>;
     struct Copy { Row40 b; int w; };
+    // 9.07.94: a block often comes with 6 of its rows missing (6-11 or 12-17), and those rows come in a transmission
+    // of their own in the same magazine with no catalogue rows 21-23 (a header, then rows 6-17 only). Such rows wait
+    // here, and the recent blocks that lack rows wait for them; a block takes them only when it is then whole and its
+    // bytes add up to the sum of its row 23 (1994), so a wrong guess is never taken
+    struct Recent { std::string name; int blk = 0; std::map<int, Row40> rows; long sum = -1; int64_t frame = 0; };
+    struct Loose { std::map<int, Row40> rows; int64_t frame = 0; };
+    std::vector<Recent> recent_[9];
+    std::vector<Loose> loose_[9];
+    std::map<std::string, int> mended_;   // file -> rows put back
+    int64_t lastFrame_ = -1;
+    void addRow(const std::string& name, int blk, int row, const Row40& r);
+    void looseRows(int mag, int64_t frame);    // the open transmission ends without rows 21-23: its rows wait
+    // b takes l's rows it lacks: when it is then whole and its sum right (sure_ counts them); once that came 3 times
+    // (the split is how this transmission goes), also a block that a bit error or a lost row keeps from adding up,
+    // where no other block waiting lacks the same row (shared)
+    bool fill(Recent& b, Loose& l, const std::set<int>& shared, bool checkedOnly = false);
+    std::set<int> sharedRows(int mag, const Recent* not1, int64_t frame) const;   // rows more than one waiting block lacks
+    int sure_ = 0, unsure_ = 0;   // fills whose sum came right / wrong
     int weight_ = 1;
     static constexpr int kEnoughCopies = 5;   // copies of a data row kept (more only repeat it)
     // files received whole (every block of the catalogue's count, every row in two agreeing copies): their

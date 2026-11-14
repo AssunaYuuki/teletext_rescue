@@ -35,12 +35,20 @@ static const int POS[18] = {3, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 2
 int h2418(u8 b0, u8 b1, u8 b2) {
     unsigned w = b0 | (b1 << 8) | (b2 << 16);
     auto bit = [&](int p) { return (w >> (p - 1)) & 1; };
+    // the syndrome of the five checks names the bit a single error is in; the sixth (all 24 bits) tells one
+    // error (mended) from two (not) - EN 300 706 8.3. A recording off tape / air has single bit errors often:
+    // without the mending X/26 (accented letters of Polish, Czech ... pages) was lost from VBI captures (issue 5)
+    int syn = 0;
     for (int k : {1, 2, 4, 8, 16}) {
         int s = 0; for (int p = 1; p < 24; p++) if (p & k) s += bit(p);
-        if (s % 2 != 1) return -1;
+        if (s % 2 != 1) syn |= k;
     }
     int s = 0; for (int p = 1; p < 25; p++) s += bit(p);
-    if (s % 2 != 1) return -1;
+    bool allOk = s % 2 == 1;
+    if (syn) {
+        if (allOk || syn > 23) return -1;   // two errors (or more)
+        w ^= 1u << (syn - 1);
+    }
     int v = 0; for (int i = 0; i < 18; i++) v |= bit(POS[i]) << i;
     return v;
 }
