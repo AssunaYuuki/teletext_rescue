@@ -73,8 +73,11 @@ jobs:
           cp $B/trcli README.md LICENSE pkg/$N/
           if [ "$(uname -s)" = "Darwin" ]; then
             cp -R "$B/TeletextRescue.app" "pkg/$N/Teletext Rescue.app"
+            mkdir -p "pkg/$N/Teletext Rescue.app/Contents/Resources"
+            cp -R roms "pkg/$N/Teletext Rescue.app/Contents/Resources/"
           else
             cp $B/TeletextRescue pkg/$N/
+            cp -R roms pkg/$N/
             cp icon.png pkg/$N/ 2>/dev/null || true
           fi
           chmod +x pkg/$N/trcli
@@ -129,6 +132,8 @@ jobs:
           strip -o "$STAGE/Teletext Rescue.exe" cpp/build/TeletextRescue.exe
           strip -o "$STAGE/trcli.exe" cpp/build/trcli.exe
           cp LICENSE README.txt "$STAGE/"
+          # the BBC Micro window needs MOS 1.20 and BASIC II (roms/README.md)
+          mkdir -p "$STAGE/roms" && cp roms/os12.rom roms/basic2.rom "$STAGE/roms/"
           N=TeletextRescue-windows-${{ matrix.arch }}
           (cd dist && zip -r -9 ../$N.zip "$(basename "$STAGE")")
           echo "STAGE=$STAGE" >> $GITHUB_ENV

@@ -18,6 +18,7 @@
   its name>` picks one).
 - **BBC Micro and Ceefax telesoftware**: programs sent in teletext (Ceefax 1984) are collected from recordings
   and in live and run in a BBC Micro window of the program (File → Open a BBC Micro program, `.bbc` / `.ssd`).
+  The BBC Micro ROMs (MOS 1.20, BASIC II) come with the installer and the packages (`roms`).
 - **DVB streams (`.ts`)** are recognised by their contents whatever the name (issue #4): the tracks are described
   and DVB subtitles are written as pictures; the start screen has a **DVB stream .ts…** button.
 - **Бизнес-Текст**: the 1995 form (29.12.1995, 25.05.1996) is decrypted; 1994 blocks whose rows were sent apart

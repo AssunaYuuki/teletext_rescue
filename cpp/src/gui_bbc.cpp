@@ -23,7 +23,10 @@ std::string exe_dir()
 // the ROMs: roms\os12.rom and roms\basic2.rom next to the program (also os.rom / BASIC.ROM, the names jsbeeb uses)
 bool find_roms(Bytes& os, Bytes& basic, std::string& where)
 {
-    for (const std::string& d : {path_join(exe_dir(), "roms"), path_join(dirname(exe_dir()), "roms"), exe_dir()}) {
+    // the installer, the zip and the Linux package put them in roms next to the program; the macOS app keeps them
+    // in Contents/Resources/roms
+    for (const std::string& d : {path_join(exe_dir(), "roms"), path_join(dirname(exe_dir()), "roms"),
+                                 path_join(path_join(dirname(exe_dir()), "Resources"), "roms"), exe_dir()}) {
         for (auto& on : {"os12.rom", "os.rom", "OS12.ROM"})
             if (exists(path_join(d, on))) { os = read_file(path_join(d, on)); break; }
         for (auto& bn : {"basic2.rom", "BASIC.ROM", "basic.rom"})
