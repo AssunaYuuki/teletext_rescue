@@ -23,7 +23,9 @@
 // Content seen: ORT 2002 - the file PPUE98_RUMS.tif (a fax-coded newspaper page) and the source beacon (record d5 f3 c9 06, type 5: version word,
 // time of the last update, source name "ОРТ, Москва и Область"), every 275 bytes, zeros between;
 // ORT 1999 - the test transmission: a 16-packet carousel (PS 4) of 7-bit + odd parity bytes that
-// are a sliding window over the PRBS s[k+8] = s[k] ^ s[k+3] (the receiver's "TEST" mode).
+// are a sliding window over the PRBS s[k+8] = s[k] ^ s[k+3] (the receiver's "TEST" mode); every 4th bundle
+// a PS 5 packet in place of CI 0 (Hamming nibbles 0 0 1 4 1 0 1 0 0 0 0 0, fill 0F); CI 13 (and the FEC
+// rows) carry the pattern's run of 7 zeros, where the slicer errs - no data either.
 #include "tvinform.h"
 #include <cstdint>
 #include <string>
@@ -31,6 +33,7 @@
 
 struct TviNorpak {
     int64_t packets = 0, bundles = 0, bundlesOk = 0, rowsFixed = 0, rowsErased = 0, testPackets = 0, rowsKept = 0;
+    int64_t testErrored = 0, testMarkers = 0;   // packets of test bundles: the pattern with errors, the PS 5 marker
     std::vector<uint8_t> stream;               // data of every bundle, in order (364 bytes each)
     std::vector<uint8_t> valid;                // per byte of stream: 1 = intact (row check passed / bundle corrected)
     std::vector<uint8_t> checks;               // per 26-byte row of stream: its packet's 2 check bytes, 1 if the packet was read

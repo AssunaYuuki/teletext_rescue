@@ -701,17 +701,25 @@ bool tviNorpakDecode(const std::string& t33, const std::string& outDir, TviNorpa
     // bytes are good; a CI "corrected" to a wrong value no longer cuts a bundle in two.
     bool slotMode = n > 0 && pos.size() >= n * 8;
     if (slotMode) {
-        auto exact = [](uint8_t b) { for (int v = 0; v < 16; v++) if (H84[v] == b) return v; return -1; };
         std::vector<int64_t> slot(n);
         // the lines of the service: those with a packet in (nearly) every frame. A stray packet read on
         // another line (sample.vbi: one on 21 and one on 334) is not a slot of the counter
-        std::map<int, int64_t> perLine;
-        for (size_t i = 0; i < n; i++) perLine[pos[i * 8 + 4] | pos[i * 8 + 5] << 8]++;
+        // (ORT 1999: lines 9 and 322 in every other frame - the SECAM identification tone read as a packet,
+        // its header never a Hamming byte; such a line taken as a slot put the counter out of step)
+        auto exact = [](uint8_t b) { for (int v = 0; v < 16; v++) if (H84[v] == b) return v; return -1; };
+        std::map<int, int64_t> perLine, headedLine;
+        for (size_t i = 0; i < n; i++) {
+            int ln = pos[i * 8 + 4] | pos[i * 8 + 5] << 8;
+            perLine[ln]++;
+            const uint8_t* p = &raw[i * 33];
+            headedLine[ln] += exact(p[0]) >= 0 && exact(p[1]) >= 0 && exact(p[2]) >= 0;
+        }
         int64_t most = 0;
         for (auto& kv : perLine) most = std::max(most, kv.second);
         std::map<int, int> lineIx;
         int L = 0;
-        for (auto& kv : perLine) if (kv.second * 10 >= most) lineIx[kv.first] = L++;
+        for (auto& kv : perLine)
+            if (kv.second * 10 >= most && headedLine[kv.first] * 4 >= kv.second) lineIx[kv.first] = L++;
         std::map<int, int64_t> addrN;
         std::vector<int> addr(n, -1), ph(n, -1);
         std::vector<char> test(n, 0);
@@ -722,7 +730,7 @@ bool tviNorpakDecode(const std::string& t33, const std::string& outDir, TviNorpa
             slot[i] = li == lineIx.end() ? -1 : fr * L + li->second;
             const uint8_t* p = &raw[i * 33];
             if (slot[i] < 0) continue;
-            if (testPacket(p)) { test[i] = 1; continue; }
+            test[i] = testPacket(p);
             int h0 = exact(p[0]), h1 = exact(p[1]), h2 = exact(p[2]), h3 = exact(p[3]);
             if (h0 < 0 || h1 < 0 || h2 < 0) continue;
             addr[i] = h0 * 256 + h1 * 16 + h2;
@@ -738,19 +746,39 @@ bool tviNorpakDecode(const std::string& t33, const std::string& outDir, TviNorpa
         int64_t curB = INT64_MIN;
         Bundle bb;
         auto flushB = [&] { cur[dom] = bb; flush(dom); bb = Bundle(); };
+        // the bundle and CI of every packet of the channel from the counter's phase (test packets too)
+        std::vector<int64_t> bidOf(n, INT64_MIN);
+        std::map<int64_t, int> testsIn;
+        for (size_t i = 0; i < n && !rel.empty(); i++) {
+            if (slot[i] < 0 || (addr[i] >= 0 && addr[i] != dom)) continue;
+            while (r + 1 < rel.size() && rel[r + 1] <= i) r++;
+            int cnt[16] = {};
+            size_t a0 = r >= 20 ? r - 20 : 0, a1 = std::min(rel.size(), r + 21);
+            for (size_t k = a0; k < a1; k++) cnt[ph[rel[k]]]++;
+            int phase = (int)(std::max_element(cnt, cnt + 16) - cnt);
+            int64_t base = slot[i] + phase;
+            bidOf[i] = base;
+            if (test[i] && base >= 0) testsIn[base / 16]++;
+        }
         for (size_t i = 0; i < n && !rel.empty(); i++) {
             o.packets++;
             if (test[i]) { o.testPackets++; continue; }
             if (slot[i] < 0) continue;
             if (addr[i] >= 0 && addr[i] != dom) { perAddr[addr[i]]++; continue; }   // another channel, read exactly
             perAddr[dom]++;
-            while (r + 1 < rel.size() && rel[r + 1] <= i) r++;
-            int cnt[16] = {};
-            size_t a0 = r >= 20 ? r - 20 : 0, a1 = std::min(rel.size(), r + 21);
-            for (size_t k = a0; k < a1; k++) cnt[ph[rel[k]]]++;
-            int phase = (int)(std::max_element(cnt, cnt + 16) - cnt);
-            int64_t base = slot[i] + phase, bid = base >= 0 ? base / 16 : -1;
+            int64_t base = bidOf[i], bid = base >= 0 ? base / 16 : -1;
             int ci = (int)(base % 16);
+            // a packet of a test bundle (most of its 16 are the pattern) is no data: the pattern read with
+            // errors (its run of 7 zeros, bytes 9-27 of CI 13 and the FEC rows over them) or the test-mode
+            // marker (PS 5 in place of CI 0 every 4th bundle: Hamming nibbles, then fill 0F)
+            if (bid >= 0 && testsIn.count(bid) && testsIn[bid] >= 8) {
+                const uint8_t* p = &raw[i * 33];
+                int fill = 0;
+                for (int k = 20; k < 32; k++) fill += p[k] == 0x8F;
+                if (exact(p[4]) == 5 && fill >= 9) o.testMarkers++;
+                else o.testErrored++;
+                continue;
+            }
             if (bid != curB) { if (curB != INT64_MIN) flushB(); curB = bid; }
             if (!bb.have[ci]) {
                 std::copy(&raw[i * 33] + 5, &raw[i * 33] + 33, bb.r[ci].begin());
@@ -792,6 +820,10 @@ bool tviNorpakDecode(const std::string& t33, const std::string& outDir, TviNorpa
     if (o.testPackets)
         R.push_back(fmt("  test transmission: %lld packets of the receiver test pattern (7-bit + odd parity bytes, a sliding window over the PRBS s[k+8] = s[k] xor s[k+3])",
                         (long long)o.testPackets));
+    if (o.testErrored || o.testMarkers)
+        R.push_back(fmt("  in the test bundles also %lld packets of the pattern read with errors (where it has 7 zeros in a row) and %lld marker packets "
+                        "(PS 5 in place of CI 0 every 4th bundle: Hamming nibbles 0 0 1 4 1 0 1 0 0 0 0 0, then fill 0F) - not data",
+                        (long long)o.testErrored, (long long)o.testMarkers));
     if (o.bundles)
         R.push_back(fmt("  error protection: product code over GF(256) - 2 check bytes per packet, 2 FEC packets (CI 14, 15) per bundle of 16; "
                         "%lld bundles, %lld corrected (%lld packets with one wrong byte fixed, %lld packets rebuilt from the FEC)",
