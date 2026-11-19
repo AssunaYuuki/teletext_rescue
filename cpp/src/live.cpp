@@ -531,6 +531,7 @@ void LiveDecoder::reset(const VbiGeometry& g)
     btWritten_.clear(); btNote_.clear(); btFrames_ = -1; btRows_ = 0;
     td_ = TtDataPages();
     ts_ = TsCollector(); tsSeen_ = 0; tsAt_ = -1000000; tsProgs_.clear();
+    its_ = ItsIdl(); itvSeen_ = 0; itvAt_ = -1000000; itvFinds_.clear();
     tviLive_.clear();
     tvi3Slicers_.clear(); tvi3Live_ = TviStream(); tvi3Lines_.clear();
     tviFinds_.clear();
@@ -625,10 +626,14 @@ void LiveDecoder::feed(const uint8_t* frame)
             if (raw_) fwrite(out[l].pk, 1, 42, raw_);
             bt_.packet(out[l].pk, frames_);
             td_.packet(out[l].pk);
+            teledata_.packet(out[l].pk);
             ts_.packet(out[l].pk);
+            its_.packet(out[l].pk, frames_);
         } else if (out[l].raw) {
             if (raw_) fwrite(out[l].rpk, 1, 42, raw_);
             bt_.packet(out[l].rpk, frames_);
+            teledata_.packet(out[l].rpk);
+            its_.packet(out[l].rpk, frames_);
         }
         if (out[l].cc && l < L / 2) cc(out[l].ccv[0], out[l].ccv[1]);
         // VPS from ONE line: ARD 23.11.95 sends a second VPS line on 329 (field 2) with other bytes (CNI 0C0, 10:00
@@ -1880,6 +1885,7 @@ bool LiveDecoder::record(const std::string& path, std::string& err, bool writeVb
     if (rec_) { fclose(rec_); rec_ = nullptr; }
     if (t42_) { fclose(t42_); t42_ = nullptr; }
     if (raw_) { fclose(raw_); raw_ = nullptr; }
+    if (path.empty()) its_.finish();
     recOn_ = false;
     if (path.empty()) return true;
     std::string base = path;
@@ -1980,6 +1986,46 @@ std::vector<Find> LiveDecoder::finds()
         ts = tsProgs_;
     }
     if (!ts.empty()) addTelesoftFinds(out, ts, "teletext lines", path_join(filesDir(), "telesoftware"), tsWrite);
+    // InterTVNet / ITS: X/31 is fed directly by the worker; rebuild and write at most every 5 s when new
+    // correct packets came, keeping the last list between refreshes of the window.
+    ItsIdl its; bool itvMake = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (its_.itvGood() != itvSeen_ && frames_ - itvAt_ >= 25 * 5) {
+            its = its_; itvSeen_ = its_.itvGood(); itvAt_ = frames_; itvMake = true;
+        }
+    }
+    if (itvMake) {
+        std::vector<Find> v;
+        addInterTvFinds(v, its, path_join(filesDir(), "intertvnet_files"));
+        std::lock_guard<std::mutex> lk(mu_); itvFinds_ = std::move(v);
+    }
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        out.insert(out.end(), itvFinds_.begin(), itvFinds_.end());
+    }
+    // TeletextData Petersburg / ТхТ 2/200: pages 8xx, 630 file bytes in rows 1-18 of each subpage.
+    TeledataPages teledata;
+    bool teledataMake = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (teledata_.transmissions() != teledataSeen_ && frames_ - teledataAt_ >= 25 * 5) {
+            teledata = teledata_;
+            teledataSeen_ = teledata_.transmissions();
+            teledataAt_ = frames_;
+            teledataMake = true;
+        }
+    }
+    if (teledataMake) {
+        std::vector<Find> v;
+        addTeledataFinds(v, teledata, "teletext lines", path_join(filesDir(), "teledata_files"));
+        std::lock_guard<std::mutex> lk(mu_);
+        teledataFinds_ = std::move(v);
+    }
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        out.insert(out.end(), teledataFinds_.begin(), teledataFinds_.end());
+    }
     return out;
 }
 

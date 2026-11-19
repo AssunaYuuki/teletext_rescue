@@ -420,6 +420,21 @@ Json vbi_auto(const std::string &src_in, bool again, Progress &pr) {
                 if (exists(pj)) { Json m = load_json(pj, Json::object()); m["source"] = src; m["source_format"] = fmtname; save_json(pj, m, 1); }
                 std::error_code ec; fs::remove(P(tmp), ec);
             }
+        } else {
+            // pages built field-aware before pages_build 2 could show rows of other transmissions over a page
+            // (bbc vps 1: the index rows on every page of the recipe 191): built again from the stream and line map
+            // kept in the project - quick, the recording is not read again; the project's own keys stay
+            std::string pjp = path_join(out, "project.json"), st = path_join(out, "stream.t42"), ln = path_join(out, "line_pkt.npy");
+            Json old = load_json(pjp, Json::object());
+            if (old.get_bool("field_skipping") && old.get_num("pages_build", 0) < 2 && exists(st) && exists(ln))
+                sub_try([&] {
+                    pr.step("Building the teletext pages again (rows filled in from other transmissions are checked)");
+                    build_project(st, out, ln, (int)old.get_num("lpf", 32), "", pr);
+                    Json now = load_json(pjp, Json::object());
+                    for (auto &kv : old.o) if (!now.has(kv.first) || kv.first == "source" || kv.first == "charset") now[kv.first] = kv.second;
+                    now["pages_build"] = 2;
+                    save_json(pjp, now, 1);
+                }, "teletext pages");
         }
         if (exists(path_join(out, "pages.json"))) {
             Json meta = load_json(path_join(out, "project.json"), Json::object());

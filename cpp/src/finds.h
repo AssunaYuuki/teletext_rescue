@@ -10,8 +10,10 @@
 
 struct DecodeResult;
 struct TviStream;
+class ItsIdl;
 class BtCatalog;
 class TtDataPages;
+class TeledataPages;
 struct BtProgress;
 
 struct Find {
@@ -61,3 +63,5 @@ struct BtWritten;
 void addBtFinds(std::vector<Find>& out, const BtCatalog& c, const std::string& where, const std::vector<BtWritten>& written,
                 const std::string& keyNote, int64_t nowFrame = -1);
 void addTtDataFinds(std::vector<Find>& out, const TtDataPages& t, const std::string& where);   // Hamming 8/4 data pages
+void addTeledataFinds(std::vector<Find>& out, const TeledataPages& t, const std::string& where, const std::string& dir = "");
+void addInterTvFinds(std::vector<Find>& out, const ItsIdl& its, const std::string& dir);

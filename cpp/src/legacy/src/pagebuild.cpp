@@ -395,6 +395,23 @@ R40 vote(const std::vector<const R40 *> &mem) {
 }
 }
 
+// счётчик подстраницы в шапке: «NN/MM» в строке 0 (5-й канал: 100 — это «00/20»…«20/20» под одним субкодом)
+template <class RowsT>
+static int header_counter(const RowsT &rows, int &mm) {
+    for (auto &rb : rows) {
+        if (rb.first != 0) continue;
+        std::string t; for (u8 c : rb.second) t += (char)(c & 0x7F);
+        auto dg = [&](size_t j) { return j < t.size() && t[j] >= '0' && t[j] <= '9'; };
+        for (size_t i = 0; i + 5 <= t.size(); i++) {
+            if (!dg(i) || !dg(i + 1) || t[i + 2] != '/' || !dg(i + 3) || !dg(i + 4)) continue;
+            if ((i > 0 && (dg(i - 1) || t[i - 1] == '/')) || dg(i + 5) || (i + 5 < t.size() && t[i + 5] == '/')) continue;
+            int a = (t[i] - '0') * 10 + t[i + 1] - '0', b = (t[i + 3] - '0') * 10 + t[i + 4] - '0';
+            if (a >= 0 && a <= b && b >= 2 && b <= 99) { mm = b; return a; }
+        }
+    }
+    return -1;
+}
+
 PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Progress &pr) {
     const long N = (long)st.size();
     auto hbits = [](int x) { return ((x >> 1) & 1) | (((x >> 3) & 1) << 1) | (((x >> 5) & 1) << 2) | (((x >> 7) & 1) << 3); };
@@ -946,17 +963,55 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
     };
     PagesBuild res;
     std::map<int, int> nsub;
-    for (auto &kv : tx) {
-        if ((int)kv.second.size() < MIN_TX) continue;
+    auto build_page = [&](const std::vector<Tx> &src, std::vector<Version> &out) {
         std::map<std::string, std::vector<TT>> by;
-        for (auto &t : assign_subs(kv.second)) by[t.sub].push_back(t);
-        std::vector<Version> out;
+        for (auto &t : assign_subs(src)) by[t.sub].push_back(t);
         for (auto &sb : by) {
             if ((int)sb.second.size() < MIN_TX && by.size() > 1) continue;
             auto snaps = build(sb.second);
             for (auto &s : snaps) s.s = sb.first;
             out.insert(out.end(), snaps.begin(), snaps.end());
         }
+    };
+    for (auto &kv : tx) {
+        if ((int)kv.second.size() < MIN_TX) continue;
+        std::vector<Version> out;
+        // карусель, которая нумерует себя в шапке («100 ТхТ-ТЕКСТ 04/20»): счётчик важнее субкода — иначе
+        // редкие подкоды отбрасываются как шум от ленты, а подстраницы под одним 0000 сливаются в одну
+        bool byCounter = false;
+        {
+            std::map<int, std::vector<const Tx *>> byCtr;
+            std::map<int, int> mmOf, mmCnt;
+            for (auto &t : kv.second) {
+                if (!t.rows || t.rows->empty() || t.rows->front().first != 0) continue;
+                int mm = 0, c = header_counter(*t.rows, mm);
+                if (c >= 0) { byCtr[c].push_back(&t); mmOf[c] = mm; mmCnt[mm]++; }
+            }
+            int bestMM = 0; long bn = 0;
+            for (auto &x : mmCnt) if (x.second > bn) { bn = x.second; bestMM = x.first; }
+            int gn = 0; for (auto &x : byCtr) if (mmOf[x.first] == bestMM) gn++;
+            if (bestMM && gn >= 2 && bn >= 3) {
+                byCounter = true;
+                std::set<long> used;
+                for (auto &x : byCtr) {
+                    if (mmOf[x.first] != bestMM) continue;
+                    Version v; v.t = x.second[0]->i; v.n = (int)x.second.size();
+                    std::map<int, std::vector<const R40 *>> mem;
+                    for (auto *t : x.second) { used.insert(t->i); for (auto &rb : *t->rows) mem[rb.first].push_back(&rb.second); }
+                    for (auto &m : mem) {
+                        if (m.first < 0 || m.first > 24) continue;
+                        v.rows[m.first] = vote(m.second);
+                        v.c[m.first] = (int)m.second.size();
+                    }
+                    v.s = x.second[0]->has_sub ? x.second[0]->sub : "0000";
+                    out.push_back(v);
+                }
+                std::vector<Tx> rest;
+                for (auto &t : kv.second) if (!used.count(t.i)) rest.push_back(t);
+                if (!rest.empty()) build_page(rest, out);
+            }
+        }
+        if (!byCounter) build_page(kv.second, out);
         if (!out.empty()) {
             std::set<std::string> ss; for (auto &v : out) ss.insert(v.s);
             nsub[std::min((int)ss.size(), 5)]++;
@@ -1221,6 +1276,18 @@ void build_project(const std::string &t42_in, const std::string &out, const std:
         good = export_pages(st, go, pr);
     }
     PagesBuild merged = merge_pages(good, full, ex, pr);
+    // the field-aware build, when it holds less than half the rows of its pages: the rest was filled in from the
+    // snapshots of other transmissions, so one page showed rows of two or three versions over each other. A
+    // capture card whose VBI window misses lines (SAA7231: 1tv.vbi, 5tv, ostankino - rows break at the field
+    // boundaries though no field is skipped) gave 69-95% filled rows; the plain build reads these pages as live does
+    if (skip) {
+        auto rows = [](const PagesBuild &b) { long n = 0; for (auto &kv : b) for (auto &v : kv.second) n += (long)v.rows.size(); return n; };
+        long all = rows(merged), own = rows(good);
+        if (all > 0 && 2 * (all - own) > all) {
+            pr.log(fmt("the field-aware build holds %ld of %ld rows: the pages are built without it", own, all));
+            merged = merge_pages(full, full, ex, pr);
+        }
+    }
     save_json(path_join(out, "pages.json"), build_to_json(merged));
     if (!vbi.empty() && !lp.empty()) {
         pr.step("tape quality map");
@@ -1246,6 +1313,7 @@ void build_project(const std::string &t42_in, const std::string &out, const std:
     pj["break_rates"] = rate;
     pj["charset"] = charset;
     if (lpf != 32) pj["lpf"] = lpf;
+    pj["pages_build"] = 2;   // 2: a field-aware build that holds less than half the rows is not used (vbi_auto builds older ones again)
     save_json(path_join(out, "project.json"), pj, 1);
     pr.step("done");
 }

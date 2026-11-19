@@ -170,10 +170,14 @@ const KnownKey KEYS[] = {
 std::string hexs(const u8 *d, int n) { std::string o; for (int i = 0; i < n; i++) o += fmt("%02X", d[i]); return o; }
 std::string tstamp(double s) { return fmt("%02d:%02d:%04.1f", (int)(s / 3600), (int)(s / 60) % 60, fmod(s, 60)); }
 
+struct EcmHalf { int u, c, ap; std::array<u8, 8> h; };
+struct DirectEmm { int u, which; std::array<u8, 72> d; };
+
 // разбор блоков: флаги, ECM (расшифровка ключом свободного доступа), EMM с адресами карт
-std::string analyse_blocks(const std::vector<std::pair<int, std::array<u8, 168>>> &msgs, double rate) {
+std::string analyse_blocks(const std::vector<std::pair<int, std::array<u8, 168>>> &msgs, double rate,
+                           const std::vector<EcmHalf> &raw_halves, const std::vector<DirectEmm> &direct_emms,
+                           std::pair<int, int> mode, int opmode) {
     std::string t;
-    if (msgs.empty()) return t;
     auto m1 = [](const std::array<u8, 168> &b) { return b.data(); };
     auto m2 = [](const std::array<u8, 168> &b) { return b.data() + 84; };
     // флаги
@@ -198,16 +202,10 @@ std::string analyse_blocks(const std::vector<std::pair<int, std::array<u8, 168>>
     // ECM: каждая половина (8 байт) приходит в своём блоке; номер c: c/2 — ECM, c&1 — половина
     struct Ecm { int u; int c; int ap; u8 e[16]; bool dec = false; u8 plain[16]; uint64_t cw = 0; };
     std::vector<Ecm> ecms;
-    struct Half { int u, c, ap; std::array<u8, 8> h; };
-    std::vector<Half> H;
+    const std::vector<EcmHalf> &H = raw_halves;
     int changes = 0; std::vector<int> change_u;
-    for (auto &m : msgs) {
-        const u8 *a = m1(m.second);
-        int c = ((a[1] & 7) << 4) | (a[2] >> 4), ap = a[2] & 15;
-        std::array<u8, 8> h; memcpy(h.data(), a + 3, 8);
-        H.push_back({m.first, c, ap, h});
-        if (ap == 0) { changes++; change_u.push_back(m.first); }
-    }
+    for (auto &h : H)
+        if (h.ap == 0) { changes++; change_u.push_back(h.u); }
     // An ECM is two 8-byte halves in slots c-1 (even) and c (odd). The same data line carries fresh
     // per-field bytes in every slot each frame, so the two halves of one ECM must be paired by time:
     // for each odd slot take the even-slot half nearest in time (a few frames away). A map keyed by
@@ -236,7 +234,7 @@ std::string analyse_blocks(const std::vector<std::pair<int, std::array<u8, 168>>
     }
     bool fa = key != nullptr;
     std::set<std::string> distinct; for (auto &e : ecms) distinct.insert(hexs(e.e, 16));
-    t += fmt("\nECM (entitlement control messages): %zu, %zu different; the control word changes %d times", ecms.size(), distinct.size(), changes);
+    t += fmt("\nECM (entitlement control messages): %zu, %zu different; flag 0 events: %d", ecms.size(), distinct.size(), changes);
     if (change_u.size() > 2) t += fmt(" (every %.1f s)", (change_u.back() - change_u.front()) / rate / (change_u.size() - 1));
     t += "\n";
     if (fa) {
@@ -258,13 +256,23 @@ std::string analyse_blocks(const std::vector<std::pair<int, std::array<u8, 168>>
     // EMM: 72 байта в каждом сообщении с 12-го; FF FF FF в адресе — заполнитель
     struct Emm { int u, which; std::array<u8, 72> d; };
     std::vector<Emm> emms; std::set<std::string> seen; int fill = 0;
-    for (auto &m : msgs)
+    for (auto &m : msgs) {
         for (int w = 0; w < 2; w++) {
+            if (!w && std::make_pair(m1(m.second)[0], (m1(m.second)[1] >> 3) | ((m1(m.second)[0] & 1) << 5)) != mode) continue;
+            if (w && opmode >= 0 && (m2(m.second)[1] << 8 | m2(m.second)[2]) != opmode) continue;
             const u8 *e = (w ? m2(m.second) : m1(m.second)) + 12;
             if (e[1] == 0xFF && e[2] == 0xFF && e[3] == 0xFF) { fill++; continue; }
             std::string k = hexs(e, 72); if (!seen.insert(k).second) continue;
             Emm x; x.u = m.first; x.which = w; memcpy(x.d.data(), e, 72); emms.push_back(x);
         }
+    }
+    for (auto &x : direct_emms) {
+        const u8 *e = x.d.data();
+        if (e[1] == 0xFF && e[2] == 0xFF && e[3] == 0xFF) { fill++; continue; }
+        if (!seen.insert(hexs(e, 72)).second) continue;
+        emms.push_back({x.u, x.which, x.d});
+    }
+    std::sort(emms.begin(), emms.end(), [](const Emm &a, const Emm &b) { return a.u < b.u; });
     std::map<int, int> addr;
     for (auto &e : emms) addr[e.d[1] | e.d[2] << 8 | e.d[3] << 16]++;
     t += fmt("\nEMM (entitlement management messages, 72 bytes: 00, 24-bit card address, 64 encrypted bytes, 4-byte signature): %zu different, %d fillers\n", emms.size(), fill);
@@ -419,11 +427,12 @@ int syster_report(const Rec &R, const std::vector<int> &rows0, const std::string
     int okn = 0;
     int nfix = 0;
     for (auto &p : pk) { auto &q = per_line[p.line]; q.first++; if (p.ok) { q.second++; okn++; } nfix += p.fixed; }
-    struct Block { int u; std::array<std::array<u8, 21>, 10> part; int have = 0; int recovered = 0; };
+    struct Block { int u; std::array<std::array<u8, 21>, 10> part; int have = 0, direct_have = 0; int recovered = 0; };
     std::vector<Block> blocks;
     Block cur{}; bool open = false;
     auto close = [&]() {
         if (!open) return;
+        cur.direct_have = cur.have;
         for (int par = 0; par < 2; par++) {              // XOR-восстановление
             int miss = -1, nm = 0;
             for (int i = par; i < 10; i += 2) if (!(cur.have >> i & 1)) { miss = i; nm++; }
@@ -449,8 +458,13 @@ int syster_report(const Rec &R, const std::vector<int> &rows0, const std::string
         // ones 1,3,5,7,9, each stepping by 4, so the ten parts of a block arrive in an order that is neither
         // increasing nor cyclic. A part already in the block therefore ends it only when its data differs:
         // the same bytes again are just a repeat of the reading.
-        if (open && (cur.have >> si & 1)) {
-            if (std::equal(cur.part[si].begin(), cur.part[si].end(), &p.d[2])) continue;
+        if (open && (cur.have >> si & 1) && std::equal(cur.part[si].begin(), cur.part[si].end(), &p.d[2])) continue;
+        // A block begins with part 0 (the XOR parts 0 and 1 lead it): on a capture whose parts come in cyclic
+        // order (NTV+, lines 13/14 + 326/327: 4 5 6 7 | 8 9 0 1 | 2 3 4 5 ...) a block opened at the first part
+        // read would take the tail of one block and the head of the next and fail its XOR check (175 of 621
+        // blocks complete instead of 616). So part 0 always opens a new block; a part already in the block
+        // with other data still ends it (part 0 lost).
+        if (open && ((cur.have >> si & 1) || (si == 0 && cur.have))) {
             close(); cur = Block{}; cur.u = p.u; open = true;
         }
         if (!open) { cur = Block{}; cur.u = p.u; open = true; }
@@ -480,7 +494,49 @@ int syster_report(const Rec &R, const std::vector<int> &rows0, const std::string
         for (int i : {8, 9, 6, 7, 4, 5, 2, 3}) for (u8 v : b.part[i]) m[k++] = v;
         msgs.push_back({b.u, m});
     }
-    txt += analyse_blocks(msgs, rate);
+    // Часть 8 содержит control/audience, слот, флаг и половину ECM: используем её даже из неполного блока.
+    std::map<std::pair<int, int>, int> modes;
+    for (auto &p : pk) {
+        if (!p.ok || p.d[1] != SEQ[8]) continue;
+        const u8 *a = &p.d[2];
+        modes[{a[0], (a[1] >> 3) | ((a[0] & 1) << 5)}]++;
+    }
+    std::pair<int, int> mode{-1, -1}; int mode_n = 0;
+    for (auto &kv : modes) if (kv.second > mode_n) { mode = kv.first; mode_n = kv.second; }
+    std::vector<EcmHalf> raw_halves;
+    for (auto &p : pk) {
+        if (!p.ok || p.d[1] != SEQ[8]) continue;
+        const u8 *a = &p.d[2];
+        if (std::make_pair(a[0], (a[1] >> 3) | ((a[0] & 1) << 5)) != mode) continue;
+        EcmHalf h{ p.u, ((a[1] & 7) << 4) | (a[2] >> 4), a[2] & 15, {} };
+        memcpy(h.h.data(), a + 3, 8); raw_halves.push_back(h);
+    }
+    // В неполном блоке четыре части одного сообщения могут быть прочитаны напрямую. Такое сообщение не нуждается
+    // в XOR и не должно пропадать из-за повреждения другого сообщения. Контрольные поля отсекают смешанные блоки.
+    std::map<int, int> operators;
+    for (auto &m : msgs) {
+        const u8 *a = m.second.data() + 84; operators[a[1] << 8 | a[2]]++;
+    }
+    int opmode = -1; mode_n = 0;
+    for (auto &kv : operators) if (kv.second > mode_n) { opmode = kv.first; mode_n = kv.second; }
+    std::vector<DirectEmm> direct_emms;
+    for (auto &b : blocks) {
+        if (b.have == 0x3FF) continue;
+        for (int w = 0; w < 2; w++) {
+            const int order[2][4] = {{8, 9, 6, 7}, {4, 5, 2, 3}};
+            bool direct = true;
+            for (int i : order[w]) if (!(b.direct_have >> i & 1)) { direct = false; break; }
+            if (!direct) continue;
+            std::array<u8, 84> m; int k = 0;
+            for (int i : order[w]) for (u8 v : b.part[i]) m[k++] = v;
+            if (!w) {
+                if (std::make_pair(m[0], (m[1] >> 3) | ((m[0] & 1) << 5)) != mode) continue;
+            } else if (opmode >= 0 && (m[1] << 8 | m[2]) != opmode) continue;
+            if (m[12] != 0) continue;
+            DirectEmm x{ b.u, w, {} }; memcpy(x.d.data(), m.data() + 12, 72); direct_emms.push_back(x);
+        }
+    }
+    txt += analyse_blocks(msgs, rate, raw_halves, direct_emms, mode, opmode);
     txt += "\nAll different blocks (message 1 = control byte, ECM part, EMM 1; message 2 = operator bytes, EMM 2)\n";
     std::map<std::string, int> seen;
     for (auto &b : blocks) {

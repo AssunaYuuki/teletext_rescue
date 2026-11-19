@@ -436,6 +436,70 @@ namespace {
 // a byte of DOS text: printable ASCII, CP866 letters, line ends
 bool textByte(int c) { return (c >= 0x20 && c < 0x7F) || (c >= 0x80 && c < 0xB0) || (c >= 0xE0 && c < 0xF2) || c == 13 || c == 10 || c == 9; }
 
+std::string btHex(const uint8_t* p, size_t n)
+{
+    std::string s;
+    for (size_t i = 0; i < n; i++) s += fmt("%02X%s", p[i], i + 1 == n ? "" : " ");
+    return s;
+}
+
+std::string btBinaryReport(const std::string& name, const std::vector<uint8_t>& d)
+{
+    std::string r = name + fmt(": %zu bytes\n\n", d.size());
+    r += "Binary record view. Transport decryption has already been applied where the service key is known.\n"
+         "The payload is compressed/encrypted for the subscriber decoder; its codec and key are not identified.\n"
+         "The bytes below are hexadecimal, not plain text.\n\n";
+    auto dump = [&](size_t at, size_t size) {
+        size_t end = std::min(d.size(), at + size);
+        for (size_t i = at; i < end; i += 16) {
+            size_t n = std::min<size_t>(16, end - i);
+            std::string ascii;
+            for (size_t k = 0; k < n; k++) ascii += d[i + k] >= 32 && d[i + k] < 127 ? (char)d[i + k] : '.';
+            r += fmt("%08X  %-47s  |%s|\n", (unsigned)i, btHex(d.data() + i, n).c_str(), ascii.c_str());
+        }
+    };
+    int emptyEven = 0, blocks = (int)(d.size() / 800);
+    for (int b = 1; b < blocks; b += 2) {
+        int nonzero = 0;
+        for (size_t i = (size_t)b * 800; i < (size_t)(b + 1) * 800; i++) nonzero += d[i] != 0;
+        emptyEven += nonzero == 0;
+    }
+    if (blocks >= 4 && d.size() % 800 == 0 && emptyEven >= blocks / 4) {
+        r += fmt("Container: %d records in odd 800-byte blocks; even blocks are zero fill.\n", (blocks + 1) / 2);
+        r += "Each record has a 9-byte header; the used length below excludes trailing zero fill.\n\n";
+        for (int b = 0; b < blocks; b += 2) {
+            size_t at = (size_t)b * 800, used = 800;
+            while (used && d[at + used - 1] == 0) used--;
+            r += fmt("record %3d @%08X: used %4zu bytes; header %s\n", b / 2 + 1, (unsigned)at, used,
+                     btHex(d.data() + at, std::min<size_t>(9, used)).c_str());
+        }
+        std::vector<int> show = {0, 2};
+        if (blocks > 4) show.push_back(blocks - 1 - (blocks & 1));
+        for (int b : show) {
+            size_t at = (size_t)b * 800, used = 800;
+            while (used && d[at + used - 1] == 0) used--;
+            r += fmt("\n== record %d, full hexadecimal dump ==\n", b / 2 + 1);
+            dump(at, used);
+        }
+        return r;
+    }
+    size_t records = d.size() / 973, rest = d.size() % 973;
+    r += fmt("Container: %zu records of 973 bytes", records) + (rest ? fmt(" + %zu trailing bytes", rest) : "") + ".\n";
+    r += "Prefix: first 16 bytes; suffix: last 16 bytes of each record.\n\n";
+    for (size_t n = 0; n < records; n++) {
+        size_t at = n * 973;
+        r += fmt("record %3zu @%08X: %s | %s\n", n + 1, (unsigned)at, btHex(d.data() + at, 16).c_str(), btHex(d.data() + at + 957, 16).c_str());
+    }
+    if (rest) r += fmt("trailing @%08X: %s\n", (unsigned)(records * 973), btHex(d.data() + records * 973, rest).c_str());
+    std::vector<size_t> show = {0, 1};
+    if (records > 2) show.push_back(records - 1);
+    for (size_t n : show) if (n < records) {
+        r += fmt("\n== record %zu, full hexadecimal dump ==\n", n + 1);
+        dump(n * 973, 973);
+    }
+    return r;
+}
+
 // FAT directory entries in what the sender's disk left in a file (-1 = byte not received): names, sizes and dates of
 // files that were on the disk
 struct FatEntry {
@@ -724,6 +788,7 @@ int ham96(int x, int mask)
 // 8/4 codeword; its value through kTi95 is a nibble of the file byte g*3200 + k*160 + c*4 + b/2 (b even: the low one).
 // One key for every group, file and tape (found from EXAMPCH1.ARJ = COMI0304.ARJ against its 25.05.96 broadcast).
 #include "biznestext_key95.inc"
+#include "biznestext_key94.inc"
 const int kTi95[16] = {0, 14, 7, 9, 11, 5, 12, 2, 13, 3, 10, 4, 6, 8, 1, 15};   // the table is its own inverse
 // the Hamming value of a codeword with erasures, as ham96 but without the 1996 table; -1 = unreadable
 int hamv95(int x, int mask)
@@ -1280,14 +1345,88 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
         }
         if (share > 0.6 && fileBest >= 0.85 && share > bestText + 0.03) { bestText = share; K = k; P = per; }
     }
+    // No file reads as text: a batch sent all in the subscriber form ("1\Новая папка (3)", 17 files). The key of 9.07.94
+    // opens it; it fits when the records of 973 bytes show their header (bytes 4-5 zero) after it and not before.
+    int fit94 = 0, of94 = 0;
+    if (!P && !v96) {
+        for (auto& f : F) {
+            if (isOpen(f.first)) continue;
+            int seen = 0, raw = 0, dec = 0;
+            for (int r = 0; r < 8; r++) {
+                int v[2], ok = 1;
+                for (int j = 0; j < 2; j++) {
+                    long off = 973L * r + 4 + j;
+                    auto b = f.second.find((int)(off / 800) + 1);
+                    v[j] = b == f.second.end() ? -1 : b->second[off % 800];
+                    if (v[j] < 0) ok = 0;
+                }
+                if (!ok) continue;
+                seen++;
+                long o0 = (973L * r + 4) % 800, o1 = (973L * r + 5) % 800;
+                raw += (v[0] & 0xFF) == 0 && (v[1] & 0xFF) == 0;
+                dec += ((v[0] & 0xFF) ^ kKey94[o0]) == 0 && ((v[1] & 0xFF) ^ kKey94[o1]) == 0;
+            }
+            if (seen < 6) continue;
+            of94++;
+            fit94 += dec >= seen - 1 && raw <= 2;
+        }
+        if (fit94 >= 2 && fit94 * 2 >= of94) { K.assign(kKey94, kKey94 + 800); P = 1; }
+        else fit94 = 0;
+    }
     note = v96 ? fmt("each byte sent as two Hamming 8/4 codewords spread down the columns (400 bytes a block); key of 800 codewords "
                      "found from the text of %s (%.0f%% of its bytes read as DOS text)", k96.from.c_str(), 100 * k96.text)
+         : fit94 ? fmt("no file reads as text (all sent in the subscriber form); the built-in key of 9.07.94 fits: %d of %d files "
+                       "show the headers of their 973-byte records with it", fit94, of94)
          : P ? fmt("key of %d bytes found from the text of the files (%.0f%% of the bytes read as DOS text)", 800 * P, 100 * bestText)
              : std::string("not decrypted: no file of this batch reads as text under any key (the key is found from a text "
                            "file; packed files and empty records cannot give it), or too little received");
     if (v96 && k96.from.empty()) note = "each byte sent as two Hamming 8/4 codewords (1996); no file reads as text to find the key";
     if (v95) note = "1995-96 form: each byte two Hamming 8/4 codewords, rows interleaved over groups of 8 blocks; the built-in key "
                     "(found from EXAMPCH1.ARJ = COMI0304.ARJ, one for every tape of 1995-96)";
+    // A loose split row can be put into two neighbouring blocks (BNK.C01: rows 12-17 of blocks 2/3, 5/6, 8/9).
+    // Their catalogue sums decide which of the other received copies belongs in this block.
+    if (!v96)
+        for (auto& f : F) {
+            auto e = entryOf(f.first);
+            if (e == entries_.end()) continue;
+            for (auto& b : f.second) {
+                auto s = e->second.blockSum.find(b.first);
+                if (s == e->second.blockSum.end()) continue;
+                long want = best<long>(s->second, -1L), have = 0;
+                bool whole = true;
+                for (auto v : b.second) { if (v < 0) { whole = false; break; } have += v & 0xFF; }
+                if (!whole || want < 0 || have == want) continue;
+                auto rows = cp.find(f.first);
+                if (rows == cp.end()) continue;
+                auto block = rows->second.find(b.first);
+                if (block == rows->second.end()) continue;
+                for (int r = 1; r <= 20 && have != want; r++) {
+                    int off = (r - 1) * 40;
+                    bool repeated = false;
+                    for (int other : {b.first - 1, b.first + 1}) {
+                        auto ob = f.second.find(other);
+                        if (ob == f.second.end()) continue;
+                        bool same = true;
+                        for (int k = 0; k < 40; k++) same &= ob->second[off + k] == b.second[off + k];
+                        repeated |= same;
+                    }
+                    if (!repeated) continue;
+                    auto copies = block->second.find(r);
+                    if (copies == block->second.end()) continue;
+                    for (auto* candidate : copies->second) {
+                        long sum = have;
+                        for (int k = 0; k < 40; k++) sum += (candidate->b[k] & 0xFF) - (b.second[off + k] & 0xFF);
+                        if (sum != want) continue;
+                        for (int k = 0; k < 40; k++) {
+                            b.second[off + k] = candidate->b[k];
+                            alt[f.first][b.first][off + k] = -1;
+                        }
+                        have = want;
+                        break;
+                    }
+                }
+            }
+        }
     // 1994: a block whose bytes as sent do not add up to the catalogue's sum (row 23) is mended when exactly one byte
     // where the copies differ makes it right with the other copy's value
     std::map<std::string, std::array<int, 3>> sumStat;   // file -> right, mended, wrong
@@ -1530,7 +1669,28 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
             if (!list.empty() && exists(xd)) {
                 write_file(path_join(xd, "_unpacked.txt"), list.data(), list.size());
                 long whole = 0, got = 0;
-                for (auto& e : a.files) { whole += e.ok; got += !e.data.empty(); }
+                int fileNo = 0;
+                for (auto& e : a.files) {
+                    whole += e.ok; got += !e.data.empty();
+                    fileNo++;
+                    if (e.data.empty()) continue;
+                    std::string nm;
+                    for (unsigned char ch : e.name) nm += ch < 32 || ch > 126 || strchr("\\/:*?\"<>|", ch) ? '_' : (char)ch;
+                    if (nm.empty() || nm == "?") nm = "file" + std::to_string(fileNo);
+                    BtWritten member;
+                    member.name = nm;
+                    member.path = path_join(xd, nm);
+                    member.archiveFrom = w.name;
+                    member.archiveSize = e.size;
+                    member.checkOk = e.ok;
+                    member.readPct = e.size ? 100.0 * (e.got - std::min(e.got, e.unknown)) / e.size : e.ok ? 100 : 0;
+                    member.check = e.ok ? "whole file, CRC right" : fmt("%u of %u bytes unpacked%s%s", e.got, e.size,
+                                                                         e.unknown ? fmt(", %u bytes not received", e.unknown).c_str() : "",
+                                                                         e.why.empty() ? "" : ("; " + e.why).c_str());
+                    std::string opened = openableCopy(member.path, true);
+                    if (opened.size() > 4 && opened.compare(opened.size() - 4, 4, ".txt") == 0) member.text = opened;
+                    out.push_back(member);
+                }
                 w.check += fmt("; unpacked into %s_files: %ld whole, %ld in part", safe.c_str(), whole, got - whole);
             }
         } else if (isPcx(bin)) {
@@ -1554,6 +1714,13 @@ std::vector<BtWritten> BtCatalog::writeFiles(const std::string& dir, std::string
         } else {
             w.check = lost ? "no check for this kind of file; bytes missing" : "no check for this kind of file; every byte read";
             w.checkOk = false;
+        }
+        std::string ext = w.name.size() > 4 ? w.name.substr(w.name.size() - 4) : "";
+        if (!isText && (ext == ".C01" || ext == ".C02" || ext == ".C03" || ext == ".C04" || ext == ".COD")) {
+            std::string view = btBinaryReport(w.name, bin);
+            w.text = w.path + ".txt";
+            write_file(w.text, view.data(), view.size());
+            w.check += "; binary record view: " + safe + ".txt";
         }
         // old contents of the sender's disk: its directories and texts in leftovers/<name>.txt
         if (w.content.rfind("disk leftovers", 0) == 0) {

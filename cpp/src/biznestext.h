@@ -38,7 +38,7 @@ struct BtFile {
 std::string utf8Of866(uint8_t x);   // one byte of DOS text (CP866) as UTF-8
 
 struct BtWritten {
-    std::string name, path, text;      // the file and its text as UTF-8 ("" if not text)
+    std::string name, path, text;      // file, and its UTF-8 text or binary record report ("" if neither)
     int blocks = -1, blocksHave = 0;   // in the catalogue / with at least one row received
     int rows = 0, rowsHave = 0;        // rows of the blocks up to the last one received
     int rowsBad = 0;                   // rows of a text file that did not read as text (left out)
@@ -64,6 +64,9 @@ struct BtWritten {
     // a whole file of the sender's disk found inside the leftovers of a sent file (JINN.EXE in TOVAR.C01): where
     // ("TOVAR.C01 @49152") and the FAT entry that named it ("" = none of that size)
     std::string carvedFrom, carvedEntry;
+    // a file unpacked from a received ARJ: its name in the archive and its size there; shown as a find of its own
+    std::string archiveFrom;
+    long archiveSize = -1;
 };
 
 // how far each file of the catalogue has come, block by block (the table of files, live and for a recording)
@@ -114,7 +117,7 @@ public:
     int64_t lastFrame() const { return lastFrame_; }
     long mendedRows() const;          // rows put back into their blocks from split transmissions
     // assembles the files from their blocks (each byte voted over the copies), finds the key and writes
-    // <dir>/<name> (+ <name>.txt when it is text); note = how the key was found
+    // <dir>/<name> (+ <name>.txt for text or a binary record view); note = how the key was found
     // status: what is being done now, for a progress window ("decrypting and writing AKC.C01 (3 of 19)")
     std::vector<BtWritten> writeFiles(const std::string& dir, std::string& note,
                                       const std::function<void(const std::string&)>& status = nullptr) const;

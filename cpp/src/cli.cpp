@@ -202,6 +202,174 @@ static int captureCli(const std::vector<std::string>& args)
     return 0;
 }
 
+// trcli --follow <rec.vbi> [--format key] [--seconds N] [--out dir] [--idle S]: the recording read as it grows.
+// The frames that came since the last look go through the live decoder (the same voting over the copies of a
+// page as the capture window); every few hundred frames the ready pages are written as clean text to <out>,
+// and at the end the session's packets make <out>/live.t42 - the program opens it as any teletext stream.
+static int followCli(const std::vector<std::string>& args)
+{
+    if (args.size() < 2) {
+        fprintf(stderr, "trcli --follow <rec.vbi> [--format saa713x-pal] [--seconds N] [--out dir] [--idle S]\n");
+        return 1;
+    }
+    std::string in = args[1], key = "saa713x-pal", out;
+    int seconds = 0, idle = 60, every = 500;
+    for (size_t i = 2; i + 1 < args.size(); i += 2) {
+        if (args[i] == "--format") key = args[i + 1];
+        else if (args[i] == "--seconds") seconds = atoi(args[i + 1].c_str());
+        else if (args[i] == "--out") out = args[i + 1];
+        else if (args[i] == "--idle") idle = atoi(args[i + 1].c_str());
+        else if (args[i] == "--every") every = std::max(50, atoi(args[i + 1].c_str()));
+    }
+    VbiGeometry g = formatGeometry(formatFromKey(key));
+    if (g.format == VbiFormat::Unknown) { fprintf(stderr, "unknown format %s\n", key.c_str()); return 1; }
+    int64_t fb = g.fileFrameBytes();
+    FILE* fi = _wfopen(widen(in).c_str(), L"rb");
+    if (!fi || fb <= 0) { fprintf(stderr, "cannot open %s\n", in.c_str()); return 1; }
+    if (out.empty()) out = in.substr(0, in.find_last_of('.')) + "_live";
+    std::filesystem::create_directories(std::filesystem::u8path(out));
+    LiveDecoder dec;
+    dec.reset(g);
+    dec.setGpu(true);
+    std::vector<uint8_t> frame((size_t)fb);
+    int64_t pos = 0, frames = 0, lastDump = -1000000;
+    // телесофт 8-го журнала: шапка страницы 800..8FF несёт имя файла и номер блока, строки 3..23 — 840 байт блока
+    struct TsBlock { std::string name; int total = 0; long size = 0; std::vector<uint8_t> data; bool ready = false; };
+    std::map<std::string, std::map<int, TsBlock>> tsFiles;   // имя файла -> блок -> содержимое
+    auto nib = [](unsigned v) -> int {
+        switch (v & 0x7F) {
+        case 0x15: return 0; case 0x02: return 1; case 0x49: return 2; case 0x5E: return 3;
+        case 0x64: return 4; case 0x73: return 5; case 0x38: return 6; case 0x2F: return 7;
+        case 0xD0: return 8; case 0xC7: return 9; case 0x8C: return 10; case 0x9B: return 11;
+        case 0xA1: return 12; case 0xB6: return 13; case 0xFD: return 14; case 0xEA: return 15;
+        }
+        return -1;
+    };
+    // the ready pages of the session so far: every subpage with at least 20 rows, as clean text
+    auto writePages = [&]() {
+        LiveSnapshot all;
+        dec.snapshot(all, 0);
+        int ready = 0, files = 0;
+        auto dir = std::filesystem::u8path(out);
+        for (auto& kv : all.list) {
+            LiveSnapshot one;
+            dec.snapshot(one, kv.first);
+            auto it = one.pages.find(kv.first);
+            if (it == one.pages.end()) continue;
+            int nsub = (int)it->second.size();
+            int sub = 0;
+            for (auto& sb : it->second) {
+                sub++;
+                const LivePage& pg = sb.second;
+                if (pg.rows.size() < 20) continue;
+                std::string cs = all.charset.empty() ? "cyr2" : all.charset;
+                const Charset& t = charset_table(cs, pg.national);
+                std::string txt;
+                for (int r = 0; r < 25; r++) {
+                    auto ri = pg.rows.find(r);
+                    if (ri == pg.rows.end()) continue;
+                    std::u32string u;
+                    for (int c = 0; c < 40; c++) {
+                        unsigned v = ri->second[c];
+                        u += v >= 0x20 && v < 0x80 ? t[v - 0x20] : U' ';
+                    }
+                    while (!u.empty() && u.back() == U' ') u.pop_back();
+                    if (u.empty()) continue;
+                    txt += from_u32(u) + "\n";
+                }
+                char name[48];
+                if (nsub > 1) snprintf(name, sizeof name, "%03X_%d.txt", kv.first, sub);
+                else snprintf(name, sizeof name, "%03X.txt", kv.first);
+                FILE* f = _wfopen((dir / std::filesystem::u8path(name)).c_str(), L"wb");
+                if (f) { fwrite(txt.data(), 1, txt.size(), f); fclose(f); ready++; }
+                // 8-й журнал: блок телесофта
+                if (kv.first >= 0x800 && kv.first <= 0x8FF && pg.rows.count(0)) {
+                    const Row& h = pg.rows.at(0);
+                    std::string nm;
+                    for (int c = 11; c < 22; c++) { unsigned v = h[c] & 0x7F; if (v > 0x20 && v < 0x7F) nm += (char)v; }
+                    int a = h.size() > 26 ? nib(h[25]) : -1, b = h.size() > 26 ? nib(h[26]) : -1;
+                    if (!nm.empty() && a >= 0 && b >= 0) {
+                        int blk = a * 8 + b;
+                        TsBlock& tb = tsFiles[nm][blk];
+                        tb.name = nm;
+                        if (pg.rows.count(2)) {   // «имя размер блок всего»
+                            std::string s2;
+                            const Row& r2 = pg.rows.at(2);
+                            for (int c = 0; c < 40; c++) { unsigned v = r2[c] & 0x7F; s2 += v >= 0x20 && v < 0x7F ? (char)v : ' '; }
+                            long sz = 0; int got = -1, tot = 0;
+                            if (sscanf(s2.c_str(), "%*s %ld %d %d", &sz, &got, &tot) >= 2) { tb.size = sz; tb.total = tot; }
+                        }
+                        tb.data.assign(21 * 40, 0);
+                        for (int r = 3; r <= 23; r++) {
+                            auto ri = pg.rows.find(r);
+                            if (ri == pg.rows.end()) continue;
+                            for (int c = 0; c < 40; c++) tb.data[(r - 3) * 40 + c] = ri->second[c] & 0x7F;
+                        }
+                    }
+                }
+            }
+        }
+        // файлы телесофта: каждый блок отдельно и файл целиком, когда все блоки на месте
+        if (!tsFiles.empty()) {
+            std::filesystem::path fd = dir / std::filesystem::u8path("files");
+            std::filesystem::create_directories(fd);
+            for (auto& kv : tsFiles) {
+                std::string safe = kv.first;
+                for (auto& ch : safe) if (ch == '/' || ch == '\\' || ch == ':') ch = '_';
+                int have = 0, total = 0;
+                for (auto& b : kv.second) { total = std::max(total, b.first + 1); b.second.ready = true; }
+                std::string all;
+                for (int i = 0; i < total; i++) {
+                    auto bi = kv.second.find(i);
+                    if (bi == kv.second.end()) continue;
+                    have++;
+                    char bn[64];
+                    snprintf(bn, sizeof bn, "%s_b%02d.bin", safe.c_str(), i);
+                    FILE* f = _wfopen((fd / std::filesystem::u8path(bn)).c_str(), L"wb");
+                    if (f) { fwrite(bi->second.data.data(), 1, bi->second.data.size(), f); fclose(f); }
+                    all.append((const char*)bi->second.data.data(), bi->second.data.size());
+                }
+                if (have == total && total > 0) {
+                    FILE* f = _wfopen((fd / std::filesystem::u8path(safe)).c_str(), L"wb");
+                    if (f) { fwrite(all.data(), 1, all.size(), f); fclose(f); files++; }
+                }
+            }
+        }
+        printf("pages %zu, ready %d, files %d, packets %zu, frames %lld\n", all.list.size(), ready, files,
+               all.packets, (long long)frames);
+        fflush(stdout);
+    };
+    int64_t t0 = GetTickCount64(), lastGrow = t0;
+    for (;;) {
+        _fseeki64(fi, 0, SEEK_END);
+        int64_t avail = _ftelli64(fi) / fb;
+        if (avail > pos) {
+            lastGrow = GetTickCount64();
+            _fseeki64(fi, pos * fb, SEEK_SET);
+            while (pos < avail) {
+                if (fread(frame.data(), 1, (size_t)fb, fi) != (size_t)fb) break;
+                dec.feed(frame.data());
+                pos++; frames++;
+                if (frames % 250 == 0) dec.joinProbe();
+            }
+            if (frames - lastDump >= every) { lastDump = frames; writePages(); }
+        }
+        if (seconds && (int64_t)(GetTickCount64() - t0) / 1000 >= seconds) break;
+        if (!seconds && (int64_t)(GetTickCount64() - lastGrow) / 1000 >= idle) break;
+        Sleep(1000);
+    }
+    writePages();
+    // «сохранить страницы»: все пакеты сессии одним потоком, как .t42 живой записи
+    {
+        std::vector<uint8_t> pk = dec.sessionPackets();
+        FILE* f = _wfopen((std::filesystem::u8path(out) / std::filesystem::u8path("live.t42")).c_str(), L"wb");
+        if (f) { fwrite(pk.data(), 1, pk.size(), f); fclose(f); }
+        printf("live.t42: %zu packets, %zu bytes -> %s\n", pk.size() / 42, pk.size(), out.c_str());
+    }
+    fclose(fi);
+    return 0;
+}
+
 int wmain(int argc, wchar_t** wargv)
 {
     SetConsoleOutputCP(CP_UTF8);
@@ -228,6 +396,7 @@ int main(int argc, char** argv)
     // card without the window (the live decoder writes <out>.vbi and <out>.t42); --capture-list shows cards
     if (!args.empty() && (args[0] == "--capture" || args[0] == "--capture-list")) return captureCli(args);
     if (!args.empty() && args[0] == "--replay") return replayCli(args);
+    if (!args.empty() && args[0] == "--follow") return followCli(args);
 #endif
     // trcli --repair-measure <rec.vbi> <spec> [first frame] [frames] [--format key]: what a VBI repair does to the
     // teletext, per line (as the repair window's Measure)

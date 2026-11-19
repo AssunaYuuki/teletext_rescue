@@ -1,8 +1,27 @@
 #include "pagebuild.h"
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <numeric>
 #include <unordered_map>
+
+// счётчик подстраницы в шапке: «NN/MM» в строке 0 (5-й канал: 100 — это «00/20»…«20/20», все под одним субкодом)
+template <class RowsT>
+static int header_counter(const RowsT &rows, int &mm) {
+    for (auto &rb : rows) {
+        if (rb.first != 0) continue;
+        std::string t; for (u8 c : rb.second) t += (char)(c & 0x7F);
+        auto dg = [&](size_t j) { return j < t.size() && t[j] >= '0' && t[j] <= '9'; };
+        for (size_t i = 0; i + 5 <= t.size(); i++) {
+            if (!dg(i) || !dg(i + 1) || t[i + 2] != '/' || !dg(i + 3) || !dg(i + 4)) continue;
+            if ((i > 0 && (dg(i - 1) || t[i - 1] == '/')) || dg(i + 5) || (i + 5 < t.size() && t[i + 5] == '/')) continue;
+            int a = (t[i] - '0') * 10 + t[i + 1] - '0', b = (t[i + 3] - '0') * 10 + t[i + 4] - '0';
+            if (a >= 0 && a <= b && b >= 2 && b <= 99) { mm = b; return a; }
+        }
+    }
+    return -1;
+}
 
 // ---------------------------------------------------------------- счётчик с порядком вставки (как Counter)
 template <class K>
@@ -821,6 +840,7 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
         for (auto &kv : by) cl.push_back(kv.second);
         return cl;
     };
+    std::string curPid;   // страница, которую сейчас строим (для TR_PB_DEBUG)
     auto build = [&](const std::vector<TT> &T) {
         struct Cl { const R40 *rep; std::vector<const R40 *> mem; };
         std::map<int, std::vector<Cl>> reps;
@@ -852,14 +872,15 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
             // for these two digits, so transmissions with different NN never join
             auto counterOf = [](const SegRows &rows, int &mm) {
                 for (auto &rb : rows) {
-                    if (rb.first < 1 || rb.first > 24) continue;
+                    if (rb.first < 0 || rb.first > 24) continue;   // и шапка: у 5-го канала «100 ТхТ-ТЕКСТ  01/20» — в строке 0
                     std::string t; for (u8 c : rb.second) t += (char)(c & 0x7F);
                     for (size_t i = 0; i + 5 <= t.size(); i++) {
                         auto dg = [&](size_t j) { return j < t.size() && t[j] >= '0' && t[j] <= '9'; };
                         if (!dg(i) || !dg(i + 1) || t[i + 2] != '/' || !dg(i + 3) || !dg(i + 4)) continue;
                         if ((i > 0 && (dg(i - 1) || t[i - 1] == '/')) || dg(i + 5) || (i + 5 < t.size() && t[i + 5] == '/')) continue;
                         int a = (t[i] - '0') * 10 + t[i + 1] - '0', b = (t[i + 3] - '0') * 10 + t[i + 4] - '0';
-                        if (a >= 1 && a <= b && b >= 2 && b <= 99) { mm = b; return a; }
+                        // «00/20» — тоже счётчик: 5-й канал нумерует подстраницы с нуля
+                        if (a >= 0 && a <= b && b >= 2 && b <= 99) { mm = b; return a; }
                     }
                 }
                 // or "N/M" in the header (Саратов 100: "меню телетекст 2/5", five pages under 0000; the
@@ -1009,6 +1030,8 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
                 for (auto &g : joined) { std::sort(g.mem.begin(), g.mem.end()); real.push_back(&g); }
                 std::stable_sort(real.begin(), real.end(), [&](const G *x, const G *y) { return T[x->mem[0]].i < T[y->mem[0]].i; });
             }
+            if (getenv("TR_PB_DEBUG"))
+                fprintf(stderr, "PB %s: T=%zu ctrs=%zu whole=%d rotation=%d real=%zu\n", curPid.c_str(), T.size(), ctrs.size(), (int)whole, (int)rotation, real.size());
             if (rotation && real.size() >= 2) {
                 R40 hdr0; hdr0.fill(32);
                 if (reps.count(0) && !reps[0].empty()) {
@@ -1115,11 +1138,12 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
     };
     PagesBuild res;
     std::map<int, int> nsub;
-    for (auto &kv : tx) {
-        if ((int)kv.second.size() < MIN_TX) continue;
+    // обычный путь страницы: субкоды, карусель по содержимому, версии
+    auto build_page = [&](const std::vector<Tx> &src, std::vector<Version> &out) {
         std::map<std::string, std::vector<TT>> by;
-        for (auto &t : assign_subs(kv.second)) by[t.sub].push_back(t);
-        std::vector<Version> out;
+        for (auto &t : assign_subs(src)) by[t.sub].push_back(t);
+        if (getenv("TR_PB_DEBUG") && curPid == "100")
+            for (auto &sb2 : by) fprintf(stderr, "  sub[%s] n=%zu\n", sb2.first.c_str(), sb2.second.size());
         for (auto &sb : by) {
             if ((int)sb.second.size() < MIN_TX && by.size() > 1) continue;
             std::vector<Version> snaps;
@@ -1143,6 +1167,53 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
             for (auto &s : snaps) s.s = sb.first;
             out.insert(out.end(), snaps.begin(), snaps.end());
         }
+    };
+    for (auto &kv : tx) {
+        if ((int)kv.second.size() < MIN_TX) continue;
+        curPid = kv.first;
+        std::vector<Version> out;
+        // карусель, которая нумерует себя в шапке («100 ТхТ-ТЕКСТ 04/20»): счётчик важнее субкода — редкие подкоды
+        // иначе отбрасываются как шум от ленты, а подстраницы под одним 0000 сливаются в одну
+        bool byCounter = false;
+        {
+            std::map<int, std::vector<const Tx *>> byCtr;
+            std::map<int, int> mmOf, mmCnt;
+            size_t nRow0 = 0;
+            for (auto &t : kv.second) {
+                if (!t.rows || t.rows->empty() || t.rows->front().first != 0) continue;
+                nRow0++;
+                int mm = 0, c = header_counter(*t.rows, mm);
+                if (c >= 0) { byCtr[c].push_back(&t); mmOf[c] = mm; mmCnt[mm]++; }
+            }
+            int bestMM = 0; long bn = 0;
+            for (auto &x : mmCnt) if (x.second > bn) { bn = x.second; bestMM = x.first; }
+            int gn = 0; for (auto &x : byCtr) if (mmOf[x.first] == bestMM) gn++;
+            // счётчик считается настоящим, если он есть у большинства передач с шапкой и даёт хотя бы две подстраницы
+            if (getenv("TR_PB_DEBUG"))
+                fprintf(stderr, "CTR %s: segs=%zu row0=%zu byCtr=%zu bn=%ld mm=%d gn=%d\n",
+                        kv.first.c_str(), kv.second.size(), nRow0, byCtr.size(), bn, bestMM, gn);
+            if (bestMM && gn >= 2 && bn >= 3) {
+                byCounter = true;
+                std::set<long> used;
+                for (auto &x : byCtr) {
+                    if (mmOf[x.first] != bestMM) continue;
+                    std::vector<Version> vs;
+                    for (auto *t : x.second) {
+                        Version v; v.t = t->i; v.n = 1;
+                        for (auto &rb : *t->rows) { R40 r = rb.second; for (auto &c2 : r) c2 &= 0x7F; v.rows[rb.first] = r; }
+                        vs.push_back(v);
+                        used.insert(t->i);
+                    }
+                    std::string sub = x.second[0]->has_sub ? x.second[0]->sub : "0000";
+                    if (vs.size() == 1) { vs[0].s = sub; out.push_back(vs[0]); continue; }
+                    for (auto &v : cluster_rotations(vs)) { v.s = sub; out.push_back(v); }
+                }
+                std::vector<Tx> rest;
+                for (auto &t : kv.second) if (!used.count(t.i)) rest.push_back(t);
+                if (!rest.empty()) build_page(rest, out);
+            }
+        }
+        if (!byCounter) build_page(kv.second, out);
         if (!out.empty()) {
             std::set<std::string> ss; for (auto &v : out) ss.insert(v.s);
             nsub[std::min((int)ss.size(), 5)]++;

@@ -1,4 +1,5 @@
 #include "export.h"
+#include <filesystem>
 #include <set>
 #include "ssjson.h"
 #include "slicer.h"
@@ -16,6 +17,60 @@ static std::string clockText(double sec)
 {
     int t = (int)sec;
     return fmt("%02d:%02d:%02d.%d", t / 3600, t / 60 % 60, t % 60, (int)((sec - t) * 10));
+}
+
+// Одна страница = одна настоящая подстраница. У страницы свой подкод — это она и есть; несколько копий
+// во времени голосуются построчно (908 → один файл, а не двенадцать). Страница, которая крутит разные
+// тексты под одним подкодом (0000), разбирается построителем проекта по содержимому.
+static std::vector<Version> subpage_versions(const Project& P, const Page& pg)
+{
+    std::map<std::string, std::vector<const Version*>> by;
+    std::vector<std::string> order;
+    for (auto& v : pg.versions) { if (!by.count(v.s)) order.push_back(v.s); by[v.s].push_back(&v); }
+    if (order.size() <= 1) return P.full_versions(pg);
+    std::vector<Version> out;
+    for (auto& s : order) {
+        auto& V = by[s];
+        const Version* last = V[0];
+        for (auto* x : V) if (x->t > last->t) last = x;
+        Version r;
+        r.s = s;
+        r.t = last->t;
+        r.n = 0;
+        r.full = true;
+        for (auto* x : V) r.n += x->n ? x->n : 1;
+        std::set<int> rows;
+        for (auto* x : V) for (auto& rb : x->rows) rows.insert(rb.first);
+        for (int rn : rows) {
+            if (rn == 0) {   // шапка — из последней копии: в ней часы, номер и счётчик подстраницы
+                auto it = last->rows.find(0);
+                if (it != last->rows.end()) r.rows[0] = it->second;
+                continue;
+            }
+            std::map<std::string, std::pair<int, double>> vote;   // строка -> (сколько копий, когда последний раз)
+            for (auto* x : V) {
+                auto it = x->rows.find(rn);
+                if (it == x->rows.end()) continue;
+                auto c = x->c.find(rn);
+                int w = (c != x->c.end() && c->second) ? c->second : (x->n ? x->n : 1);
+                auto& e = vote[std::string((const char*)it->second.data(), 40)];
+                e.first += w;
+                e.second = std::max(e.second, x->t);
+            }
+            const std::string* best = nullptr;
+            int bw = -1;
+            double bt = -1;
+            for (auto& e : vote)
+                if (e.second.first > bw || (e.second.first == bw && e.second.second > bt)) { best = &e.first; bw = e.second.first; bt = e.second.second; }
+            if (!best) continue;
+            Row row;
+            for (int k = 0; k < 40; k++) row[k] = k < (int)best->size() ? (u8)(*best)[k] : 0x20;
+            r.rows[rn] = row;
+            r.c[rn] = bw;
+        }
+        out.push_back(std::move(r));
+    }
+    return out;
 }
 
 static const char* kSignPage = R"~(<!doctype html><html><head><meta charset="utf-8"><title>Silent Radio</title>
@@ -249,7 +304,7 @@ std::string exportResult(const DecodeResult& r, const std::string& dir, Progress
             std::string png = path_join(P.outdir, "png");
             make_dirs(png);
             for (auto& kv : pages) {
-                auto vs = P.full_versions(kv.second);
+                auto vs = subpage_versions(P, kv.second);
                 if (vs.empty()) vs = kv.second.versions;
                 for (size_t k = 0; k < vs.size(); k++) {
                     const Charset& t = P.table(&kv.second);
@@ -260,7 +315,48 @@ std::string exportResult(const DecodeResult& r, const std::string& dir, Progress
                     png_save(path_join(png, kv.first + (vs.size() > 1 ? fmt("_%zu", k + 1) : "") + ".png"), im.scaled(im.w * 2, im.h * 2));
                 }
             }
-            done.push_back(fmt("teletext/ (%zu pages: output.html, html/, output.t42)", pages.size()));
+            // каждая страница и подстраница — чистым текстом: pages/ (то же имя, что у PNG) и всё вместе в all.txt
+            pr.step("pages as text");
+            std::string txtdir = path_join(dir, "pages");
+            make_dirs(txtdir);
+            {   // старые .txt прошлого прохода не должны оставаться рядом с новыми
+                std::error_code ec;
+                for (std::filesystem::directory_iterator it(std::filesystem::u8path(txtdir), ec), end; !ec && it != end; it.increment(ec)) {
+                    const std::string f = it->path().filename().u8string();
+                    if (f.size() > 4 && f.compare(f.size() - 4, 4, ".txt") == 0) std::filesystem::remove(it->path(), ec);
+                }
+            }
+            int ntxt = 0;
+            std::string all;
+            for (auto& kv : pages) {
+                if (kv.second.deleted) continue;
+                auto vs = subpage_versions(P, kv.second);
+                if (vs.empty()) vs = kv.second.versions;
+                const Charset& t = P.table(&kv.second);
+                for (size_t k = 0; k < vs.size(); k++) {
+                    std::string txt;
+                    int rows = 0;
+                    for (int r = 0; r < 25; r++) {
+                        auto ri = vs[k].rows.find(r);
+                        if (ri == vs[k].rows.end()) continue;
+                        std::string line = P.row_text(ri->second, P.overlay(kv.second, &vs[k]), r, t);
+                        if (line.empty()) continue;
+                        rows++;
+                        txt += line + "\n";
+                    }
+                    if (rows < 2) continue;   // строки-картинки без текста не пишем, а «страница не передаётся» (2 строки) — пишем
+                    std::string name = kv.first + (vs.size() > 1 ? fmt("_%zu", k + 1) : "");
+                    write_text(path_join(txtdir, name + ".txt"), txt);
+                    all += "===== " + name + " =====\n" + txt + "\n";
+                    ntxt++;
+                }
+            }
+            if (!all.empty()) write_text(path_join(txtdir, "all.txt"), all);
+            done.push_back(fmt("pages/ (%d pages as text, all.txt)", ntxt));
+            // один собранный экземпляр каждой подстраницы: teletext/clean.t42 — открывается программой как поток
+            try { P.squash(pages); done.push_back("teletext/clean.t42 (one assembled copy of each subpage)"); }
+            catch (std::exception&) {}
+            done.push_back(fmt("teletext/ (%zu pages: output.html, html/, output.t42, png/)", pages.size()));
         }
     }
     std::string s = "Written to " + dir + ":\n";

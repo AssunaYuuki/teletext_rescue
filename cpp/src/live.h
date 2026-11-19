@@ -6,7 +6,9 @@
 #include "nabts/teletext.h"
 #include "biznestext.h"
 #include "ttdata.h"
+#include "teledata.h"
 #include "telesoft.h"
+#include "itsidl.h"
 #include "finds.h"
 #include "tvinform.h"
 #include "tviftr3.h"
@@ -184,11 +186,19 @@ bool gpuActive();                            // the card took the work (a kernel
     void setRepair(const VbiRepair& r);
     // copy for the window; page = which page to copy in full (0 = none)
     void snapshot(LiveSnapshot& s, int page);
-    // for tests: teletext packets (.t42, 42 bytes each) straight into the page store, as the lines would give them
+    // for tests: teletext packets (.t42, 42 bytes each) through the page store and file decoders, as lines give them
     void testPackets(const uint8_t* t42, size_t bytes)
     {
         std::lock_guard<std::mutex> lk(mu_);
-        for (size_t i = 0; i + 42 <= bytes; i += 42) { packet(t42 + i); if (i % (42 * 16) == 0) frames_++; }
+        for (size_t i = 0; i + 42 <= bytes; i += 42) {
+            packet(t42 + i);
+            bt_.packet(t42 + i, frames_);
+            td_.packet(t42 + i);
+            teledata_.packet(t42 + i);
+            ts_.packet(t42 + i);
+            its_.packet(t42 + i, frames_);
+            if (i % (42 * 16) == 0) frames_++;
+        }
     }
     // .vbi recording of the frames as they come, and next to it <name>.t42 with the teletext packets
     // decoded live (42 bytes each, ready for any teletext tool); empty path stops it
@@ -200,7 +210,7 @@ bool gpuActive();                            // the card took the work (a kernel
     int64_t recordedFrames() const { return recFrames_; }
     std::string recordPath() const { return recPath_; }
     // files and texts found so far (ТВ-информ lines and Norpak packets, «Бизнес-Текст» catalogue and
-    // data channel); files are written to filesDir() (next to the recording, else a temporary folder)
+    // data channel, TeletextData Petersburg / ТхТ pages); files go to filesDir() (next to the recording, else temporary)
     std::vector<Find> finds();
     // what the «Бизнес-Текст» part is doing now: catalogue, the file and block on the air, rows, decrypting, written
     // ("" = no Бизнес-Текст heard)
@@ -413,12 +423,19 @@ private:
     std::vector<BtWritten> btWritten_;       // under mu_
     std::string btNote_;                     // under mu_
     TtDataPages td_;                         // Hamming 8/4 data pages (ТЕЛЕИНФ 790 / 795), the same
+    TeledataPages teledata_;                 // TeletextData Petersburg / ТхТ 2/200 (5 канал, pages 8xx)
+    size_t teledataSeen_ = 0;
+    int64_t teledataAt_ = -1000000;
+    std::vector<Find> teledataFinds_;         // last catalogue and files, kept between window refreshes
     // BBC Ceefax telesoftware (under mu_): blocks as they come; programs made again at most every 5 s when new
     // blocks came, written as <files>/telesoftware/<name>.bbc (a click runs them in the BBC Micro window)
     TsCollector ts_;
     size_t tsSeen_ = 0;
     int64_t tsAt_ = -1000000;
     std::vector<TsProgram> tsProgs_;
+    ItsIdl its_;                           // InterTVNet / ITS X/31, fed by the worker (under mu_)
+    int64_t itvSeen_ = 0, itvAt_ = -1000000;
+    std::vector<Find> itvFinds_;               // the last InterTVNet list, kept between window refreshes
     std::map<int, TviStream> tviLive_;       // line index -> words so far (probe thread only)
     std::map<int, std::unique_ptr<Tvi3Slicer>> tvi3Slicers_;   // ТВ-информ fТ3 lines: their MLSE (probe thread only)
     TviStream tvi3Live_;                     // the fТ3 words of all its lines so far

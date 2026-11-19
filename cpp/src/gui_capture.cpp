@@ -157,6 +157,7 @@ struct CaptureWin : Window {
         if (t != gpuText) { gpuText = t; set_text(b_gpu, t); }
     }
     std::string note;                    // shown after the status (saving, VBI window)
+    std::string saveDir;                 // the folder this session's pages were saved to (the next saves update it)
     std::atomic<bool> saving{false};
     std::string lastStatus;
     RECT rVideo{}, rLines{}, rPage{}, rList{}, rText{};
@@ -182,6 +183,11 @@ struct CaptureWin : Window {
     void test_file(const std::string &path)
     {
         if (path.empty()) return;
+        // a teletext packet stream (.t42 / .t34 / .t33) is not a VBI recording: it goes to the decoder, pages and all,
+        // exactly as dropped on the main window or given on the command line
+        std::string ext = path.size() > 4 ? path.substr(path.size() - 4) : path;
+        for (auto &c : ext) c = (char)tolower((unsigned char)c);
+        if ((ext == ".t42" || ext == ".t34" || ext == ".t33") && open_recording_hook()) { open_recording_hook()(path); return; }
         stop();
         // the layout as the recording's decoder finds it (several layouts share a file size: the NHK TBC u16 file
         // read as 8-bit samples was only noise): the saved results, else the decoder's format probe
@@ -444,6 +450,7 @@ struct CaptureWin : Window {
         if (cap.running()) return;
         if (!cap.isOpen()) open_device();
         if (!cap.isOpen()) return;
+        saveDir.clear();   // a new session: «Save pages» asks for a folder again
         std::string file = record ? ask_file() : std::string();   // where to record; Cancel: watch only
         cap.onFrame = [this](const uint8_t *f) { dec.push(f, cap.geom().frameBytes()); };
         cap.onVideo = [this](const uint8_t *p, int w, int h, int stride) { picture(p, w, h, stride); };
@@ -584,34 +591,46 @@ struct CaptureWin : Window {
         time_t t = time(nullptr);
         char ts[32];
         strftime(ts, sizeof ts, "%Y-%m-%d_%H%M%S", localtime(&t));
-        // the folder is chosen each time, starting in the one used last (else the recordings' folder)
-        Json st = load_state();
-        std::string start = st.get_str("live_save_dir");
-        if (start.empty()) start = folder();
-        std::error_code ec0;
-        std::filesystem::create_directories(std::filesystem::u8path(start), ec0);
-        std::string where = pick_folder(hwnd, "Save pages: choose the folder (a folder live_<date> is made in it)", start);
-        if (where.empty()) { note = "saving cancelled"; return; }
-        st["live_save_dir"] = where;
-        save_state(st);
-        std::filesystem::path dir = std::filesystem::u8path(where) / std::filesystem::u8path(std::string("live_") + ts);
-        std::error_code ec;
-        std::filesystem::create_directories(dir, ec);
-        if (!std::filesystem::is_directory(dir, ec)) {
-            // Windows не пустил в выбранную папку (чаще всего «Защита от подмены»): пишем рядом с записями,
-            // иначе на Рабочем столе — сессия не должна пропадать из-за прав
-            std::string name = std::string("live_") + ts;
-            std::vector<std::filesystem::path> alt;
-            if (!folder().empty()) alt.push_back(std::filesystem::u8path(folder()) / std::filesystem::u8path(name));
-            if (const char *up = getenv("USERPROFILE")) alt.push_back(std::filesystem::u8path(up) / "Desktop" / std::filesystem::u8path(name));
-            bool okDir = false;
-            for (auto &a : alt) {
-                std::error_code e2;
-                std::filesystem::create_directories(a, e2);
-                if (std::filesystem::is_directory(a, e2)) { dir = a; okDir = true; break; }
+        // the folder is chosen once a session, starting in the one used last (else the recordings' folder);
+        // the next saves of the same session update it (Shift = a new folder)
+        bool fresh = saveDir.empty() || (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        std::filesystem::path dir;
+        if (!fresh) {
+            dir = std::filesystem::u8path(saveDir);
+            std::error_code e2;
+            std::filesystem::create_directories(dir, e2);
+            fresh = !std::filesystem::is_directory(dir, e2);
+        }
+        if (fresh) {
+            Json st = load_state();
+            std::string start = st.get_str("live_save_dir");
+            if (start.empty()) start = folder();
+            std::error_code ec0;
+            std::filesystem::create_directories(std::filesystem::u8path(start), ec0);
+            std::string where = pick_folder(hwnd, "Save pages: choose the folder (a folder live_<date> is made in it; the next saves update it)", start);
+            if (where.empty()) { note = "saving cancelled"; return; }
+            st["live_save_dir"] = where;
+            save_state(st);
+            dir = std::filesystem::u8path(where) / std::filesystem::u8path(std::string("live_") + ts);
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            if (!std::filesystem::is_directory(dir, ec)) {
+                // Windows не пустил в выбранную папку (чаще всего «Защита от подмены»): пишем рядом с записями,
+                // иначе на Рабочем столе — сессия не должна пропадать из-за прав
+                std::string name = std::string("live_") + ts;
+                std::vector<std::filesystem::path> alt;
+                if (!folder().empty()) alt.push_back(std::filesystem::u8path(folder()) / std::filesystem::u8path(name));
+                if (const char *up = getenv("USERPROFILE")) alt.push_back(std::filesystem::u8path(up) / "Desktop" / std::filesystem::u8path(name));
+                bool okDir = false;
+                for (auto &a : alt) {
+                    std::error_code e2;
+                    std::filesystem::create_directories(a, e2);
+                    if (std::filesystem::is_directory(a, e2)) { dir = a; okDir = true; break; }
+                }
+                if (!okDir) { note = "cannot create the folder " + dir.u8string() + ": " + ec.message(); return; }
+                note = "the folder " + where + " is closed for writing, saving to " + dir.u8string();
             }
-            if (!okDir) { note = "cannot create the folder " + dir.u8string() + ": " + ec.message(); return; }
-            note = "the folder " + where + " is closed for writing, saving to " + dir.u8string();
+            saveDir = dir.u8string();       // the next saves of this session go to the same folder
         }
         std::string t42 = (dir / "live.t42").u8string();
         FILE *f = _wfopen(widen(t42).c_str(), L"wb");
@@ -651,9 +670,19 @@ struct CaptureWin : Window {
         if (tab != std::string::npos) { who = m.substr(tab + 1); m.resize(tab); }
         std::filesystem::path dir = std::filesystem::u8path(m), html = dir / "teletext" / "output.html";
         std::error_code ec;
-        bool page = std::filesystem::exists(html, ec);
-        note = "saved \xE2\x86\x92 " + (page ? html : dir).u8string() + (who.empty() ? std::string() : "   (" + who + ")");
-        ShellExecuteW(hwnd, L"open", (page ? html : dir).wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        // what is in the folder now: the pages as text (pages/), as pictures (teletext/png), the stream itself
+        int ntxt = 0, npng = 0;
+        for (std::filesystem::directory_iterator it(dir / "pages", ec), end; !ec && it != end; it.increment(ec)) {
+            const std::string fn = it->path().filename().u8string();
+            if (fn != "all.txt" && fn.size() > 4 && fn.compare(fn.size() - 4, 4, ".txt") == 0) ntxt++;
+        }
+        ec.clear();
+        for (std::filesystem::directory_iterator it(dir / "teletext" / "png", ec), end; !ec && it != end; it.increment(ec))
+            if (it->path().extension() == ".png") npng++;
+        note = fmt("saved: %d pages as text, %d as pictures \xE2\x86\x92 ", ntxt, npng) + dir.u8string() +
+               (who.empty() ? std::string() : "   (" + who + ")");
+        ShellExecuteW(hwnd, L"open", dir.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        (void)html;
     }
     // Lines...: the VBI lines asked of the card, e.g. 5-22 when data sits above line 7 (a shifted tape).
     // 16 lines a field (the card's window moved) or 18 (widened: recorded as the 18-line layout)

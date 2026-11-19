@@ -849,6 +849,14 @@ struct App : Window {
                     if (!loadResults(f, *res, err)) throw std::runtime_error(err);
                     // files and texts (the «Бизнес-Текст» files put together and written), telling which
                     prepareFinds(*res, [&](const std::string &s) { pr.step(s); });
+                    // страницы текстом: если в папке результатов их ещё нет (запись разобрана раньше этой сборкой)
+                    if (!res->teletext.project.empty()) {
+                        std::string out = ends_with_i(f, ".t42") || ends_with_i(f, ".t34") ? res->teletext.project : legacyReportDir(f);
+                        if (!exists(path_join(out, "pages"))) {
+                            pr.step("saving the pages next to the recording");
+                            try { pr.log(exportResult(*res, out, pr)); } catch (std::exception &) {}
+                        }
+                    }
                 }, [this, res](bool ok) { if (ok) show_results(res); });
                 return;
             }
@@ -881,6 +889,14 @@ struct App : Window {
                 throw std::runtime_error(err == "no data lines found" ? "Nothing the program can decode was found in this recording." : err);
             }
             prepareFinds(*res, [&](const std::string &s) { pr.step(s); pr.log(s); });
+            // всё распознанное — сразу в папку результатов: каждая страница и подстраница текстом (pages/),
+            // html, png, clean.t42 — как «Save pages» в окне захвата, только без нажатия
+            if (!res->teletext.project.empty()) {
+                pr.step("saving the pages next to the recording");
+                std::string out = ends_with_i(f, ".t42") || ends_with_i(f, ".t34") ? res->teletext.project : legacyReportDir(f);
+                try { pr.log(exportResult(*res, out, pr)); }
+                catch (std::exception &e) { pr.log(std::string("the pages were not saved: ") + e.what()); }
+            }
         }, [this, res](bool ok) { if (ok) show_results(res); });
     }
     void show_results(const ResultPtr &r)

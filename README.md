@@ -33,7 +33,7 @@ processor.
 
 ## Installing and running
 
-**Windows 10/11:** run `TeletextRescue-Setup-v1.5.exe` (64-bit) or `TeletextRescue-Setup-v1.5-x86.exe`
+**Windows 10/11:** run `TeletextRescue-Setup-v1.6.exe` (64-bit) or `TeletextRescue-Setup-v1.6-x86.exe`
 (32-bit), or unpack the zip of the same name. Nothing else is needed.
 
 **File → Open .vbi recording…** — the recording is examined and decoded; the results are saved in one
@@ -53,6 +53,32 @@ trcli recording.vbi --export out        # write everything decoded into the fold
 trcli recording.vbi --cpu               # on the processor (--gpu: on the graphics card)
 trcli recording.vbi --again             # decode again instead of opening the saved results
 ```
+
+## What is new in 1.6
+
+- **Teletext pages no longer show over each other** when a recording is opened (in live they were right): a
+  recording of a capture card that drops frames or whose VBI window misses lines was built "field-aware", and
+  most rows of its pages (69-95%) were then filled in from other transmissions — rows of two or three versions,
+  or of another page, on one page (BBC 1 April: the index rows on every page of a recipe). Such a build is not
+  used any more; recordings opened before are built again from the stream they kept (the recording is not read
+  again).
+- **Pages saved as text**: export and opening a recording write every page and subpage as clean UTF-8 text
+  (`pages/100.txt`, `pages/800_2.txt`, all together in `pages/all.txt`) and `teletext/clean.t42` — one assembled
+  copy of every subpage, which the program opens as a stream. In live, **Save pages** asks for the folder once a
+  session and updates it after that (Shift = a new folder); a `.t42` dropped on the capture window is decoded.
+- **TeletextData Petersburg / ТхТ 2/200** (5th channel, St Petersburg): files sent on magazine-8 pages are put
+  together from their blocks — the catalogue on page 800 gives each file's name, size and pages — in recordings
+  and in live.
+- **Бизнес-Текст**: binary files of the service (`.C01`…`.C04`, `.COD`) get a `.txt` with their records and a hex
+  dump in the found files; the files inside a received ARJ archive are listed one by one (texts as UTF-8, PCX
+  pictures as PNG) with their CRC; rows of a block sent apart are put back by the checksum of the catalogue; a
+  1994 batch where no file reads as text is opened with the transport key of the tape of 9.07.94.
+- **InterTVNet** files are found in live too, not only in recordings.
+- **Syster / Nagravision** report: ECM and EMM messages are listed more completely (EMMs sent directly, the
+  operating mode of the messages).
+- **`trcli --follow <recording.vbi>`** (Windows): reads a recording while it is still being written, through the
+  live decoder; the ready pages are written as text every few hundred frames and the session as `live.t42` at
+  the end.
 
 ## What is new in 1.5
 
