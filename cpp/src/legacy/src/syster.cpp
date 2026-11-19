@@ -258,7 +258,7 @@ std::string analyse_blocks(const std::vector<std::pair<int, std::array<u8, 168>>
     std::vector<Emm> emms; std::set<std::string> seen; int fill = 0;
     for (auto &m : msgs) {
         for (int w = 0; w < 2; w++) {
-            if (!w && std::make_pair(m1(m.second)[0], (m1(m.second)[1] >> 3) | ((m1(m.second)[0] & 1) << 5)) != mode) continue;
+            if (!w && std::make_pair((int)m1(m.second)[0], (m1(m.second)[1] >> 3) | ((m1(m.second)[0] & 1) << 5)) != mode) continue;
             if (w && opmode >= 0 && (m2(m.second)[1] << 8 | m2(m.second)[2]) != opmode) continue;
             const u8 *e = (w ? m2(m.second) : m1(m.second)) + 12;
             if (e[1] == 0xFF && e[2] == 0xFF && e[3] == 0xFF) { fill++; continue; }
@@ -507,7 +507,7 @@ int syster_report(const Rec &R, const std::vector<int> &rows0, const std::string
     for (auto &p : pk) {
         if (!p.ok || p.d[1] != SEQ[8]) continue;
         const u8 *a = &p.d[2];
-        if (std::make_pair(a[0], (a[1] >> 3) | ((a[0] & 1) << 5)) != mode) continue;
+        if (std::make_pair((int)a[0], (a[1] >> 3) | ((a[0] & 1) << 5)) != mode) continue;
         EcmHalf h{ p.u, ((a[1] & 7) << 4) | (a[2] >> 4), a[2] & 15, {} };
         memcpy(h.h.data(), a + 3, 8); raw_halves.push_back(h);
     }
@@ -530,7 +530,7 @@ int syster_report(const Rec &R, const std::vector<int> &rows0, const std::string
             std::array<u8, 84> m; int k = 0;
             for (int i : order[w]) for (u8 v : b.part[i]) m[k++] = v;
             if (!w) {
-                if (std::make_pair(m[0], (m[1] >> 3) | ((m[0] & 1) << 5)) != mode) continue;
+                if (std::make_pair((int)m[0], (m[1] >> 3) | ((m[0] & 1) << 5)) != mode) continue;
             } else if (opmode >= 0 && (m[1] << 8 | m[2]) != opmode) continue;
             if (m[12] != 0) continue;
             DirectEmm x{ b.u, w, {} }; memcpy(x.d.data(), m.data() + 12, 72); direct_emms.push_back(x);

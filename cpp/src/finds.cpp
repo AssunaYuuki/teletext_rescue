@@ -793,7 +793,7 @@ void addTeledataFinds(std::vector<Find>& out, const TeledataPages& t, const std:
                 if (!b && last)
                     for (const TeledataBlock* candidate : candidates)
                         if (candidate->mixed == textExt) { b = candidate; break; }
-                size_t take = std::min(kTeledataBlockBytes, f.size - data.size());
+                size_t take = (size_t)std::min<uint64_t>(kTeledataBlockBytes, f.size - data.size());   // uint64_t: size_t is 32 bits on x86
                 if (!b) {
                     missing.push_back(fmt("%03X/%02X", 0x800 | p, sub));
                     data.resize(data.size() + take, 0);
