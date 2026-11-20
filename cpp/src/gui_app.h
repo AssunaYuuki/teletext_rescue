@@ -50,6 +50,7 @@ void sign_window(HWND owner, const ResultPtr &r);
 void amol_window(HWND owner, const ResultPtr &r);
 void gemstar_window(HWND owner, const ResultPtr &r);
 void jtes_window(HWND owner, const ResultPtr &r);
+void antiope_window(HWND owner, const ResultPtr &r);
 void tvinform_window(HWND owner, const ResultPtr &r);
 // files and texts the recording brought (finds.h); the live one asks source() every 2 s
 void finds_window(HWND owner, const ResultPtr &r);

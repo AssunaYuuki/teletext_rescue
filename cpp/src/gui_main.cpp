@@ -35,6 +35,7 @@ void open_service(HWND owner, const ResultPtr &r, const Service &s)
     case ServiceWindow::Data: data_window(owner, r, s.dataKind); break;
     case ServiceWindow::Gemstar: gemstar_window(owner, r); break;
     case ServiceWindow::Jtes: jtes_window(owner, r); break;
+    case ServiceWindow::Antiope: antiope_window(owner, r); break;
     case ServiceWindow::Tvinform: tvinform_window(owner, r); break;
     case ServiceWindow::Finds: finds_window(owner, r); break;
     case ServiceWindow::LegacyFile:

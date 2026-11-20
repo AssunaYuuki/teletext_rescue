@@ -217,12 +217,23 @@ std::string exportResult(const DecodeResult& r, const std::string& dir, Progress
             std::string from = dirname(lr.path), to = path_join(dir, "antiope");
             make_dirs(to);
             int n = 0;
-            std::error_code ec;
-            for (std::filesystem::directory_iterator it(std::filesystem::u8path(from), ec), end; !ec && it != end; it.increment(ec)) {
-                const std::string f = it->path().filename().u8string();
-                if (f.size() > 4 && f.compare(f.size() - 4, 4, ".txt") == 0) { write_text(path_join(to, f), read_text(path_join(from, f))); n++; }
+            if (!r.antiopeData.pages.empty() && from != to) {   // drawn again: the pages, their pictures and the viewer
+                antiopeWrite(r.antiopeData, to);
+                n = (int)r.antiopeData.pages.size();
+            } else {
+                std::error_code ec;
+                for (std::filesystem::directory_iterator it(std::filesystem::u8path(from), ec), end; !ec && it != end; it.increment(ec)) {
+                    const std::string f = it->path().filename().u8string();
+                    if (f.size() > 4 && f.compare(f.size() - 4, 4, ".txt") == 0 && f != "all.txt") n++;
+                    if (from != to && f.size() > 4 && (f.compare(f.size() - 4, 4, ".txt") == 0 || f.compare(f.size() - 4, 4, ".png") == 0 ||
+                                                       f.compare(f.size() - 5, 5, ".html") == 0))
+                    {
+                        std::error_code ec2;
+                        std::filesystem::copy_file(it->path(), std::filesystem::u8path(path_join(to, f)), std::filesystem::copy_options::overwrite_existing, ec2);
+                    }
+                }
             }
-            done.push_back(fmt("antiope/ (%d pages as text, all.txt)", n - 1));
+            done.push_back(fmt("antiope/ (%d pages: index.html, PNG, text, all.txt)", n));
         }
     }
     if (!r.xds.empty()) put("xds.txt", join(r.xds));

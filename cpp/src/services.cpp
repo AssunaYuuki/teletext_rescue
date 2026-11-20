@@ -121,6 +121,13 @@ std::vector<Service> services_of(const DecodeResult &r)
             for (auto& pg : r.jtes.pages) progs.insert(pg.programme);
             s.name = "Japanese teletext (\xE6\x96\x87\xE5\xAD\x97\xE5\xA4\x9A\xE9\x87\x8D\xE6\x94\xBE\xE9\x80\x81)"; s.kind = "teletext"; s.window = ServiceWindow::Jtes;
             s.note = fmt("%zu pages in %zu programmes", r.jtes.pages.size(), progs.size());
+        } else if (k.rfind("Antiope", 0) == 0) {
+            if (r.antiopeData.pages.empty()) continue;
+            std::set<std::string> nums;
+            for (auto& pg : r.antiopeData.pages) nums.insert(pg.number);
+            s.name = "Antiope pages (French teletext)"; s.kind = "teletext"; s.window = ServiceWindow::Antiope;
+            s.note = fmt("%zu pages, %zu texts", nums.size(), r.antiopeData.pages.size()) +
+                     (r.antiopeData.service.empty() ? std::string() : " \xC2\xB7 " + r.antiopeData.service);
         } else if (k == "Gemstar") {
             size_t n = 0; for (auto &g : r.gemstar) n += g.messages.size();
             s.name = "Gemstar (VCR Plus+ / Guide Plus+)"; s.kind = "Gemstar"; s.window = ServiceWindow::Gemstar;
@@ -166,6 +173,7 @@ std::vector<Service> services_of(const DecodeResult &r)
     // everything else the Teletext Rescue engine saved in the results folder (VPS, Syster, TOP, ...)
     for (auto &x : r.legacy.results) {
         if (x.kind == "teletext_project") continue;
+        if (x.kind == "antiope" && !r.antiopeData.pages.empty()) continue;   // its own window
         Service s;
         s.name = x.service; s.kind = x.service; s.note = x.note.empty() ? basename(x.path) : x.note;
         s.where = "results folder"; s.window = ServiceWindow::LegacyFile; s.dataKind = x.path;

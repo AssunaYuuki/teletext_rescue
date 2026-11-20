@@ -12,6 +12,7 @@
 #include "legacy_bridge.h"
 #include "vitc.h"
 #include "finds.h"
+#include "antiope.h"
 #include <map>
 #include <memory>
 #include <atomic>
@@ -82,6 +83,7 @@ struct DecodeResult {
     std::vector<std::string> vpsReport;    // VPS (line 16): [0] = the headline, then everything the line tells (vpsAnalyse)
     std::vector<std::string> videocrypt;   // VideoCrypt I / II data lines: [0] = the headline, then the report (videocrypt.h)
     std::vector<std::string> antiope;      // Antiope (Didon) pages: [0] = the headline, then the report (antiope.h)
+    AntiopeResult antiopeData;             // the Antiope pages themselves (drawn by antiopeImage)
     std::map<int, LineForce> lineForce;    // line types the user set by hand for this decoding
     std::vector<std::string> xds;
     std::vector<SilentRadioMessage> silentRadio;

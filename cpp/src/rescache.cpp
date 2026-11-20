@@ -6,13 +6,14 @@
 namespace {
 
 constexpr uint32_t kMagic = 0x31435254;   // "TRC1"
-constexpr uint32_t kVersion = 29;          // bump when a saved structure changes (23: layout choice and captions of
+constexpr uint32_t kVersion = 30;          // bump when a saved structure changes (23: layout choice and captions of
                                             // channel-changing NTSC captures - results saved before are decoded again;
                                             // 24: the VPS report; 25: VPS text read through lost frames, time of the broadcast;
                                             // 26: ТВ-информ files from damaged blocks, their text;
                                             // 27: teletext pages of a field-aware build that filled most rows from other
                                             // transmissions are built again - pages showed over each other;
-                                            // 28: VideoCrypt data lines read and named; 29: Antiope pages)
+                                            // 28: VideoCrypt data lines read and named; 29: Antiope pages;
+                                            // 30: Antiope pages drawn: colours, sizes, mosaics)
 
 // One archive type for both directions: R = reading.
 template <bool R> struct Ar {
@@ -140,12 +141,17 @@ template <bool R> void io(Ar<R>& a, JtesPage& p)
 }
 template <bool R> void io(Ar<R>& a, JtesResult& j) { all(a, j.packets, j.clean, j.fixed, j.failed, j.groups, j.channels, j.pages, j.report); }
 
+// Antiope
+template <bool R> void io(Ar<R>& a, AntiopeCell& c) { all(a, c.ch, c.mosaic, c.fg, c.bg, c.flags); }
+template <bool R> void io(Ar<R>& a, AntiopePage& p) { all(a, p.number, p.copies, p.rows, p.cells, p.screen); }
+template <bool R> void io(Ar<R>& a, AntiopeResult& x) { all(a, x.rows, x.tvLines, x.rates, x.packets, x.channel, x.groups, x.pages, x.service); }
+
 template <bool R> void io(Ar<R>& a, DecodeResult& r)
 {
     all(a, r.path, r.source, r.captureNotes, r.geom, r.slicerName, r.sliceSeconds, r.totalSeconds, r.lines, r.db, r.captions,
         r.xds, r.silentRadio, r.amol, r.gemstar, r.tvinform, r.fieldsSwapped, r.fastPackets, r.fastReport, r.fastText,
         r.nabtsT33, r.nabtsField, r.nabtsLine, r.legacy, r.teletext, r.colour, r.log, r.jtes, r.captionCues, r.vitc, r.vitcReport, r.lineForce, r.timeCode, r.vpsReport,
-        r.videocrypt, r.antiope);
+        r.videocrypt, r.antiope, r.antiopeData);
 }
 
 // size and modification time of the recording: saved results only fit the same file

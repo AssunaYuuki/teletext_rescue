@@ -67,9 +67,11 @@ trcli recording.vbi --again             # decode again instead of opening the sa
   are rebuilt by the row and column codes together. WaveTop gets the records the old reading missed; other channels
   with this protection are written as `datacast_<address>.bin`.
 - **Antiope, the French teletext**: the Didon packets (6.2 Mbit/s) of French recordings of the 1980s are read with the
-  per-line channel decoder, and the Antiope pages are put together, voted over their copies and written as text
-  (`antiope/<page>.txt`, `all.txt`) — accents, positions on the screen, mosaics. Antenne 2, January 1986: the
-  SAVOIR/A2 service, 99 pages (news, sports, exchange rates, books, the viewers' poll).
+  per-line channel decoder, and the Antiope pages are put together and voted over their copies. They are drawn as
+  the receiver showed them — the colour of the screen, colours, double height and width, mosaics, accents, concealed
+  text — and shown in their own window, written as pictures and text (`antiope/<page>.png`, `.txt`, `all.txt`) with
+  a page viewer (`antiope/index.html`). Antenne 2, January 1986: the SAVOIR/A2 service, 99 pages (news, sports,
+  exchange rates, books, the viewers' poll).
 - **VideoCrypt lines named and read**: the blocks on lines 8-15 / 321-328 of satellite recordings of the 1990s
   (MTV Europe 1995) are VideoCrypt I and II data — the lines are named so, and their messages are read, checked and
   listed in `videocrypt.txt` with what each says: soft-scrambled (any decoder shows the picture) or for card holders,

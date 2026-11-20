@@ -11,6 +11,7 @@
 #include "ssjson.h"
 #include "slicer.h"
 #include "faxg4.h"
+#include "png.h"
 #include <set>
 #include <windowsx.h>
 #include <algorithm>
@@ -1522,6 +1523,126 @@ struct JtesWin : Window {
     }
 };
 
+// ================================================================ Antiope
+// The pages as the receiver showed them (colours, double size, mosaics), one row per page and text; the page's text
+// below the picture. "Reveal" shows the concealed text (the editor's stamp of row 24).
+struct AntiopeWin : Window {
+    ResultPtr R;
+    Header hd; HWND lst = nullptr, txt = nullptr, revealBtn = nullptr;
+    RECT pic{};
+    int sel = -1;
+    bool reveal = false;
+    Image img;
+    std::vector<std::string> names;
+    const AntiopePage *cur() const { return sel >= 0 && sel < (int)R->antiopeData.pages.size() ? &R->antiopeData.pages[sel] : nullptr; }
+    void select(int i)
+    {
+        sel = i;
+        const AntiopePage *p = cur();
+        if (!p) return;
+        img = antiopeImage(*p, reveal);
+        std::string t;
+        for (auto &row : p->rows) t += row + "\r\n";
+        while (t.size() >= 4 && t.compare(t.size() - 4, 4, "\r\n\r\n") == 0) t.resize(t.size() - 2);
+        set_text(txt, t);
+        InvalidateRect(hwnd, &pic, FALSE);
+    }
+    void paint(HDC dc, RECT)
+    {
+        fill(dc, pic, RGB(0x11, 0x11, 0x11));
+        if (img.w <= 0) return;
+        // 40 x 25 cells on a 4:3 screen: the cells a little wider than the 12 x 20 picture
+        int aw = pic.right - pic.left - S(hwnd, 16), ah = pic.bottom - pic.top - S(hwnd, 16);
+        double ar = 1.2;
+        int w = std::min(aw, (int)(ah * ar)), h = (int)(w / ar);
+        int x = pic.left + (pic.right - pic.left - w) / 2, y = pic.top + (pic.bottom - pic.top - h) / 2;
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = img.w; bi.bmiHeader.biHeight = -img.h;
+        bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+        SetStretchBltMode(dc, COLORONCOLOR);
+        StretchDIBits(dc, x, y, w, h, 0, 0, img.w, img.h, img.px.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+    }
+    LRESULT proc(UINT m, WPARAM w, LPARAM l) override
+    {
+        switch (m) {
+        case WM_CREATE: {
+            dark_window(hwnd);
+            const AntiopeResult &A = R->antiopeData;
+            names = antiopeNames(A);
+            std::set<std::string> nums;
+            for (auto &p : A.pages) nums.insert(p.number);
+            hd.create(hwnd, "Antiope pages", (A.service.empty() ? std::string() : A.service + " \xC2\xB7 ") +
+                                                 fmt("French teletext (BT.653 system A), channel %s \xC2\xB7 %zu pages, %zu texts \xC2\xB7 ",
+                                                     A.channel.c_str(), nums.size(), A.pages.size()) + file_name(*R));
+            revealBtn = hd.add(hwnd, 405, "Reveal: off", 110);
+            hd.add(hwnd, 402, "Export\xE2\x80\xA6", 100);
+            hd.add(hwnd, 403, "Text report", 110);
+            lst = listview(hwnd, 10, {{"Page", 64}, {"Copies", 60}, {"Title", -60}});
+            for (size_t i = 0; i < A.pages.size(); i++) {
+                lv_set(lst, (int)i, 0, names[i]);
+                lv_set(lst, (int)i, 1, fmt("%d", A.pages[i].copies));
+                lv_set(lst, (int)i, 2, antiopeTitle(A.pages[i]));
+            }
+            txt = edit(hwnd, 0, "", ES_MULTILINE | ES_READONLY | WS_VSCROLL | WS_HSCROLL | ES_AUTOVSCROLL);
+            HFONT mf = CreateFontW(-S(hwnd, 13), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
+            SendMessageW(txt, WM_SETFONT, (WPARAM)mf, TRUE);
+            if (!A.pages.empty()) ListView_SetItemState(lst, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+            return 0;
+        }
+        case WM_SIZE: {
+            RECT rc; GetClientRect(hwnd, &rc);
+            int p = S(hwnd, 14), y = hd.layout(hwnd);
+            int lw = std::min((int)S(hwnd, 420), (int)(rc.right - 2 * p) * 2 / 5);
+            MoveWindow(lst, p, y, lw, std::max(0L, rc.bottom - y - p), TRUE);
+            int x0 = p + lw + S(hwnd, 10), th = S(hwnd, 190);
+            pic = {x0, y, rc.right - p, std::max<LONG>(y + S(hwnd, 100), rc.bottom - p - th - S(hwnd, 10))};
+            MoveWindow(txt, x0, pic.bottom + S(hwnd, 10), rc.right - p - x0, std::max(0L, rc.bottom - p - pic.bottom - S(hwnd, 10)), TRUE);
+            InvalidateRect(hwnd, nullptr, TRUE);
+            return 0;
+        }
+        case WM_PAINT: paint_buffered(hwnd, [this](HDC dc, RECT rc) { paint(dc, rc); }); return 0;
+        case WM_ERASEBKGND: return 1;
+        case WM_NOTIFY: {
+            auto *nh = (NMHDR *)l;
+            if (nh->hwndFrom == lst && nh->code == LVN_ITEMCHANGED) {
+                int i = ListView_GetNextItem(lst, -1, LVNI_SELECTED);
+                if (i >= 0 && i != sel) select(i);
+            }
+            return 0;
+        }
+        case WM_COMMAND: {
+            int id = LOWORD(w);
+            if (id == 405) {
+                reveal = !reveal;
+                set_text(revealBtn, reveal ? "Reveal: on" : "Reveal: off");
+                InvalidateRect(revealBtn, nullptr, TRUE);
+                select(sel);
+            } else if (id == 402) {
+                std::string d = pick_folder(hwnd, "Export the Antiope pages");
+                if (!d.empty()) {
+                    std::string out = path_join(d, stem_path(file_name(*R)) + "_antiope");
+                    antiopeWrite(R->antiopeData, out);
+                    ask(hwnd, "Export", fmt("%zu pages written to %s (index.html, PNG, text).", R->antiopeData.pages.size(), out.c_str()), MB_ICONINFORMATION);
+                }
+            } else if (id == 403) {
+                std::string s;
+                for (auto &x : R->antiope) s += x + "\n";
+                s += "\n";
+                for (size_t i = 0; i < R->antiopeData.pages.size(); i++) {
+                    auto &p = R->antiopeData.pages[i];
+                    s += fmt("===== page %s (%d copies) =====\n", names[i].c_str(), p.copies);
+                    for (auto &row : p.rows) s += row + "\n";
+                }
+                text_window(hwnd, "Antiope \xE2\x80\x94 " + file_name(*R), "every page as text", s);
+            }
+            return 0;
+        }
+        case WM_NCDESTROY: { LRESULT r = Window::proc(m, w, l); delete this; return r; }
+        }
+        return Window::proc(m, w, l);
+    }
+};
+
 // ================================================================ ТВ-информ
 // One row per line that carries it; for the chosen line a card (what it is) and its text:
 // the document sent, or the inserter's test message; "Packets" shows every chunk as received.
@@ -1810,6 +1931,11 @@ void jtes_window(HWND owner, const ResultPtr &r)
 {
     auto *w = new JtesWin; w->R = r;
     open_window(w, owner, L"TRJtes", "Japanese teletext \xE2\x80\x94 " + file_name(*r), 1240, 820);
+}
+void antiope_window(HWND owner, const ResultPtr &r)
+{
+    auto *w = new AntiopeWin; w->R = r;
+    open_window(w, owner, L"TRAntiope", "Antiope \xE2\x80\x94 " + file_name(*r), 1280, 900);
 }
 void captions_window(HWND owner, const ResultPtr &r)
 {

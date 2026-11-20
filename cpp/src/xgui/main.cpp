@@ -455,6 +455,20 @@ void open_service(const ResultPtr &r, const Service &s)
     case ServiceWindow::Tvinform:
         text_window("TV-Inform \xE2\x80\x94 " + ui::file_name(*r), "\xD0\xA2\xD0\x92-\xD0\xB8\xD0\xBD\xD1\x84\xD0\xBE\xD1\x80\xD0\xBC (GOST R 50822-95), voted carousel pages", ui::tvinform_text(*r));
         break;
+    case ServiceWindow::Antiope: {   // the page viewer the decoding wrote (antiope/index.html), else the pages as text
+        std::string html;
+        for (auto &x : r->legacy.results)
+            if (x.kind == "antiope") html = path_join(dirname(x.path), "index.html");
+        if (!html.empty() && exists(html)) { open_path(html); break; }
+        std::string t;
+        auto names = antiopeNames(r->antiopeData);
+        for (size_t i = 0; i < r->antiopeData.pages.size(); i++) {
+            t += "===== page " + names[i] + " =====\n";
+            for (auto &row : r->antiopeData.pages[i].rows) t += row + "\n";
+        }
+        text_window("Antiope \xE2\x80\x94 " + ui::file_name(*r), "French teletext pages", t);
+        break;
+    }
     case ServiceWindow::LegacyFile:
         if (ends_with_i(s.dataKind, ".txt")) text_window(s.name + " \xE2\x80\x94 " + ui::file_name(*r), s.note, read_text(s.dataKind));
         else open_path(s.dataKind);

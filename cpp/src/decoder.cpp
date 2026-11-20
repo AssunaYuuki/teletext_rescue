@@ -704,6 +704,7 @@ static VpsClocks vpsClocksOf(const DecodeResult& res, const std::string& path)
 static void applyAntiope(DecodeResult& res, const DecodeOptions& opt, const std::string& path, const AntiopeResult& a)
 {
     if (a.rows.empty()) return;
+    res.antiopeData = a;
     for (size_t i = 0; i < a.rows.size(); i++) {
         LineInfo* li = nullptr;
         for (auto& x : res.lines) if (x.index == a.rows[i]) li = &x;
