@@ -762,6 +762,13 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
                 if (uni.size() >= 8 && per.size() >= 4) {
                     std::sort(per.begin(), per.end());
                     whole = per[per.size() / 4] * 10 >= (int)uni.size() * 8;   // three quarters bring 80% of the rows
+                    // a capture that loses frames cuts some transmissions short (1tv.vbi 101: 12-18 rows of 23 in a
+                    // third of them), and the rotation of texts in its right column was gathered row by row into
+                    // snapshots that mixed the texts. Whole too when three transmissions at least, and a third of all,
+                    // brought 80% of the rows (101 0001: 3 of 8): a torn tape (tvinfoorm), where few come whole, stays
+                    size_t full = 0;
+                    for (int n : per) full += n * 10 >= (int)uni.size() * 8;
+                    if (!whole && full >= 3 && 3 * full >= per.size()) whole = true;
                 }
             }
             // rows that change between whole transmissions, a variant seen once included
@@ -993,8 +1000,33 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
             if (bestMM && gn >= 2 && bn >= 3) {
                 byCounter = true;
                 std::set<long> used;
+                // transmissions under one number that carry different texts (1tv.vbi 101 "01/01": the right column
+                // turns through several texts, each sent once or twice): a row two of them carry more than 12
+                // characters apart, in two rows at least, is no tape damage - the number is built as a page of its own
+                // (rotation or snapshots below), not voted row by row into one mix of the texts
+                auto differ = [&](const std::vector<const Tx *> &ts) {
+                    auto mosaic = [](const R40 &r) { for (u8 c : r) if ((c & 0x7F) >= 0x10 && (c & 0x7F) <= 0x17) return true; return false; };
+                    std::map<int, std::vector<const R40 *>> by;
+                    for (auto *t : ts) for (auto &rb : *t->rows) if (rb.first >= 1 && rb.first <= 23 && informative(rb.second) && !mosaic(rb.second)) by[rb.first].push_back(&rb.second);
+                    int rows = 0;
+                    for (auto &kv2 : by) {
+                        bool d = false;
+                        for (size_t a = 0; a < kv2.second.size() && !d; a++)
+                            for (size_t b = a + 1; b < kv2.second.size() && !d; b++) d = dist(*kv2.second[a], *kv2.second[b]) > 12;
+                        rows += d;
+                    }
+                    return rows >= 2;
+                };
                 for (auto &x : byCtr) {
                     if (mmOf[x.first] != bestMM) continue;
+                    if (x.second.size() >= 2 && differ(x.second)) {
+                        std::vector<TT> T;
+                        for (auto *t : x.second) { used.insert(t->i); T.push_back({t->i, t->rows, t->has_sub ? t->sub : "0000"}); }
+                        std::stable_sort(T.begin(), T.end(), [](const TT &a, const TT &b) { return a.i < b.i; });
+                        auto vs = build(T);
+                        for (auto &v : vs) { v.s = T[0].sub; out.push_back(v); }
+                        continue;
+                    }
                     Version v; v.t = x.second[0]->i; v.n = (int)x.second.size();
                     std::map<int, std::vector<const R40 *>> mem;
                     for (auto *t : x.second) { used.insert(t->i); for (auto &rb : *t->rows) mem[rb.first].push_back(&rb.second); }

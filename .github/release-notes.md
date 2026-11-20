@@ -3,6 +3,19 @@
 
 ### What is new in 1.6
 
+- **Pages of a rotation stay apart**: a page that turns through several texts under one subcode or one number
+  (TELEINF 101: championships, exchange rates, tours ...) is shown as one subpage a text, also in the text and picture
+  export; before, the export voted them row by row into one mix, and a page whose transmissions a capture cut short
+  was not taken for a rotation at all.
+- **Rows no page shows** are written to `unplaced_rows.txt` — versions of pages whose header was lost, rows a service
+  sent without a page — instead of being guessed onto a page.
+- **NABTS datacasts with error correction**: each row is put right by its own code, the bundle's layout (how many
+  data rows, which check rows are sent, before or after their data) is learnt from the stream, lost and damaged rows
+  are rebuilt by the row and column codes together. WaveTop gets the records the old reading missed; other channels
+  with this protection are written as `datacast_<address>.bin`.
+- **VideoCrypt lines named and read**: the blocks on lines 8-15 / 321-328 of satellite recordings of the 1990s
+  (MTV Europe 1995) are VideoCrypt I and II data — the lines are named so, and their messages are read, checked and
+  listed in `videocrypt.txt`.
 - **Teletext pages no longer show over each other** when a recording is opened (in live they were right): a
   recording of a capture card that drops frames or whose VBI window misses lines was built "field-aware", and
   most rows of its pages (69-95%) were then filled in from other transmissions — rows of two or three versions,

@@ -1,4 +1,5 @@
 #include "decoder.h"
+#include "videocrypt.h"
 #include "ui/util.h"
 #include "jtes.h"
 #include "jtesrx.h"
@@ -698,6 +699,41 @@ static VpsClocks vpsClocksOf(const DecodeResult& res, const std::string& path)
 // engine's "interference (2.50 MHz sine)" for a label of all ones), its report and every frame's bytes in the results folder.
 // The report is made again with the clocks of the recording (teletext, VITC): the time of the broadcast and frames
 // the capture lost
+// the VideoCrypt lines named (the old engine called them "unknown signal (0.06 MHz peak)") and its messages in
+// <recording>_vbi/videocrypt.txt; after the old engine, which names the lines it found
+static void applyVideocrypt(DecodeResult& res, const DecodeOptions& opt, const std::string& path, const std::vector<VcStream>& vc)
+{
+    if (vc.empty()) return;
+    for (auto& v : vc) {
+        double rate = v.frames ? (double)v.halves / v.frames : 0;
+        for (int row : v.rows) {
+            LineInfo* li = nullptr;
+            for (auto& x : res.lines) if (x.index == row) li = &x;
+            if (li && (li->mode == MODE_TVINFORM || li->mode == MODE_FAST || li->mode == MODE_CC)) continue;   // a service our slicers read wins
+            if (!li) {
+                res.lines.emplace_back();
+                li = &res.lines.back();
+                li->index = row;
+                lineOf(res.geom, row, li->lineNo, li->field);
+            }
+            li->mode = MODE_TEST + 1;
+            li->detectRate = rate;
+            li->tviRate = 1;
+            li->kind = v.system == 1 ? "VideoCrypt I data (scrambling system)" : "VideoCrypt II data (scrambling system)";
+        }
+    }
+    std::sort(res.lines.begin(), res.lines.end(), [](const LineInfo& a, const LineInfo& b) { return a.index < b.index; });
+    try {
+        std::string dir = legacyReportDir(opt.sourcePath.empty() ? path : opt.sourcePath);
+        make_dirs(dir);
+        write_text(path_join(dir, "videocrypt.txt"), videocryptMessagesText(vc));
+        res.legacy.results.erase(std::remove_if(res.legacy.results.begin(), res.legacy.results.end(), [](const LegacyResult& x) { return x.kind == "videocrypt"; }),
+                                 res.legacy.results.end());
+        res.legacy.results.push_back({"VideoCrypt messages (scrambling system data)", "videocrypt", path_join(dir, "videocrypt.txt"),
+                                      res.videocrypt.empty() ? std::string() : res.videocrypt[0]});
+    } catch (...) {}
+}
+
 static void applyVps(DecodeResult& res, const DecodeOptions& opt, const std::string& path, int row, const VpsFile& v0, double rate,
                      const std::vector<VpsExtra>& extra)
 {
@@ -1121,6 +1157,15 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
             for (auto& l : vpsFile.report) note(l);
         }
     }
+    // VideoCrypt I / II (lines 8-15 / 321-328, 40 bits a line): what showed as blocks on those lines (MTV Europe 1995)
+    std::vector<VcStream> vcStreams;
+    if (g.pal) {
+        progress(0, "VideoCrypt: reading its lines in every frame");
+        vcStreams = videocryptPass(vf, g, frames, [&](double f) { progress(f, "VideoCrypt: reading its lines in every frame"); }, opt.cancel);
+        if (opt.cancel && *opt.cancel) { err = "cancelled"; return false; }
+        res.videocrypt = videocryptReport(vcStreams);
+        for (auto& l : res.videocrypt) note(l);
+    }
     std::vector<float> out;
     auto cpu = makeCpuSlicer(opt.threads);
     cpu->run(probe.data(), probeN, g, all, out, err);
@@ -1426,6 +1471,7 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
             if (!runLegacy(res, opt, path, note, err)) return false;
             liveTeletext(res, opt, path, note);
             applyVps(res, opt, path, vpsRow, vpsFile, vpsRate, vpsExtra);   // after the teletext: its clock goes in the VPS report
+            applyVideocrypt(res, opt, path, vcStreams);
             recheckCharset(res, note);
             res.totalSeconds = now() - t0;
             saveReport(res, opt, path);
@@ -2095,6 +2141,7 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
     if (g.pal && !runLegacy(res, opt, path, note, err)) return false;
     if (g.pal) liveTeletext(res, opt, path, note);
     if (g.pal) applyVps(res, opt, path, vpsRow, vpsFile, vpsRate, vpsExtra);   // after the teletext: its clock goes in the VPS report
+    if (g.pal) applyVideocrypt(res, opt, path, vcStreams);
     recheckCharset(res, note);
     res.totalSeconds = now() - t0;
     saveReport(res, opt, path);
@@ -2182,9 +2229,11 @@ std::vector<std::string> headline(const DecodeResult& r)
     else
         h.push_back("Teletext: none");
     if (!r.vpsReport.empty()) h.push_back(r.vpsReport[0]);
+    if (!r.videocrypt.empty()) h.push_back(r.videocrypt[0]);
     std::vector<std::string> other;
     for (auto& li : r.lines) {
         if (!r.vpsReport.empty() && li.kind.rfind("VPS", 0) == 0) continue;
+        if (!r.videocrypt.empty() && li.kind.rfind("VideoCrypt", 0) == 0) continue;
         if (li.mode == MODE_TVINFORM ||li.mode == MODE_TEST || li.kind.rfind("TV-Inform", 0) == 0 || li.kind.find("WST") != std::string::npos || li.kind == "Teletext stream" ||
             li.kind.rfind("picture", 0) == 0 || li.kind.rfind("Test", 0) == 0)
             continue;
@@ -2246,6 +2295,10 @@ std::string summarize(const DecodeResult& r)
     }
     if (r.vpsReport.size() > 1) {
         for (size_t i = 1; i < r.vpsReport.size(); i++) s += r.vpsReport[i] + "\r\n";
+        s += "\r\n";
+    }
+    if (r.videocrypt.size() > 1) {
+        for (size_t i = 1; i < r.videocrypt.size(); i++) s += r.videocrypt[i] + "\r\n";
         s += "\r\n";
     }
     if (!isDvb(r)) s += "Lines:\r\n";

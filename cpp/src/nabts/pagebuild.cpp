@@ -924,6 +924,13 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
                 if (uni.size() >= 8 && per.size() >= 4) {
                     std::sort(per.begin(), per.end());
                     whole = per[per.size() / 4] * 10 >= (int)uni.size() * 8;   // three quarters bring 80% of the rows
+                    // a capture that loses frames cuts some transmissions short (1tv.vbi 101: 12-18 rows of 23 in
+                    // half of them), and the texts its right column turns through were gathered row by row into
+                    // snapshots that mixed them. Whole too when three transmissions at least, and a third of all,
+                    // brought 80% of the rows: a torn tape (tvinfoorm), where few come whole, stays as it was
+                    size_t full = 0;
+                    for (int n : per) full += n * 10 >= (int)uni.size() * 8;
+                    if (!whole && full >= 3 && 3 * full >= per.size()) whole = true;
                 }
             }
             // rows that change between whole transmissions, a variant seen once included

@@ -5,6 +5,94 @@
 #include "slicer.h"
 #include "wavetop.h"
 #include "project.h"
+#include "pagebuild.h"
+
+// Rows of the teletext stream that no page shows: a display packet (rows 1-24) whose text is on no page of its
+// magazine - a version of a page whose header was lost, rows a service sent without a page, a row whose address was
+// misread. The page builder does not guess them onto a page (guessed rows were what put pages over each other), so they
+// are listed apart: in the order they first came, each text once with the copies of it that came (copies that differ
+// in a few characters, as a tape reads them, count as one). A row is on a page when its text is there exactly on any
+// row of the magazine's pages, or on the same row with at most 4 characters different.
+static std::string unplaced_rows(const Project &P, const Pages &pages, int &listed)
+{
+    listed = 0;
+    std::vector<Packet42> st;
+    try { st = read_t42(P.stream); } catch (...) { return ""; }
+    using R7 = std::array<u8, 40>;
+    auto strip = [](const u8 *p) { R7 r; for (int i = 0; i < 40; i++) r[i] = p[i] & 0x7F; return r; };
+    auto parityOk = [](u8 c) { return (__builtin_popcount(c) & 1) == 1; };
+    std::map<int, std::vector<R7>> placed;   // magazine * 32 + row -> the rows of the pages
+    std::set<std::pair<int, R7>> anyRow;     // magazine, text
+    std::map<int, const Page *> pageOf;      // a page of each magazine, for its character set
+    for (auto &kv : pages) {
+        if (kv.first.empty() || kv.second.deleted) continue;
+        int mag = (kv.first[0] - '0') % 8;
+        if (kv.first[0] < '1' || kv.first[0] > '8') continue;
+        pageOf.emplace(mag, &kv.second);
+        for (auto &v : kv.second.versions)
+            for (auto &rr : v.rows)
+                if (rr.first >= 1 && rr.first <= 24) { R7 x = strip(rr.second.data()); placed[mag * 32 + rr.first].push_back(x); anyRow.insert({mag, x}); }
+    }
+    for (auto &kv : placed) { std::sort(kv.second.begin(), kv.second.end()); kv.second.erase(std::unique(kv.second.begin(), kv.second.end()), kv.second.end()); }
+    struct U { int mag, row; R7 text; Row raw; size_t first; int n; };
+    std::vector<U> out;
+    std::map<std::pair<int, R7>, long> seen;   // magazine * 32 + row, text -> entry of out, -1 = on a page or noise
+    std::map<int, std::vector<size_t>> outOf;  // magazine * 32 + row -> entries
+    long packets = 0;
+    for (size_t i = 0; i < st.size(); i++) {
+        const u8 *p = st[i].data();
+        int a = ham::fix[p[0]], b = ham::fix[p[1]];
+        if (a < 0 || b < 0) continue;
+        int mag = a & 7, row = (a >> 3) | (b << 1), key = mag * 32 + row;
+        if (row < 1 || row > 24) continue;
+        packets++;
+        R7 x = strip(p + 2);
+        auto sk = std::make_pair(key, x);
+        auto it = seen.find(sk);
+        if (it != seen.end()) { if (it->second >= 0) out[it->second].n++; continue; }
+        // noise: fewer than two words (three letters or digits in a row), or more than 8 characters failing their parity
+        int words = 0, run = 0, badParity = 0;
+        for (int k = 0; k < 40; k++) {
+            bool letter = (x[k] >= '0' && x[k] <= '9') || (x[k] >= 'A' && x[k] != 0x7F);
+            run = letter ? run + 1 : 0;
+            words += run == 3;
+            badParity += !parityOk(p[2 + k]);
+        }
+        bool onPage = words < 2 || badParity > 8 || anyRow.count({mag, x});
+        if (!onPage)
+            for (auto &y : placed[key]) {
+                int d = 0;
+                for (int k = 0; k < 40 && d <= 4; k++) d += x[k] != y[k];
+                if (d <= 4) { onPage = true; break; }
+            }
+        if (onPage) { seen[sk] = -1; continue; }
+        long into = -1;   // another copy of a row already listed
+        for (size_t e : outOf[key]) {
+            int d = 0;
+            for (int k = 0; k < 40 && d <= 4; k++) d += x[k] != out[e].text[k];
+            if (d <= 4) { into = (long)e; break; }
+        }
+        if (into >= 0) { out[into].n++; seen[sk] = into; continue; }
+        if (out.size() >= 50000) continue;
+        U u{mag, row, x, Row{}, i, 1};
+        std::copy(p + 2, p + 42, u.raw.begin());
+        seen[sk] = (long)out.size();
+        outOf[key].push_back(out.size());
+        out.push_back(u);
+    }
+    if (out.empty()) return "";
+    std::string s = fmt("Rows of the teletext stream that no page shows: %zu different rows (%ld display packets in the stream).\n"
+                        "Versions of pages whose header was lost, rows a service sent without a page, rows with a misread address.\n"
+                        "In the order they first came; xN = copies received.\n\n", out.size(), packets);
+    for (auto &u : out) {
+        auto pg = pageOf.find(u.mag);
+        const Charset &t = P.table(pg == pageOf.end() ? nullptr : pg->second);
+        std::string text = P.row_text(u.raw, nullptr, u.row, t);
+        s += fmt("packet %7zu  magazine %d row %2d  x%-4d| ", u.first, u.mag ? u.mag : 8, u.row, u.n) + text + "\n";
+    }
+    listed = (int)out.size();
+    return s;
+}
 
 static std::string join(const std::vector<std::string>& v)
 {
@@ -24,17 +112,27 @@ static std::string clockText(double sec)
 // тексты под одним подкодом (0000), разбирается построителем проекта по содержимому.
 static std::vector<Version> subpage_versions(const Project& P, const Page& pg)
 {
+    // the pages of a rotation the builder told apart under one subcode (Version::rot: 1tv.vbi 101 0000, three texts in
+    // its right column) stay apart: voted together they made one page of rows of all three
     std::map<std::string, std::vector<const Version*>> by;
-    std::vector<std::string> order;
-    for (auto& v : pg.versions) { if (!by.count(v.s)) order.push_back(v.s); by[v.s].push_back(&v); }
-    if (order.size() <= 1) return P.full_versions(pg);
+    std::vector<std::string> order, subOf;
+    std::set<std::string> subs;
+    for (auto& v : pg.versions) {
+        std::string key = v.rot >= 0 ? v.s + "#" + std::to_string(v.rot) : v.s;
+        if (!by.count(key)) { order.push_back(key); subOf.push_back(v.s); }
+        by[key].push_back(&v);
+        subs.insert(v.s);
+    }
+    if (subs.size() <= 1) return P.full_versions(pg);
     std::vector<Version> out;
-    for (auto& s : order) {
-        auto& V = by[s];
+    for (size_t oi = 0; oi < order.size(); oi++) {
+        auto& V = by[order[oi]];
+        const std::string& s = subOf[oi];
         const Version* last = V[0];
         for (auto* x : V) if (x->t > last->t) last = x;
         Version r;
         r.s = s;
+        r.rot = last->rot;
         r.t = last->t;
         r.n = 0;
         r.full = true;
@@ -253,6 +351,10 @@ std::string exportResult(const DecodeResult& r, const std::string& dir, Progress
         // WaveTop (WavePhore web-cache datacast, 1998-2000): bundles of 18 packets
         {
             std::vector<int> field = r.nabtsField, line = r.nabtsLine;
+            if (field.size() < r.nabtsT33.size() / 33) {   // a .t33 opened as it is: no field of each packet, their order
+                field.resize(r.nabtsT33.size() / 33); line.assign(field.size(), 0);
+                for (size_t i = 0; i < field.size(); i++) field[i] = (int)i;
+            }
             pr.step("WaveTop files");
             Json w = wavetop_decode_packets(r.nabtsT33, field, line, basename(r.path), path_join(dir, "wavetop"), pr);
             if (w.has("records") && w["records"].num() == 0) {
@@ -261,6 +363,7 @@ std::string exportResult(const DecodeResult& r, const std::string& dir, Progress
                 w = wavetop_decode_packets(r.nabtsT33, field, line, basename(r.path), path_join(dir, "wavetop"), pr);
             }
             if (w.has("records")) done.push_back(fmt("wavetop/ (%d records, %d files intact)", (int)w["records"].num(), (int)w["ok"].num()));
+            if (w.has("datacasts")) done.push_back(fmt("wavetop/datacast_*.bin (%d NABTS FEC datacast channels, wavetop.txt)", (int)w["datacasts"].num()));
         }
         int pages = 0;
         for (auto& rec : r.nabtsRecords) pages += rec.page != nullptr;
@@ -353,6 +456,17 @@ std::string exportResult(const DecodeResult& r, const std::string& dir, Progress
             }
             if (!all.empty()) write_text(path_join(txtdir, "all.txt"), all);
             done.push_back(fmt("pages/ (%d pages as text, all.txt)", ntxt));
+            {
+                pr.step("rows no page shows");
+                int nu = 0;
+                std::string u = unplaced_rows(P, pages, nu);
+                std::string up = path_join(dir, "unplaced_rows.txt");
+                if (!u.empty()) { write_text(up, u); done.push_back(fmt("unplaced_rows.txt (%d rows no page shows)", nu)); }
+                else {   // a list from an earlier pass is not left beside pages that have none
+                    std::error_code ec;
+                    std::filesystem::remove(std::filesystem::u8path(up), ec);
+                }
+            }
             // один собранный экземпляр каждой подстраницы: teletext/clean.t42 — открывается программой как поток
             try { P.squash(pages); done.push_back("teletext/clean.t42 (one assembled copy of each subpage)"); }
             catch (std::exception&) {}

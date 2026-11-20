@@ -8,3 +8,6 @@
 // t33 — пакеты; pos — рядом лежащий <t33>.pos (поле и строка каждого пакета), может отсутствовать.
 // out_dir — куда класть восстановленные файлы. -> отчёт (пусто, если пачек WaveTop нет)
 Json wavetop_decode(const std::string &t33, const std::string &out_dir, Progress &pr);
+// the same from packets in memory: field (any increasing count) and line of each packet
+Json wavetop_decode_packets(const Bytes &raw, const std::vector<int> &field, const std::vector<int> &line, const std::string &name,
+                            const std::string &out_dir, Progress &pr);

@@ -1,7 +1,12 @@
 #include "wavetop.h"
 #include "teletext.h"
+#include <algorithm>
 #include <array>
+#include <cstdio>
 #include <ctime>
+#include <map>
+#include <set>
+#include "nabts_fec.h"
 
 namespace {
 // ---------------------------------------------------------------- GF(256): многочлен 0x11D, образующий 0x1D
@@ -165,6 +170,35 @@ std::string safe_part(std::string s) {
     for (auto &c : s) if (strchr("<>:\"|?*", c) || (unsigned char)c < 0x20) c = '_';
     return s;
 }
+
+// a channel's data rows in order, its filler taken off; rows nothing put right are left out and listed
+// -> the text of the report for it
+std::string write_datacast(const nabtsfec::Channel &ch, const std::string &out_dir) {
+    Bytes data;
+    std::string gaps, weak;
+    long lost = 0, unchecked = 0;
+    for (auto &bu : ch.bundles)
+        for (int q = 2; q < bu.positions; q++) {
+            if (bu.state[q] > nabtsfec::Unverified) { lost++; if (gaps.size() < 2000) gaps += fmt(" %zu", data.size()); continue; }
+            if (bu.state[q] == nabtsfec::Unverified) { unchecked++; if (weak.size() < 2000) weak += fmt(" %zu", data.size()); }
+            int end = nabtsfec::kDataBytes;
+            if (bu.filler[q] || bu.state[q] == nabtsfec::Rebuilt) {   // RFC 2728 §3.2: 0x15 then 0xEA to the end
+                int k = end;
+                while (k > 0 && bu.rows[q][k - 1] == 0xEA) k--;
+                if (k > 0 && bu.rows[q][k - 1] == 0x15 && (bu.filler[q] || k < end)) end = k - 1;
+            }
+            data.insert(data.end(), bu.rows[q].begin(), bu.rows[q].begin() + end);
+        }
+    size_t text = 0;
+    for (u8 b : data) text += (b >= 0x20 && b < 0x7F) || b == '\r' || b == '\n' || b == '\t';
+    std::string name = fmt("datacast_%03X.bin", ch.address);
+    write_file(path_join(out_dir, name), data);
+    std::string t = "  " + ch.summary() + "\n";
+    t += fmt("    -> %s: %zu bytes, %.0f%% text; %ld rows not put right left out%s; %ld rows put right by their own code only, "
+             "the bundle could not check them%s\n", name.c_str(), data.size(), data.empty() ? 0.0 : 100.0 * text / data.size(), lost,
+             lost ? (" (at bytes" + gaps + ")").c_str() : "", unchecked, unchecked ? (" (26 bytes at" + weak + ")").c_str() : "");
+    return t;
+}
 }
 
 Json wavetop_decode(const std::string &t33, const std::string &out_dir, Progress &pr) {
@@ -244,6 +278,38 @@ Json wavetop_decode_packets(const Bytes &raw, const std::vector<int> &field, con
         if (!ok) { st["uncorrectable"]++; continue; }
         st["ok"]++; r.field = b.f0; r.line = b.line; r.addr = b.addr; recs.push_back(r);
     }
+    // NABTS FEC as RFC 2728 / EIA-516 send it (nabts_fec.h): every row put right by its own code first, the bundle's
+    // layout learnt from the stream (data rows to a bundle, check rows before or after them, one never sent), rows rebuilt
+    // by the row and column codes together. A record it gives that the reading above missed is added: each has its CRC-16
+    std::vector<nabtsfec::Channel> fec = nabtsfec::decode(raw.data(), n, std::vector<int>(field.begin(), field.begin() + n));
+    std::set<int> wavetopAddr;
+    {
+        std::set<std::string> have;
+        auto key = [](const Record &r) { return fmt("%d %d %u %d %u %zu", r.type, r.ci, r.svc, r.fid, r.off, r.payload.size()); };
+        for (auto &r : recs) have.insert(key(r));
+        for (auto &ch : fec) {
+            if (ch.layoutData != 16) continue;
+            for (auto &bu : ch.bundles) {
+                if (!bu.usable()) continue;
+                Mat M;
+                for (int i = 0; i < 18; i++) for (int c = 0; c < 28; c++) M[i][c] = bu.rows[i][c];
+                Record r;
+                if (!record_from_bundle(M, r)) continue;
+                wavetopAddr.insert(ch.address);
+                r.field = bu.field; r.line = 0; r.addr = ch.address;
+                if (have.insert(key(r)).second) { recs.push_back(r); st["recovered by the row and column codes"]++; }
+            }
+        }
+        std::stable_sort(recs.begin(), recs.end(), [](const Record &a, const Record &b) { return a.field < b.field; });
+    }
+    std::string fecText;
+    int fecChannels = 0;
+    for (auto &ch : fec)
+        if (!wavetopAddr.count(ch.address) && !ch.bundles.empty()) {
+            make_dirs(out_dir);
+            fecText += write_datacast(ch, out_dir);
+            fecChannels++;
+        }
     // время из служебного канала (адреса FC0/EF0: полезная нагрузка кодом Хэмминга)
     std::vector<std::pair<int, uint32_t>> ts;
     for (size_t i = 0; i < n; i++) {
@@ -254,9 +320,14 @@ Json wavetop_decode_packets(const Bytes &raw, const std::vector<int> &field, con
         uint32_t u = le32(b + 5);
         if (u > 600000000u && u < 1100000000u) ts.push_back({field[i], u});
     }
-    if (recs.empty() && ts.empty()) { rep["bundles"] = (double)B.size(); return rep; }
+    if (recs.empty() && ts.empty() && fecText.empty()) { rep["bundles"] = (double)B.size(); return rep; }
     make_dirs(out_dir);
     std::string txt = "WaveTop datacast in " + t33 + "\n";
+    if (!fecText.empty()) {
+        txt += "NABTS datacasts with FEC (RFC 2728 / EIA-516 bundles) that are not WaveTop:\n" + fecText;
+        pr.log("NABTS FEC datacast:\n" + fecText);
+        rep["datacasts"] = (double)fecChannels;
+    }
     txt += fmt("bundles %zu:", B.size()); for (auto &kv : st) txt += fmt("  %s %d", kv.first.c_str(), kv.second); txt += "\n";
     if (!ts.empty()) {
         auto tstr = [](uint32_t u) { time_t t = (time_t)u; char s[64]; struct tm *g = gmtime(&t); if (!g) return std::string(); strftime(s, sizeof s, "%Y-%m-%d %H:%M:%S UTC", g); return std::string(s); };
