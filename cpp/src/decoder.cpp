@@ -1,5 +1,6 @@
 #include "decoder.h"
 #include "videocrypt.h"
+#include "antiope.h"
 #include "ui/util.h"
 #include "jtes.h"
 #include "jtesrx.h"
@@ -699,6 +700,35 @@ static VpsClocks vpsClocksOf(const DecodeResult& res, const std::string& path)
 // engine's "interference (2.50 MHz sine)" for a label of all ones), its report and every frame's bytes in the results folder.
 // The report is made again with the clocks of the recording (teletext, VITC): the time of the broadcast and frames
 // the capture lost
+// the Didon lines named and the Antiope pages written to <recording>_vbi/antiope (after the old engine, which names lines)
+static void applyAntiope(DecodeResult& res, const DecodeOptions& opt, const std::string& path, const AntiopeResult& a)
+{
+    if (a.rows.empty()) return;
+    for (size_t i = 0; i < a.rows.size(); i++) {
+        LineInfo* li = nullptr;
+        for (auto& x : res.lines) if (x.index == a.rows[i]) li = &x;
+        if (!li) {
+            res.lines.emplace_back();
+            li = &res.lines.back();
+            li->index = a.rows[i];
+            lineOf(res.geom, a.rows[i], li->lineNo, li->field);
+        }
+        li->mode = MODE_TEST + 1;
+        li->detectRate = i < a.rates.size() ? a.rates[i] : 0;
+        li->tviRate = 1;
+        li->kind = "Antiope (Didon packets, 6.2 Mbit/s)";
+    }
+    std::sort(res.lines.begin(), res.lines.end(), [](const LineInfo& x, const LineInfo& y) { return x.index < y.index; });
+    try {
+        std::string dir = path_join(legacyReportDir(opt.sourcePath.empty() ? path : opt.sourcePath), "antiope");
+        std::string all = antiopeWrite(a, dir);
+        res.legacy.results.erase(std::remove_if(res.legacy.results.begin(), res.legacy.results.end(), [](const LegacyResult& x) { return x.kind == "antiope"; }),
+                                 res.legacy.results.end());
+        if (!all.empty())
+            res.legacy.results.push_back({"Antiope pages (French teletext)", "antiope", all, res.antiope.empty() ? std::string() : res.antiope[0]});
+    } catch (...) {}
+}
+
 // the VideoCrypt lines named (the old engine called them "unknown signal (0.06 MHz peak)") and its messages in
 // <recording>_vbi/videocrypt.txt; after the old engine, which names the lines it found
 static void applyVideocrypt(DecodeResult& res, const DecodeOptions& opt, const std::string& path, const std::vector<VcStream>& vc)
@@ -1166,6 +1196,16 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
         res.videocrypt = videocryptReport(vcStreams);
         for (auto& l : res.videocrypt) note(l);
     }
+    // Antiope (French teletext, Didon packets at 397 x fH): its lines are no picture or unknown signal
+    AntiopeResult antiope;
+    if (g.pal) {
+        progress(0, "Antiope: looking for Didon packets");
+        if (antiopeDecode(vf, g, frames, opt.threads, [&](double f) { progress(f, "Antiope: reading the Didon lines"); }, opt.cancel, antiope)) {
+            res.antiope = antiopeReport(antiope);
+            for (auto& l : res.antiope) note(l);
+        }
+        if (opt.cancel && *opt.cancel) { err = "cancelled"; return false; }
+    }
     std::vector<float> out;
     auto cpu = makeCpuSlicer(opt.threads);
     cpu->run(probe.data(), probeN, g, all, out, err);
@@ -1472,6 +1512,7 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
             liveTeletext(res, opt, path, note);
             applyVps(res, opt, path, vpsRow, vpsFile, vpsRate, vpsExtra);   // after the teletext: its clock goes in the VPS report
             applyVideocrypt(res, opt, path, vcStreams);
+            applyAntiope(res, opt, path, antiope);
             recheckCharset(res, note);
             res.totalSeconds = now() - t0;
             saveReport(res, opt, path);
@@ -2142,6 +2183,7 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
     if (g.pal) liveTeletext(res, opt, path, note);
     if (g.pal) applyVps(res, opt, path, vpsRow, vpsFile, vpsRate, vpsExtra);   // after the teletext: its clock goes in the VPS report
     if (g.pal) applyVideocrypt(res, opt, path, vcStreams);
+    if (g.pal) applyAntiope(res, opt, path, antiope);
     recheckCharset(res, note);
     res.totalSeconds = now() - t0;
     saveReport(res, opt, path);
@@ -2230,10 +2272,12 @@ std::vector<std::string> headline(const DecodeResult& r)
         h.push_back("Teletext: none");
     if (!r.vpsReport.empty()) h.push_back(r.vpsReport[0]);
     if (!r.videocrypt.empty()) h.push_back(r.videocrypt[0]);
+    if (!r.antiope.empty()) h.push_back(r.antiope[0]);
     std::vector<std::string> other;
     for (auto& li : r.lines) {
         if (!r.vpsReport.empty() && li.kind.rfind("VPS", 0) == 0) continue;
         if (!r.videocrypt.empty() && li.kind.rfind("VideoCrypt", 0) == 0) continue;
+        if (!r.antiope.empty() && li.kind.rfind("Antiope", 0) == 0) continue;
         if (li.mode == MODE_TVINFORM ||li.mode == MODE_TEST || li.kind.rfind("TV-Inform", 0) == 0 || li.kind.find("WST") != std::string::npos || li.kind == "Teletext stream" ||
             li.kind.rfind("picture", 0) == 0 || li.kind.rfind("Test", 0) == 0)
             continue;
@@ -2299,6 +2343,10 @@ std::string summarize(const DecodeResult& r)
     }
     if (r.videocrypt.size() > 1) {
         for (size_t i = 1; i < r.videocrypt.size(); i++) s += r.videocrypt[i] + "\r\n";
+        s += "\r\n";
+    }
+    if (r.antiope.size() > 1) {
+        for (size_t i = 1; i < r.antiope.size(); i++) s += r.antiope[i] + "\r\n";
         s += "\r\n";
     }
     if (!isDvb(r)) s += "Lines:\r\n";

@@ -210,6 +210,21 @@ std::string exportResult(const DecodeResult& r, const std::string& dir, Progress
     }
     if (!r.vitcReport.empty()) put("vitc.txt", join(r.vitcReport));
     if (!r.vpsReport.empty()) put("vps.txt", join(r.vpsReport));
+    // VideoCrypt messages and Antiope pages: the files the decoding wrote next to the recording, copied
+    for (auto& lr : r.legacy.results) {
+        if (lr.kind == "videocrypt" && exists(lr.path)) put("videocrypt.txt", read_text(lr.path));
+        if (lr.kind == "antiope" && exists(lr.path)) {
+            std::string from = dirname(lr.path), to = path_join(dir, "antiope");
+            make_dirs(to);
+            int n = 0;
+            std::error_code ec;
+            for (std::filesystem::directory_iterator it(std::filesystem::u8path(from), ec), end; !ec && it != end; it.increment(ec)) {
+                const std::string f = it->path().filename().u8string();
+                if (f.size() > 4 && f.compare(f.size() - 4, 4, ".txt") == 0) { write_text(path_join(to, f), read_text(path_join(from, f))); n++; }
+            }
+            done.push_back(fmt("antiope/ (%d pages as text, all.txt)", n - 1));
+        }
+    }
     if (!r.xds.empty()) put("xds.txt", join(r.xds));
     if (!r.silentRadio.empty()) {
         std::string s;

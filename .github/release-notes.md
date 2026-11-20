@@ -13,9 +13,15 @@
   data rows, which check rows are sent, before or after their data) is learnt from the stream, lost and damaged rows
   are rebuilt by the row and column codes together. WaveTop gets the records the old reading missed; other channels
   with this protection are written as `datacast_<address>.bin`.
+- **Antiope, the French teletext**: the Didon packets (6.2 Mbit/s) of French recordings of the 1980s are read with the
+  per-line channel decoder, and the Antiope pages are put together, voted over their copies and written as text
+  (`antiope/<page>.txt`, `all.txt`) — accents, positions on the screen, mosaics. Antenne 2, January 1986: the
+  SAVOIR/A2 service, 99 pages (news, sports, exchange rates, books, the viewers' poll).
 - **VideoCrypt lines named and read**: the blocks on lines 8-15 / 321-328 of satellite recordings of the 1990s
   (MTV Europe 1995) are VideoCrypt I and II data — the lines are named so, and their messages are read, checked and
-  listed in `videocrypt.txt`.
+  listed in `videocrypt.txt` with what each says: soft-scrambled (any decoder shows the picture) or for card holders,
+  the month it was issued for (July 1995 on MTV, the date of its teletext), the channel, a name for the decoder's
+  screen when one is sent.
 - **Teletext pages no longer show over each other** when a recording is opened (in live they were right): a
   recording of a capture card that drops frames or whose VBI window misses lines was built "field-aware", and
   most rows of its pages (69-95%) were then filled in from other transmissions — rows of two or three versions,

@@ -81,6 +81,7 @@ struct DecodeResult {
     std::vector<std::string> timeCode;     // the time code line of ORT (line 6: 1 MHz burst + 25 symbols a second)
     std::vector<std::string> vpsReport;    // VPS (line 16): [0] = the headline, then everything the line tells (vpsAnalyse)
     std::vector<std::string> videocrypt;   // VideoCrypt I / II data lines: [0] = the headline, then the report (videocrypt.h)
+    std::vector<std::string> antiope;      // Antiope (Didon) pages: [0] = the headline, then the report (antiope.h)
     std::map<int, LineForce> lineForce;    // line types the user set by hand for this decoding
     std::vector<std::string> xds;
     std::vector<SilentRadioMessage> silentRadio;

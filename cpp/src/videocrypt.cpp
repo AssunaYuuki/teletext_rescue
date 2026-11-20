@@ -231,6 +231,46 @@ std::vector<VcStream> videocryptPass(VbiFile &vf, const VbiGeometry &g, int64_t 
     return out;
 }
 
+// What a message says, as far as the system is known (the card messages of BSkyB VideoCrypt: byte 0 high nibble C / D =
+// soft-scrambled, any decoder shows the picture without a card; E / F = scrambled for card holders; byte 1 = month since
+// January 1989; byte 3 the command (encrypted); bytes 4-5 pay-per-view; byte 6 low 7 bits the channel; bytes 7-26 card
+// addresses (encrypted); 27-30 the signature; 31 the checksum. A message whose byte 0 is 20 may carry the name the
+// decoder shows: byte 2 = 0x60 + its length, the letters after it). 111.vbi: the month 4E = July 1995, the date its
+// teletext gives.
+namespace {
+const char *const kMonths[12] = {"January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"};
+bool cardKind(const uint8_t *m) { return (m[0] >> 4) >= 0xC; }
+std::string monthOf(int b) { return fmt("%s %d", kMonths[b % 12], 1989 + b / 12); }
+std::string nameIn(const uint8_t *m)
+{
+    int n = m[2] - 0x60;
+    if (m[0] != 0x20 || m[2] < 0x62 || m[2] > 0x60 + 28) return "";   // byte 0 = 20, two letters at least
+    std::string s;
+    for (int i = 0; i < n; i++) { uint8_t c = m[3 + i]; if (c < 0x20 || c > 0x7E) return ""; s += (char)c; }
+    return s;
+}
+std::string describe(const VcMessage &m, int system)
+{
+    const uint8_t *b = m.bytes;
+    std::string name = nameIn(b);
+    if (!name.empty()) return "the name the decoder shows: \"" + name + "\"";
+    int hi = b[0] >> 4;
+    // the channel byte is known for VideoCrypt I; VideoCrypt II lays its message out otherwise (bytes 4-5 always 02 2F on MTV)
+    std::string ch = system == 1 ? fmt("; channel %02X", b[6] & 0x7F) : std::string();
+    if (hi == 0xC || hi == 0xD)
+        return fmt("soft-scrambled: any decoder shows the picture without a card; issued for %s%s; card addresses and signature",
+                   monthOf(b[1]).c_str(), ch.c_str());
+    if (hi == 0xE || hi == 0xF)
+        return fmt("scrambled for card holders: the card answers it with the descrambling key; issued for %s%s; card addresses "
+                   "and signature",
+                   monthOf(b[1]).c_str(), ch.c_str());
+    bool zeros = true;
+    for (int i = 3; i < 27; i++) zeros &= b[i] == 0;
+    if (zeros) return fmt("a message of kind %02X, nearly empty (filler or a decoder setting; not described)", b[0]);
+    return fmt("a message of kind %02X (not described)", b[0]);
+}
+}  // namespace
+
 std::vector<std::string> videocryptReport(const std::vector<VcStream> &s)
 {
     std::vector<std::string> r;
@@ -252,9 +292,39 @@ std::vector<std::string> videocryptReport(const std::vector<VcStream> &s)
         std::sort(kv.begin(), kv.end(), [](auto &a, auto &b) { return a.second > b.second; });
         for (size_t i = 0; i < kv.size() && i < 10; i++) k += fmt(" %02X x%d", kv[i].first, kv[i].second);
         r.push_back(k);
+        // in words: how many of each kind, the months they were issued for, the channels, any name
+        int soft = 0, card = 0, other = 0;
+        std::map<int, int> months, channels;
+        std::map<std::string, int> names;
+        for (auto &m : v.list) {
+            std::string nm = nameIn(m.bytes);
+            if (!nm.empty()) { names[nm]++; continue; }
+            int hi = m.bytes[0] >> 4;
+            if (hi == 0xC || hi == 0xD) soft++;
+            else if (hi == 0xE || hi == 0xF) card++;
+            else other++;
+            if (cardKind(m.bytes)) { months[m.bytes[1]]++; if (v.system == 1) channels[m.bytes[6] & 0x7F]++; }
+        }
+        r.push_back(fmt("    in words: %d soft-scrambled (any decoder shows the picture without a card), %d scrambled for card holders, "
+                        "%d of other kinds",
+                        soft, card, other));
+        if (!months.empty()) {
+            std::string ms = "    issued for:";
+            for (auto &x : months) ms += fmt(" %s (%d)", monthOf(x.first).c_str(), x.second);
+            r.push_back(ms + " - the month the broadcast was made");
+        }
+        if (!channels.empty()) {
+            std::string cs = "    channel numbers:";
+            std::vector<std::pair<int, int>> cv(channels.begin(), channels.end());
+            std::sort(cv.begin(), cv.end(), [](auto &a, auto &b) { return a.second > b.second; });
+            for (size_t i = 0; i < cv.size() && i < 8; i++) cs += fmt(" %02X (%d)", cv[i].first, cv[i].second);
+            r.push_back(cs);
+        }
+        for (auto &n : names) r.push_back(fmt("    the name the decoder shows: \"%s\" (%d times)", n.first.c_str(), n.second));
     }
-    r.push_back("  The messages are the scrambling system's own (control and entitlement messages for the decoder and its card);"
-                " they are listed in videocrypt.txt. Nothing of the picture is recovered from them.");
+    r.push_back("  The messages are the scrambling system's own (control and entitlement messages for the decoder and its card),"
+                " each listed with what it says in videocrypt.txt. Their encrypted parts (command, card addresses, signature) and"
+                " the descrambling key stay unknown: the picture is not recovered from them.");
     return r;
 }
 
@@ -263,11 +333,11 @@ std::string videocryptMessagesText(const std::vector<VcStream> &s)
     std::string t;
     for (auto &l : videocryptReport(s)) t += l + "\r\n";
     for (auto &v : s) {
-        t += fmt("\r\n%s: frame, header, counter, mode, the 32 bytes of the message\r\n", v.system == 1 ? "VideoCrypt I" : "VideoCrypt II");
+        t += fmt("\r\n%s: frame, header, counter, mode, the 32 bytes of the message, what it says\r\n", v.system == 1 ? "VideoCrypt I" : "VideoCrypt II");
         for (auto &m : v.list) {
             t += fmt("%6lld  %02X  %02X  %02X  ", (long long)m.frame, m.sequence, m.counter, m.mode);
             for (uint8_t b : m.bytes) t += fmt("%02X ", b);
-            t += "\r\n";
+            t += " " + describe(m, v.system) + "\r\n";
         }
     }
     return t;
