@@ -171,21 +171,10 @@ static std::vector<Version> subpage_versions(const Project& P, const Page& pg)
     return out;
 }
 
-static const char* kSignPage = R"~(<!doctype html><html><head><meta charset="utf-8"><title>Silent Radio</title>
-<style>
-body{background:#111;color:#ccc;font:14px sans-serif;margin:16px}
-#sign{background:#000;border:10px solid #222;border-radius:6px;display:block;margin:8px 0;max-width:100%}
-#list{max-height:45vh;overflow:auto;border:1px solid #333;margin-top:8px}
-#list div{padding:3px 6px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-#list div.on{background:#523;color:#fff}
-button,select{background:#222;color:#ddd;border:1px solid #444;padding:3px 10px}
-#cap{color:#fa4;min-height:1.3em}
-</style></head><body>
-<div>Silent Radio &mdash; <span id="src"></span> &middot; zone <select id="zone"></select>
-<button id="play">Pause</button> <button id="prev">&lt;</button> <button id="next">&gt;</button>
-<label><input type="checkbox" id="loop" checked> loop</label></div>
-<canvas id="sign"></canvas><div id="cap"></div><div id="list"></div>
-<script>var DATA=/*DATA*/;</script><script>/*PLAYER*/</script></body></html>)~";
+// the page of the sign: the data and the player (silent_radio_player.js builds the controls)
+static const char* kSignPage = R"~(<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Silent Radio</title></head>
+<body style="background:#0d0e10"><script>var DATA=/*DATA*/;</script><script>/*PLAYER*/</script></body></html>)~";
 
 std::string exportResult(const DecodeResult& r, const std::string& dir, Progress& pr)
 {
@@ -246,7 +235,13 @@ std::string exportResult(const DecodeResult& r, const std::string& dir, Progress
         for (auto& m : r.silentRadio) {
             Json it = Json::object();
             it["seq"] = m.seq >= 0 ? fmt("%04X", m.seq) : std::string("-");
-            it["title"] = m.text.size() > 60 ? m.text.substr(0, 60) : m.text;
+            std::string title = m.text;
+            if (title.size() > 60) {   // cut between characters, not inside one
+                size_t k = 60;
+                while (k > 0 && ((unsigned char)title[k] & 0xC0) == 0x80) k--;
+                title.resize(k);
+            }
+            it["title"] = title;
             Json tx = Json::array();
             for (auto& t : m.texts) tx.push(t);
             it["text"] = tx;
@@ -258,7 +253,8 @@ std::string exportResult(const DecodeResult& r, const std::string& dir, Progress
                     for (int v : f.cols) c.push(v);
                     fj["f"] = c;
                     fj["t"] = f.hold;
-                    if (f.wipe) fj["fx"] = "wipe";
+                    if (f.fx != SR_CUT) { fj["fx"] = f.fx; fj["ft"] = f.fxTime; if (f.fxArg) fj["fa"] = f.fxArg; }
+                    if (f.fx2 >= 0) { fj["fx2"] = f.fx2; fj["ft"] = f.fxTime; }
                 } else {
                     Json ls = Json::array();
                     for (auto& l : f.lines) {
@@ -276,6 +272,9 @@ std::string exportResult(const DecodeResult& r, const std::string& dir, Progress
             }
             it["frames"] = frs;
             it["copies"] = m.copies;
+            it["intact"] = m.intact;
+            it["time"] = clockText(m.frame / fps);
+            it["at"] = (double)m.frame / fps;
             std::string z = m.zone.empty() ? "text" : m.zone;
             if (!zones.has(z)) zones[z] = Json::array();
             zones[z].push(it);

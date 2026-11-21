@@ -33,7 +33,7 @@ processor.
 
 ## Installing and running
 
-**Windows 10/11:** run `TeletextRescue-Setup-v1.6.exe` (64-bit) or `TeletextRescue-Setup-v1.6-x86.exe`
+**Windows 10/11:** run `TeletextRescue-Setup-v1.6.1.exe` (64-bit) or `TeletextRescue-Setup-v1.6.1-x86.exe`
 (32-bit), or unpack the zip of the same name. Nothing else is needed.
 
 **File → Open .vbi recording…** — the recording is examined and decoded; the results are saved in one
@@ -53,6 +53,25 @@ trcli recording.vbi --export out        # write everything decoded into the fold
 trcli recording.vbi --cpu               # on the processor (--gpu: on the graphics card)
 trcli recording.vbi --again             # decode again instead of opening the saved results
 ```
+
+## What is new in 1.6.1
+
+- **Silent Radio fixed** (the LED news sign in the VBI of WTTW, WNET ...): the sign line is found on every line of a
+  recording (the preamble is matched as a whole, not by its first cycles — a CX23885 capture lost one line in 25, and
+  every lost line took two letters with it); a line read without its preamble keeps its place, so the repeats of a
+  packet stay lined up and are voted bit by bit — the text comes out clean instead of mixed (WNET 1988: 187 clean
+  items instead of 461 with garbage). A repeat with a piece of tape missing is left out; the same item sent again
+  under a new number helps too; where the recording ends the packet ends.
+- **The sign shows what it showed**: pictures stay next to their headlines (Olympic rings, the birthday cake, the golf
+  flag), headlines are two lines, animations play in place (the turning film reel of MOVIE REVIEW, blinking eyes,
+  SPORTS letter by letter over a sign memory wider than the 112 LEDs), a narrow space between words no longer eats a
+  letter (MEN'S GOLF, THE VERDICT), lowercase letters have their tails.
+- **Transitions**: wipes, slides, rolling up and down, dissolve, the two lines of a headline each in its own way,
+  the window panning; scrolling text at a readable speed.
+- **The sign player** (`silent_radio/index.html` of an export): glowing LEDs that fade, every transition, all zones
+  in the order they were sent, speed, colour, picture by picture, search, a link to a moment (`#9BAB/1/0.3`).
+  The sign window of the program shows the transitions too.
+- `packets.json` of the sign no longer breaks a character in two in titles.
 
 ## What is new in 1.6
 

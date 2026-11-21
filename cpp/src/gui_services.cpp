@@ -661,7 +661,7 @@ struct SignWin : Window {
         if (m.frames.empty()) return;
         el = now() - t0;
         if (el >= m.frames[fr].duration()) {
-            if (!m.frames[fr].scroll) prev = m.frames[fr].at(1e9, prev);
+            prev = m.frames[fr].at(m.frames[fr].duration(), prev);   // after a crawl the sign is dark
             fr++; t0 = now(); el = 0;
             if (fr >= (int)m.frames.size()) { go(it + 1); return; }
         }
@@ -687,7 +687,7 @@ struct SignWin : Window {
             cap = label(hwnd, ""); set_label_colour(cap, ACCENT2);
             lst = listview(hwnd, 10, {{"Recording", 100}, {"Packet", 60}, {"Copies", 60}, {"Text", 900}});
             if (R->silentRadio.empty()) set_text(cap, "The sign carrier is there, but no messages were sent while recording.");
-            SetTimer(hwnd, 1, 30, nullptr);
+            SetTimer(hwnd, 1, 20, nullptr);
             select();
             return 0;
         }
@@ -708,14 +708,25 @@ struct SignWin : Window {
                 fill(dc, sign, RGB(0x11, 0x11, 0x11));
                 int pad = S(hwnd, 10), d = (sign.right - sign.left - 2 * pad) / SR_W;
                 RECT in{sign.left + pad, sign.top + pad, sign.left + pad + d * SR_W, sign.top + pad + d * SR_H}; fill(dc, in, RGB(0, 0, 0));
-                HBRUSH on = CreateSolidBrush(RGB(0xff, 0xa3, 0x1a)), offb = CreateSolidBrush(RGB(0x2a, 0x16, 0x06));
+                HBRUSH on = CreateSolidBrush(RGB(0xff, 0xb0, 0x30)), core = CreateSolidBrush(RGB(0xff, 0xe0, 0x9a)),
+                       halo = CreateSolidBrush(RGB(0x5a, 0x2c, 0x06)), offb = CreateSolidBrush(RGB(0x24, 0x13, 0x06));
                 HGDIOBJ op = SelectObject(dc, GetStockObject(NULL_PEN));
+                // a lit LED glows a little onto the board around it
+                SelectObject(dc, halo);
+                for (int x = 0; x < SR_W; x++)
+                    for (int y = 0; y < SR_H; y++)
+                        if ((state[x] >> y) & 1) Ellipse(dc, in.left + x * d - d / 3, in.top + y * d - d / 3, in.left + x * d + d + d / 3, in.top + y * d + d + d / 3);
                 for (int x = 0; x < SR_W; x++)
                     for (int y = 0; y < SR_H; y++) {
-                        SelectObject(dc, (state[x] >> y) & 1 ? on : offb);
+                        bool lit = (state[x] >> y) & 1;
+                        SelectObject(dc, lit ? on : offb);
                         Ellipse(dc, in.left + x * d + 1, in.top + y * d + 1, in.left + x * d + d, in.top + y * d + d);
+                        if (lit && d >= 6) {
+                            SelectObject(dc, core);
+                            Ellipse(dc, in.left + x * d + d / 3, in.top + y * d + d / 3, in.left + x * d + d - d / 3 + 1, in.top + y * d + d - d / 3 + 1);
+                        }
                     }
-                SelectObject(dc, op); DeleteObject(on); DeleteObject(offb);
+                SelectObject(dc, op); DeleteObject(on); DeleteObject(core); DeleteObject(halo); DeleteObject(offb);
             });
             return 0;
         case WM_ERASEBKGND: return 1;

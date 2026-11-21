@@ -59,6 +59,67 @@ FN float ss_bit(GLOBAL const unsigned char* p, int fmt, int n, float c, float bp
     return (ss_interp(p, fmt, n, c) - thr) / amp;
 }
 
+/* Silent Radio: the preamble 101010101000011 is matched as a whole at every
+   place in the first half of the line (bit = spl / 80 samples). The run-in
+   is only 4.5 cycles long, and on captures that start early in the line
+   (CX23885: 1440 of 1716 samples) its first cycles sit where a crossing
+   search does not look; a damaged cycle then lost the whole line. */
+FN float sr_pre_score(GLOBAL const unsigned char* p, int fmt, int n, float o, float T, float thr, float amp)
+{
+    float s = 0.0f;
+    int j;
+    for (j = 0; j < 15; j++) {
+        int want = (j < 9) ? ((j & 1) == 0) : (j >= 13);
+        float v = (ss_interp(p, fmt, n, o + ((float)j + 0.5f) * T) - thr) / amp;
+        if (v > 1.5f) v = 1.5f;     /* one overshoot must not outweigh a missing cycle */
+        if (v < -1.5f) v = -1.5f;
+        s += want ? v : -v;
+    }
+    return s;
+}
+
+FN void slice_sr(GLOBAL const unsigned char* p, int fmt, int n, float spl, float phase, float anchor,
+                 float thr, float amp, GLOBAL float* out)
+{
+    int j, k;
+    float T = spl / 80.0f;
+    float o0 = 0.0f, o1 = (float)n - 31.0f * T - 2.0f;
+    if (o1 > spl * 0.45f) o1 = spl * 0.45f;
+    if (anchor > 0.0f) { o0 = anchor - 1.5f * T; o1 = anchor + 0.5f * T; }
+    if (o0 < 0.0f) o0 = 0.0f;
+    if (o1 <= o0 || amp < 1e-3f) return;
+    float best = -1e30f, bo = o0, o;
+    for (o = o0; o <= o1; o += T * 0.25f) {
+        float s = sr_pre_score(p, fmt, n, o, T, thr, amp);
+        if (s > best) { best = s; bo = o; }
+    }
+    float c = bo;
+    for (k = -4; k <= 4; k++) {
+        o = c + (float)k * T * 0.0625f;
+        if (o < 0.0f) continue;
+        float s = sr_pre_score(p, fmt, n, o, T, thr, amp);
+        if (s > best) { best = s; bo = o; }
+    }
+    /* slicing level and swing from the preamble itself: its ones and zeros */
+    float s1 = 0.0f, s0 = 0.0f;
+    for (j = 0; j < 15; j++) {
+        int want = (j < 9) ? ((j & 1) == 0) : (j >= 13);
+        float v = ss_interp(p, fmt, n, bo + ((float)j + 0.5f) * T);
+        if (want) s1 += v; else s0 += v;
+    }
+    s1 /= 7.0f;
+    s0 /= 8.0f;
+    if (s1 - s0 < 1e-3f) return;
+    thr = 0.5f * (s1 + s0);
+    amp = 0.5f * (s1 - s0);
+    out[0] = 1.0f;
+    out[1] = bo + 0.5f * T;
+    out[2] = amp;
+    out[3] = sr_pre_score(p, fmt, n, bo, T, thr, amp) / 5.0f;
+    for (k = 0; k < 16; k++)
+        out[4 + k] = (ss_interp(p, fmt, n, bo + (15.0f + (float)k + 0.5f + phase) * T) - thr) / amp;
+}
+
 FN void slice_line(GLOBAL const unsigned char* p, int fmt, int n, float spl, int mode, float phase, float anchor,
                    GLOBAL float* out)
 {
@@ -85,6 +146,7 @@ FN void slice_line(GLOBAL const unsigned char* p, int fmt, int n, float spl, int
     float lo = mn + (blo + 0.5f) / sc, hi = mn + (bhi + 0.5f) / sc;
     float thr = 0.5f * (lo + hi);
     if (hi - lo < (mx - mn) * 0.15f) return;
+    if (mode == 1) { slice_sr(p, fmt, n, spl, phase, anchor, thr, 0.5f * (hi - lo), out); return; }
 
     /* rising crossings of the run-in */
     float P = (mode == 0) ? spl / 32.0f : spl / 40.0f;

@@ -540,7 +540,7 @@ struct SignWin : Win {
         if (m.frames.empty()) return;
         el = now() - t0;
         if (el >= m.frames[fr].duration()) {
-            if (!m.frames[fr].scroll) prev = m.frames[fr].at(1e9, prev);
+            prev = m.frames[fr].at(m.frames[fr].duration(), prev);   // after a crawl the sign is dark
             fr++; t0 = now(); el = 0;
             if (fr >= (int)m.frames.size()) { go(it + 1); return; }
         }

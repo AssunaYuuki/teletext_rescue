@@ -6,14 +6,16 @@
 namespace {
 
 constexpr uint32_t kMagic = 0x31435254;   // "TRC1"
-constexpr uint32_t kVersion = 30;          // bump when a saved structure changes (23: layout choice and captions of
+constexpr uint32_t kVersion = 33;          // bump when a saved structure changes (23: layout choice and captions of
                                             // channel-changing NTSC captures - results saved before are decoded again;
                                             // 24: the VPS report; 25: VPS text read through lost frames, time of the broadcast;
                                             // 26: ТВ-информ files from damaged blocks, their text;
                                             // 27: teletext pages of a field-aware build that filled most rows from other
                                             // transmissions are built again - pages showed over each other;
                                             // 28: VideoCrypt data lines read and named; 29: Antiope pages;
-                                            // 30: Antiope pages drawn: colours, sizes, mosaics)
+                                            // 30: Antiope pages drawn: colours, sizes, mosaics;
+                                            // 31: Silent Radio read through lost lines, sign transitions;
+                                            // 32: Silent Radio sprites in place, a window over a wider memory; 33: and a transition per text line)
 
 // One archive type for both directions: R = reading.
 template <bool R> struct Ar {
@@ -91,7 +93,7 @@ template <bool R> void io(Ar<R>& a, SsDatabase& d)
     all(a, d.channels, d.programs, d.descriptions, d.showLists, d.themes, d.clock, d.dstChanges, d.sequenceNumbers, d.stats, d.log);
 }
 // Silent Radio
-template <bool R> void io(Ar<R>& a, SrFrame& f) { all(a, f.scroll, f.cols, f.lines, f.hold, f.speed, f.wipe, f.what); }
+template <bool R> void io(Ar<R>& a, SrFrame& f) { all(a, f.scroll, f.cols, f.lines, f.hold, f.speed, f.fx, f.fxTime, f.fxArg, f.fx2, f.what); }
 template <bool R> void io(Ar<R>& a, SilentRadioMessage& m) { all(a, m.frame, m.text, m.zone, m.seq, m.copies, m.intact, m.texts, m.frames); }
 // AMOL
 template <bool R> void io(Ar<R>& a, AmolStamp& s) { all(a, s.frame, s.sid, s.month, s.day, s.hour, s.minute, s.second, s.pm, s.parityOk, s.bits, s.fa, s.inverted); }

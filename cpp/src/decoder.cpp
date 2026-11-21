@@ -1687,14 +1687,16 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
                 Stream& s = streams[{li.lineNo, li.mode}];
                 // keep weak lines too: soft confidences let the CRC repair them
                 bool ok = li.mode == MODE_CC ? o[0] > 0 : detected(o, li.mode);
-                if (li.mode == MODE_SILENT_RADIO && !ok) continue;
                 uint8_t by[2] = {0, 0};
                 for (int k = 0; k < 16; k++) {
-                    float v = ok ? o[4 + k] : 0.0f;
+                    // Silent Radio keeps a line without its preamble too, as an erasure: two bytes per
+                    // field always, so the copies of a packet stay aligned; its bits count for little
+                    float v = ok ? o[4 + k] : li.mode == MODE_SILENT_RADIO && o[0] > 0 ? 0.05f * o[4 + k] : 0.0f;
                     int bit = v > 0;
                     if (li.mode == MODE_CC) by[k >> 3] |= bit << (k & 7);
                     else by[k >> 3] |= bit << (7 - (k & 7));
                     if (li.mode == MODE_CC) s.soft.conf.push_back(std::fabs(v));
+                    else s.soft.conf.push_back(std::max(-2.0f, std::min(2.0f, v)));   // signed, MSB first
                 }
                 for (int k = 0; k < 2; k++) {
                     s.soft.bytes.push_back(by[k]);
@@ -2039,7 +2041,7 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
         if (s.mode == MODE_SILENT_RADIO) {
             size_t before = res.silentRadio.size(), nz = 0;
             for (uint8_t c : s.soft.bytes) nz += c != 0;
-            srDecode(s.soft.bytes, s.frame, res.silentRadio);
+            srDecode(s.soft.bytes, s.frame, res.silentRadio, &s.valid, &s.soft.conf);
             bool idle = res.silentRadio.size() == before && nz * 100 < s.soft.bytes.size();
             // the same 80 x fH preamble without any sign text is not taken for Silent Radio
             (void)idle;
