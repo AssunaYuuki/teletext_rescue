@@ -791,14 +791,17 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
             }
         }
         for (auto &mm : byMM) {
-            if (mm.second.size() < 4) continue;
+            if (mm.first < 4) continue;
             std::set<std::string> subs; std::set<int> values;
             for (auto &sb : mm.second) {
-                bool fresh = false; for (int c : sb.second) fresh |= !values.count(c);
-                if (!fresh) continue;
-                subs.insert(sb.first); values.insert(sb.second.begin(), sb.second.end());
+                if (sb.first.size() != 4 || sb.first[2] < '0' || sb.first[2] > '9' || sb.first[3] < '0' || sb.first[3] > '9') continue;
+                int value = (sb.first[2] - '0') * 10 + sb.first[3] - '0';
+                if (value < 1 || value > mm.first || !sb.second.count(value)) continue;
+                subs.insert(sb.first); values.insert(value);
             }
-            if (subs.size() >= 4 && values.size() >= 4) return subs;
+            bool complete = values.size() == mm.first;
+            for (int value = 1; value <= mm.first; value++) complete &= values.count(value);
+            if (complete) return subs;
         }
         return std::set<std::string>();
     };
