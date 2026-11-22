@@ -6,6 +6,8 @@
 - **Numbered teletext subpages are kept**: in a sequence such as `1/13`…`13/13`, parts received only twice are no longer
   mistaken for noise and dropped. The exception is limited to subcodes with consistent page counters; ordinary pages
   keep the existing repeat threshold.
+- **Already assembled `.t42` files keep their text**: a cleaned stream with one copy of each subpage is recognised even
+  when a page has many subpages. Reopening it no longer removes every display row and leaves only empty page headers.
 
 ### What is new in 1.6.1
 

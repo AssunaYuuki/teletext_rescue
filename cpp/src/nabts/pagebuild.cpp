@@ -1450,14 +1450,19 @@ static std::pair<bool, std::pair<double, double>> field_skipping(const std::vect
 
 static bool sparse_stream(const std::vector<Packet42> &st) {
     std::map<std::tuple<int, int, int>, int> cnt;
+    std::map<std::tuple<int, int, int, int, int, int, int>, int> subs;
+    long headers = 0;
     for (auto &p : st) {
         int a = H(p[0]), b = H(p[1]);
         if (a < 0 || b < 0 || ((a >> 3) | (b << 1)) != 0) continue;
         cnt[{a & 7, p[2], p[3]}]++;
+        subs[{a & 7, p[2], p[3], p[4], p[5], p[6], p[7]}]++;
+        headers++;
     }
     if (cnt.empty()) return false;
     std::vector<double> v; for (auto &kv : cnt) v.push_back(kv.second);
-    return median(v) < 6;
+    long single = 0; for (auto &kv : subs) single += kv.second == 1;
+    return median(v) < 6 || single * 10 >= headers * 9;
 }
 // no transmission errors: the display rows keep odd parity in (nearly) every byte - DVB, a cleaned stream
 static bool clean_stream(const std::vector<Packet42> &st) {
