@@ -33,7 +33,7 @@ processor.
 
 ## Installing and running
 
-**Windows 10/11:** run `TeletextRescue-Setup-v1.6.1.exe` (64-bit) or `TeletextRescue-Setup-v1.6.1-x86.exe`
+**Windows 10/11:** run `TeletextRescue-Setup-v1.6.2.exe` (64-bit) or `TeletextRescue-Setup-v1.6.2-x86.exe`
 (32-bit), or unpack the zip of the same name. Nothing else is needed.
 
 **File → Open .vbi recording…** — the recording is examined and decoded; the results are saved in one
@@ -53,6 +53,12 @@ trcli recording.vbi --export out        # write everything decoded into the fold
 trcli recording.vbi --cpu               # on the processor (--gpu: on the graphics card)
 trcli recording.vbi --again             # decode again instead of opening the saved results
 ```
+
+## What is new in 1.6.2
+
+- **Numbered teletext subpages are kept**: in a sequence such as `1/13`…`13/13`, parts received only twice are no longer
+  mistaken for noise and dropped. The exception is limited to subcodes with consistent page counters; ordinary pages
+  keep the existing repeat threshold.
 
 ## What is new in 1.6.1
 

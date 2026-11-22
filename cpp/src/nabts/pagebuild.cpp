@@ -768,7 +768,41 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
 
     // подстраницы
     struct TT { long i; std::shared_ptr<SegRows> rows; std::string sub; };
-    auto assign_subs = [&](const std::vector<Tx> &T) {
+    auto numbered_subs = [](const std::vector<Tx> &T) {
+        Counter<std::string> copies;
+        for (auto &t : T) if (t.has_sub) copies.add(t.sub);
+        std::map<int, std::map<std::string, std::set<int>>> byMM;
+        for (auto &t : T) {
+            if (!t.has_sub || copies.get(t.sub) < 2) continue;
+            for (auto &rb : *t.rows) {
+                if (rb.first < 0 || rb.first > 24) continue;
+                std::string text; for (u8 c : rb.second) text += (char)(c & 0x7F);
+                auto dg = [&](size_t j) { return j < text.size() && text[j] >= '0' && text[j] <= '9'; };
+                for (size_t i = 0; i < text.size(); i++) {
+                    if (!dg(i) || (i > 0 && (dg(i - 1) || text[i - 1] == '/'))) continue;
+                    int a = text[i] - '0'; size_t slash = i + 1;
+                    if (dg(slash)) { a = a * 10 + text[slash] - '0'; slash++; }
+                    if (slash + 2 >= text.size() || text[slash] != '/' || !dg(slash + 1) || !dg(slash + 2)) continue;
+                    size_t end = slash + 3;
+                    if (end < text.size() && (dg(end) || text[end] == '/')) continue;
+                    int b = (text[slash + 1] - '0') * 10 + text[slash + 2] - '0';
+                    if (a <= b && b >= 2 && b <= 99) byMM[b][t.sub].insert(a);
+                }
+            }
+        }
+        for (auto &mm : byMM) {
+            if (mm.second.size() < 4) continue;
+            std::set<std::string> subs; std::set<int> values;
+            for (auto &sb : mm.second) {
+                bool fresh = false; for (int c : sb.second) fresh |= !values.count(c);
+                if (!fresh) continue;
+                subs.insert(sb.first); values.insert(sb.second.begin(), sb.second.end());
+            }
+            if (subs.size() >= 4 && values.size() >= 4) return subs;
+        }
+        return std::set<std::string>();
+    };
+    auto assign_subs = [&](const std::vector<Tx> &T, const std::set<std::string> &numbered) {
         std::vector<TT> out;
         Counter<std::string> main;
         for (auto &t : T) if (t.has_sub) main.add(t.sub);
@@ -776,7 +810,8 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
         std::set<std::string> kn;
         long top = main.top().second;
         // субкод, встретившийся в единицы раз на сотню (0x2B вместо 0x15 — сбитый бит на ленте), — не подстраница
-        for (auto &kv : main.v) if (kv.second >= MIN_TX && kv.second * 10 >= top) kn.insert(kv.first);
+        for (auto &kv : main.v)
+            if ((kv.second >= MIN_TX || (kv.second >= 2 && numbered.count(kv.first))) && kv.second * 10 >= top) kn.insert(kv.first);
         if (kn.empty()) kn.insert(main.top().first);
         if (kn.size() == 1) {
             std::string only = *kn.begin();
@@ -1147,12 +1182,14 @@ PagesBuild export_pages(const std::vector<Packet42> &st, const ExportOpts &o, Pr
     std::map<int, int> nsub;
     // обычный путь страницы: субкоды, карусель по содержимому, версии
     auto build_page = [&](const std::vector<Tx> &src, std::vector<Version> &out) {
+        std::set<std::string> numbered = numbered_subs(src);
         std::map<std::string, std::vector<TT>> by;
-        for (auto &t : assign_subs(src)) by[t.sub].push_back(t);
+        for (auto &t : assign_subs(src, numbered)) by[t.sub].push_back(t);
         if (getenv("TR_PB_DEBUG") && curPid == "100")
             for (auto &sb2 : by) fprintf(stderr, "  sub[%s] n=%zu\n", sb2.first.c_str(), sb2.second.size());
         for (auto &sb : by) {
-            if ((int)sb.second.size() < MIN_TX && by.size() > 1) continue;
+            int min_tx = numbered.count(sb.first) ? 2 : MIN_TX;
+            if ((int)sb.second.size() < min_tx && by.size() > 1) continue;
             std::vector<Version> snaps;
             auto groups = split_rotation(sb.second);
             int gi = 0;

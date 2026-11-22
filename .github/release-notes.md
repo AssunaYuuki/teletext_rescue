@@ -1,5 +1,11 @@
-**Windows 10/11:** `TeletextRescue-Setup-v1.6.1.exe` (64-bit) or `TeletextRescue-Setup-v1.6.1-x86.exe` (32-bit) — the program with windows and `trcli`; the same as zip: `TeletextRescue-windows-x64.zip`, `TeletextRescue-windows-x86.zip`.
+**Windows 10/11:** `TeletextRescue-Setup-v1.6.2.exe` (64-bit) or `TeletextRescue-Setup-v1.6.2-x86.exe` (32-bit) — the program with windows and `trcli`; the same as zip: `TeletextRescue-windows-x64.zip`, `TeletextRescue-windows-x86.zip`.
 **Linux** (x86_64, ARM64, x86) and **macOS** (Apple Silicon and Intel in one app): the program with windows (`TeletextRescue`, `Teletext Rescue.app`) and `trcli`. On macOS the first time: right click → Open, or `xattr -dr com.apple.quarantine "Teletext Rescue.app" trcli`.
+
+### What is new in 1.6.2
+
+- **Numbered teletext subpages are kept**: in a sequence such as `1/13`…`13/13`, parts received only twice are no longer
+  mistaken for noise and dropped. The exception is limited to subcodes with consistent page counters; ordinary pages
+  keep the existing repeat threshold.
 
 ### What is new in 1.6.1
 
