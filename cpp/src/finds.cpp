@@ -120,14 +120,22 @@ std::string fileTypeOf(const std::string& path, const std::string& name)
     return e.empty() ? "data" : e;
 }
 
+// the first n bytes of a UTF-8 text, not cutting a character in two
+static std::string utf8Head(const std::string& s, size_t n)
+{
+    if (s.size() <= n) return s;
+    while (n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80) n--;
+    return s.substr(0, n);
+}
+
 void addTviFinds(std::vector<Find>& out, const TviStream& t, const std::string& where)
 {
     std::string svc = t.rate < 0 ? std::string(kTvi) + " (Norpak packets, 5.73 Mbit/s)" : std::string(kTvi) + (t.rate == 0 ? " (f\xD0\xA2" "1)" : t.rate == 1 ? " (f\xD0\xA2" "2)" : " (f\xD0\xA2" "3, 6.94 Mbit/s)");
     for (auto& f : t.fileInfo) {
         Find x;
-        x.kind = Find::File;
+        x.kind = f.path.empty() && !f.have ? Find::Announced : Find::File;
         x.name = f.name; x.shortName = f.shortName != f.name ? f.shortName : "";
-        x.type = fileTypeOf(f.path, f.name);
+        x.type = f.note.rfind("Norpak-26:", 0) == 0 ? (f.have ? "Norpak-26 proprietary encoded data" : "Norpak-26 file description") : fileTypeOf(f.path, f.name);
         x.service = svc; x.where = where;
         x.when = f.time.empty() ? "" : "written " + f.time;
         x.size = f.size; x.blocks = f.blocks; x.have = f.have;
@@ -186,7 +194,7 @@ void addTviFinds(std::vector<Find>& out, const TviStream& t, const std::string& 
             y.kind = Find::Text;
             std::string first = t.texts[0];
             for (auto& c : first) if (c == '\r' || c == '\n') c = ' ';
-            y.name = "texts: " + strip(first).substr(0, 60) + "...";
+            y.name = "texts: " + utf8Head(strip(first), 60) + "...";
             y.type = "text, ASCII (WMO bulletins)";
             y.service = svc; y.where = where;
             y.status = fmt("%zu pieces", t.texts.size());
@@ -233,7 +241,7 @@ void addTviFinds(std::vector<Find>& out, const TviStream& t, const std::string& 
     Find x;
     x.kind = s.kind == TviSummary::Data ? Find::Text : Find::Test;
     x.name = s.kind == TviSummary::Data ? "document" : "test message of the inserter";
-    for (auto& l : s.text) if (s.kind == TviSummary::Data && !strip(l).empty()) { x.name = "document: " + strip(l).substr(0, 70) + "..."; break; }
+    for (auto& l : s.text) if (s.kind == TviSummary::Data && !strip(l).empty()) { x.name = "document: " + utf8Head(strip(l), 70) + "..."; break; }
     x.type = "text, " + s.charset;
     x.service = svc; x.where = where;
     x.status = fmt("%d lines with data", s.dataLines);
@@ -590,6 +598,11 @@ std::vector<Find> findsCompute(const DecodeResult& r, const FindStatus& status)
             for (auto& li : r.lines)
                 if (li.kind.rfind("TV-Inform packets", 0) == 0) w += (w.empty() ? "lines " : ", ") + fmt("%d", li.lineNo) + (li.field == 2 ? "/f2" : "");
             if (w.empty()) w = "lines 7-9";
+        } else if (t.joined || t.rate == 2) {   // one stream over several lines
+            std::set<std::pair<int, int>> ls;
+            for (auto& x : t.words) ls.insert({x.field, x.lineNo});
+            for (auto& x : ls) w += (w.empty() ? "lines " : ", ") + fmt("%d", x.second);
+            if (!ls.empty()) w += fmt(" field %d", ls.begin()->first);
         } else if (!t.words.empty())
             w = fmt("line %d field %d", t.words[0].lineNo, t.words[0].field);
         addTviFinds(out, t, w);
@@ -656,6 +669,13 @@ std::vector<Find> findsCompute(const DecodeResult& r, const FindStatus& status)
             if (!progs.empty()) addTelesoftFinds(out, progs, w.empty() ? "teletext lines" : w, tdir);
         }
         ItsIdl its = itsIdlOf(t42);
+        if (!r.teletext.project.empty()) {
+            std::string decodedPath = path_join(r.teletext.project, "stream.t42");
+            if (decodedPath != t42 && exists(decodedPath)) {
+                ItsIdl decoded = itsIdlOf(decodedPath);
+                if (decoded.good() + decoded.itvGood() > its.good() + its.itvGood()) its = decoded;
+            }
+        }
         if (its.found()) {
             // the packets X/31 are ITS data channels: the «Бизнес-Текст» descriptor made of them is noise
             out.erase(std::remove_if(out.begin(), out.end(), [](const Find& f) { return f.type == "service information, packets 8/31 (independent data lines)"; }),

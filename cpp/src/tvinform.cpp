@@ -3,8 +3,14 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <set>
+
+// the Hamming stream over several lines (end of the file)
+static void tviJoinBuild(TviStream& s);
+static TviSummary tviJoinSummary(const TviStream& s);
+static float tviSwing(const uint8_t* p, int fmt, int n);
 
 static float sampleAt(const uint8_t* p, int fmt, int i) { return fmt == 1 ? (float)(p[2 * i] | (p[2 * i + 1] << 8)) : (float)p[i]; }
 
@@ -358,6 +364,10 @@ static std::vector<const TviChunk*> tviChunks(const TviStream& s, int kind)
 std::string tviText(const TviStream& s)
 {
     std::string t;
+    if (s.joined) {
+        for (auto& l : s.texts) t += l + "\n";
+        return t;
+    }
     for (int kind = 0; kind < 2; kind++) {
         auto ch = tviChunks(s, kind);
         if (ch.empty()) continue;
@@ -372,19 +382,21 @@ std::string tviSerialText(const TviStream& s, double fps)
     std::string t;
     char b[96];
     int cs[2] = {kCsKoi7, tviCharset(tviChunks(s, 1), 1)};
+    const int cs3 = s.joined ? tviCharset(tviChunks(s, 3), 3) : kCsKoi8;
     for (auto& c : s.serial) {
         double sec = c.frame / (fps > 0 ? fps : 25);
         snprintf(b, sizeof b, "%02d:%02d:%05.2f  %-8lld %s %04x  ", (int)(sec / 3600), (int)(sec / 60) % 60, std::fmod(sec, 60.0),
-                 (long long)c.frame, c.kind ? "hamming" : "async  ", c.header);
+                 (long long)c.frame, c.kind == 3 ? "stream " : c.kind ? "hamming" : "async  ", c.header);
         t += b;
         for (uint8_t x : c.chars) { snprintf(b, sizeof b, "%02x ", x); t += b; }
-        t += " " + tviShow(c.chars, c.kind) + "\n";
+        t += " " + tviShow(c.chars, c.kind == 3 ? cs3 : c.kind) + "\n";
     }
     return t;
 }
 
 void tviBuild(TviStream& s)
 {
+    if (s.joined) { tviJoinBuild(s); return; }
     char b[200];
     s.report.clear();
     double mhz = kTviRateHz[s.rate] / 1e6;
@@ -662,6 +674,7 @@ void tviBuild(TviStream& s)
 
 TviSummary tviSummarize(const TviStream& s)
 {
+    if (s.joined) return tviJoinSummary(s);
     TviSummary r;
     r.lines = (int)s.words.size();
     if (s.rate < 0 || s.rate == 2) {   // Norpak packets / fТ3 file transfer records: the report is all there is
@@ -853,4 +866,578 @@ TviLineTest tviTestLine(const uint8_t* probe, int probeN, size_t frameBytes, siz
     }
     out.rate = rate; out.hits = hits; out.pairs = pairs;
     return out;
+}
+
+// ---- fТ1 Hamming(7,4) stream over several lines (TviGridSlicer, tviJoin, tviJoinBuild) ------------------------
+
+static float tviInterp(const std::vector<float>& s, float x)
+{
+    int i = (int)x;
+    if (s.empty()) return 0;
+    if (i < 0) return s[0];
+    if (i + 1 >= (int)s.size()) return s.back();
+    float f = x - i;
+    return s[i] * (1 - f) + s[i + 1] * f;
+}
+
+void TviGridSlicer::add(const uint8_t* line, int fmt, int samples, int64_t frame, int lineNo, int field)
+{
+    if (samples < 8) return;
+    Pending p{frame, lineNo, field, std::vector<float>(samples)};
+    float lo = 1e9f, hi = -1e9f;
+    for (int i = 0; i < samples; i++) { p.s[i] = sampleAt(line, fmt, i); lo = std::min(lo, p.s[i]); hi = std::max(hi, p.s[i]); }
+    // no signal on the line in this frame: flat. (Not the swing between percentiles: a line of all 0 data is
+    // white from end to end and is data too)
+    if (hi - lo < 0.10f * (fmt == 1 ? 65535.0f : 255.0f)) return;
+    if (trained_) { emit(p); return; }
+    buf_.push_back(std::move(p));
+    if (buf_.size() >= 48) train();
+}
+
+void TviGridSlicer::train()
+{
+    if (buf_.empty()) return;
+    // threshold half way between the dark level (blanking = a 0 bit; the 20th percentile is above the sync
+    // tip of an equalizing pulse) and the white level
+    std::vector<float> all;
+    for (auto& p : buf_)
+        for (size_t i = 0; i < p.s.size(); i += 3) all.push_back(p.s[i]);
+    size_t q1 = all.size() * 20 / 100, q2 = all.size() * 97 / 100;
+    std::nth_element(all.begin(), all.begin() + q1, all.end());
+    float dark = all[q1];
+    std::nth_element(all.begin(), all.begin() + q2, all.end());
+    float white = all[q2];
+    thr_ = (dark + white) / 2;
+    const float clip = std::max(1.0f, (white - dark) / 3);
+    const int n = (int)buf_[0].s.size();
+    // phase of the grid: the widest eye over the lines gathered
+    double best = -1;
+    for (float ph = 0; ph < T_; ph += 0.25f) {
+        double m = 0;
+        long c = 0;
+        for (size_t i = 0; i < buf_.size(); i += 2)
+            for (float x = ph; x < n - 1; x += T_) { m += std::min(std::fabs(tviInterp(buf_[i].s, x) - thr_), clip); c++; }
+        if (c && m / c > best) { best = m / c; ph_ = ph; }
+    }
+    nbits_ = std::max(1, (int)((n - 1 - ph_) / T_) + 1);
+    trained_ = true;
+    for (auto& p : buf_) emit(p);
+    buf_.clear();
+}
+
+void TviGridSlicer::emit(const Pending& p)
+{
+    TviWord w;
+    w.frame = p.frame;
+    w.lineNo = p.lineNo;
+    w.field = p.field;
+    w.bytes.assign((nbits_ + 7) / 8, 0);
+    double marg = 0;
+    for (int k = 0; k < nbits_; k++) {
+        float v = tviInterp(p.s, ph_ + k * T_);
+        if (v > thr_) w.bytes[k / 8] |= 1 << (k % 8);
+        marg += std::fabs(v - thr_);
+    }
+    w.quality = (float)(marg / std::max(1, nbits_));
+    out_.push_back(std::move(w));
+}
+
+std::vector<TviWord> TviGridSlicer::take()
+{
+    std::vector<TviWord> o;
+    o.swap(out_);
+    return o;
+}
+
+std::vector<TviWord> TviGridSlicer::finish()
+{
+    if (!trained_ && !buf_.empty()) train();
+    return take();
+}
+
+// one codeword, its 7 bits as sent: the syndrome (0 = a codeword) and the nibble after the correction
+static int tviH74(const uint8_t* b, int& nib)
+{
+    int p[8] = {0}, syn = 0;
+    for (int t = 0; t < 7; t++) p[7 - t] = b[t];
+    for (int i = 1; i < 8; i++)
+        if (p[i]) syn ^= i;
+    if (syn) p[syn] ^= 1;
+    nib = ~(p[3] << 3 | p[5] << 2 | p[6] << 1 | p[7]) & 15;   // levels inverted
+    return syn;
+}
+
+// the 16 codewords (bit t of the code = bit t as sent) and their nibbles
+static const std::vector<std::pair<int, int>>& tviCodewords()
+{
+    static const std::vector<std::pair<int, int>> cw = [] {
+        std::vector<std::pair<int, int>> v;
+        for (int c = 0; c < 128; c++) {
+            uint8_t b[7];
+            for (int t = 0; t < 7; t++) b[t] = (c >> t) & 1;
+            int nib;
+            if (!tviH74(b, nib)) v.push_back({c, nib});
+        }
+        return v;
+    }();
+    return cw;
+}
+
+static inline int tviGridBit(const TviWord& w, int k) { return k >= 0 && k / 8 < (int)w.bytes.size() ? (w.bytes[k / 8] >> (k % 8)) & 1 : 0; }
+
+// a run of Hamming codewords on a line: lead = bits of the cut first codeword that are seen, g0 = the first
+// whole codeword, words = whole codewords
+struct TviSeg { int lead = 0, g0 = 0, words = 0; };
+
+// the codewords of a line: places where (nearly) every frame holds a codeword and the words change from frame
+// to frame (a constant level or the 1010 idle carrier are codewords too)
+static std::vector<TviSeg> tviSegments(const std::vector<const TviWord*>& ws, int nbits)
+{
+    std::vector<TviSeg> out;
+    const int N = (int)ws.size();
+    if (N < 20 || nbits < 28) return out;
+    std::vector<int> valid(nbits, 0), ones(nbits, 0);
+    std::vector<std::set<int>> seen(nbits);
+    std::vector<uint8_t> b(nbits + 8, 0);
+    for (auto* w : ws) {
+        for (int k = 0; k < nbits; k++) { b[k] = (uint8_t)tviGridBit(*w, k); ones[k] += b[k]; }
+        for (int g = 0; g + 7 <= nbits; g++) {
+            int nib, c = 0;
+            for (int t = 0; t < 7; t++) c |= b[g + t] << t;
+            if (seen[g].size() < 8) seen[g].insert(c);
+            valid[g] += !tviH74(&b[g], nib);
+        }
+    }
+    auto good = [&](int g) { return g >= 0 && g + 7 <= nbits && valid[g] * 100 >= N * 85 && seen[g].size() >= 4; };
+    std::vector<TviSeg> chains;
+    for (int g = 0; g + 7 <= nbits; g++) {
+        if (!good(g) || good(g - 7)) continue;
+        TviSeg s;
+        s.g0 = g;
+        while (good(g + 7 * s.words)) s.words++;
+        if (s.words >= 4) chains.push_back(s);
+    }
+    std::sort(chains.begin(), chains.end(), [](const TviSeg& a, const TviSeg& c) { return a.words > c.words; });
+    for (auto& c : chains) {
+        bool clash = false;
+        for (auto& o : out) clash |= c.g0 < o.g0 + 7 * o.words && o.g0 < c.g0 + 7 * c.words;
+        if (!clash) out.push_back(c);
+    }
+    std::sort(out.begin(), out.end(), [](const TviSeg& a, const TviSeg& c) { return a.g0 < c.g0; });
+    // the cut first codeword: the bits before g0 that change from frame to frame (the blanking before them does not)
+    auto varying = [&](int k) { return ones[k] * 50 > N && ones[k] * 50 < N * 49; };
+    int floor = 0;
+    for (auto& s : out) {
+        while (s.lead < 6 && s.g0 - s.lead - 1 >= floor && varying(s.g0 - s.lead - 1)) s.lead++;
+        if (s.lead >= 4) {   // 4 or more bits are checked by the code: they must be the tail of a codeword
+            int fit = 0;
+            for (auto* w : ws) {
+                int v = 0;
+                for (int i = 0; i < s.lead; i++) v |= tviGridBit(*w, s.g0 - s.lead + i) << i;
+                for (auto& cw : tviCodewords())
+                    if ((cw.first >> (7 - s.lead)) == v) { fit++; break; }
+            }
+            if (fit * 10 < N * 9) s.lead = 0;
+        }
+        floor = s.g0 + 7 * s.words;
+    }
+    return out;
+}
+
+std::vector<TviStream> tviJoin(const std::vector<std::vector<TviWord>>& lines, int nbits)
+{
+    struct L { int field, lineNo; const std::vector<TviWord>* w; int words; };
+    std::vector<L> ok;
+    for (auto& v : lines) {
+        if (v.size() < 20) continue;
+        std::vector<const TviWord*> p;
+        for (auto& w : v) p.push_back(&w);
+        int words = 0;
+        for (auto& s : tviSegments(p, nbits)) words += s.words;
+        if (words >= 4) ok.push_back({v[0].field, v[0].lineNo, &v, words});
+    }
+    std::sort(ok.begin(), ok.end(), [](const L& a, const L& b) { return a.field != b.field ? a.field < b.field : a.lineNo < b.lineNo; });
+    std::vector<TviStream> out;
+    for (size_t i = 0; i < ok.size();) {
+        size_t j = i + 1;
+        int words = ok[i].words;
+        while (j < ok.size() && ok[j].field == ok[i].field && ok[j].lineNo == ok[j - 1].lineNo + 1) words += ok[j++].words;
+        // two lines or more next to each other (one line alone stays with the per-line kinds of tviBuild)
+        if (j - i >= 2 && words >= 12) {
+            TviStream s;
+            s.rate = 0;
+            s.joined = 1;
+            s.nbits = nbits;
+            for (size_t k = i; k < j; k++) s.words.insert(s.words.end(), ok[k].w->begin(), ok[k].w->end());
+            std::stable_sort(s.words.begin(), s.words.end(), [](const TviWord& x, const TviWord& y) { return x.frame != y.frame ? x.frame < y.frame : x.lineNo < y.lineNo; });
+            out.push_back(std::move(s));
+        }
+        i = j;
+    }
+    return out;
+}
+
+static bool tviVowel(int x)
+{
+    static const char* lat = "AEIOUYaeiouy";
+    if (x <= 0) return false;
+    if (x < 0x80) return std::strchr(lat, x) != nullptr;
+    static const uint8_t cyr[] = {0x80, 0x85, 0x88, 0x8E, 0x93, 0x9B, 0x9D, 0x9E, 0x9F, 0xA0, 0xA5, 0xA8, 0xAE, 0xE3, 0xEB, 0xED, 0xEE, 0xEF,   // CP866
+                                  0xC1, 0xC5, 0xC9, 0xCF, 0xD5, 0xD9, 0xDC, 0xC0, 0xD1, 0xE1, 0xE5, 0xE9, 0xF5, 0xF9, 0xFC, 0xE0, 0xF1};   // KOI8-R
+    for (uint8_t c : cyr)
+        if (c == x) return true;
+    return false;
+}
+static bool tviLetter(int x) { return (x >= 'A' && x <= 'Z') || (x >= 'a' && x <= 'z') || (x >= 0x80 && x < 0xB0) || (x >= 0xC0 && x < 0xFF); }
+
+// UTF-8 -> code points
+static std::u32string tviU32(const char* s)
+{
+    std::u32string o;
+    for (const unsigned char* p = (const unsigned char*)s; *p;) {
+        char32_t c = *p++;
+        if (c >= 0xE0) { c = (c & 15) << 12; c |= (*p++ & 63) << 6; c |= *p++ & 63; }
+        else if (c >= 0xC0) { c = (c & 31) << 6; c |= *p++ & 63; }
+        o += c;
+    }
+    return o;
+}
+static char32_t tviLower(char32_t c)
+{
+    if (c >= 'A' && c <= 'Z') return c + 32;
+    if (c >= 0x410 && c <= 0x42F) return c + 32;
+    if (c == 0x401) return 0x451;
+    return c;
+}
+// a byte as a letter (lower case) in CP866 (cs 0) or KOI8-R (cs 1); ' ' for a space, 0 for anything else
+static char32_t tviChar(int x, int cs)
+{
+    static std::u32string dos = tviU32("АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмноп"), dos2 = tviU32("рстуфхцчшщъыьэюяЁё"),
+                          koi = tviU32("юабцдефгхийклмнопярстужвьызшэщчъЮАБЦДЕФГХИЙКЛМНОПЯРСТУЖВЬЫЗШЭЩЧЪ");
+    if (x == ' ') return ' ';
+    if ((x >= 'A' && x <= 'Z') || (x >= 'a' && x <= 'z')) return tviLower((char32_t)x);
+    if (cs == 0) {
+        if (x >= 0x80 && x < 0xB0) return tviLower(dos[x - 0x80]);
+        if (x >= 0xE0 && x < 0xF2) return tviLower(dos2[x - 0xE0]);
+    } else if (x >= 0xC0 && x < 0xFF)
+        return tviLower(koi[x - 0xC0]);
+    return 0;
+}
+// a little of the language of the texts (Russian and English words of TV and datacast): where a cut codeword reads
+// two ways (Г / Д, U / R, O / H, space / '), the reading that makes common letter triples wins
+static const std::set<std::u32string>& tviTrigrams()
+{
+    static const std::set<std::u32string> t = [] {
+        std::u32string c = tviU32(
+            " программа программы передача передачи время московское москва канал каналы европа новости погода "
+            "телевидение информ информация реклама курс доллара рубль сегодня завтра вечер утро день ночь первый "
+            "второй третий россия российский телетекст страница сообщение текст проверка тест связь данные файл "
+            "приём абонент служба выпуск часы минуты секунды температура ветер давление "
+            " the quick brown fox jumps over a lazy dog time news weather channel program test information page "
+            "text data file europe moscow service ");
+        std::set<std::u32string> s;
+        for (size_t i = 0; i + 3 <= c.size(); i++) s.insert(c.substr(i, 3));
+        return s;
+    }();
+    return t;
+}
+static int tviTrigramHits(const std::vector<uint8_t>& by, int prev)
+{
+    int best = 0;
+    for (int cs = 0; cs < 2; cs++) {
+        std::u32string u;
+        if (prev >= 0) u += tviChar(prev, cs);
+        for (uint8_t x : by) u += tviChar(x, cs);
+        int h = 0;
+        for (size_t i = 0; i + 3 <= u.size(); i++)
+            if (u[i] && u[i + 1] && u[i + 2] && tviTrigrams().count(u.substr(i, 3))) h++;
+        best = std::max(best, h);
+    }
+    return best;
+}
+
+// how much a piece of the stream looks like text: as 8-bit characters (CP866 / KOI8-R) or as 7-bit characters
+// with even parity (the inserter's identification); prev = the byte before it (-1 = none)
+static double tviTextScore(const std::vector<uint8_t>& by, int prev)
+{
+    double plain = 0.4 * tviTrigramHits(by, prev), par = 0;
+    for (size_t i = 0; i < by.size(); i++) {
+        int x = by[i];
+        bool pr = (x >= 0x20 && x < 0x7F) || x == 0x0D || x == 0x0A || tviLetter(x);
+        plain += pr;
+        if (tviLetter(x) || (x >= '0' && x <= '9')) plain += 0.2;
+        if (x == ' ') plain += 0.1;
+        // a vowel between two consonants (J?MPS, D?G)
+        int a = i ? by[i - 1] : prev, c = i + 1 < by.size() ? by[i + 1] : -1;
+        if (a >= 0 && c >= 0 && tviLetter(a) && tviLetter(c) && !tviVowel(a) && !tviVowel(c) && tviVowel(x)) plain += 0.5;
+        int y = x & 0x7F;
+        if (!(__builtin_popcount(x) & 1) && ((y >= 0x20 && y < 0x7F) || y == 0x0D || y == 0x0A)) par += 1;
+    }
+    return std::max(plain, par);
+}
+
+static std::string tviJoinLines(const TviStream& s)
+{
+    std::set<std::pair<int, int>> ls;
+    for (auto& w : s.words) ls.insert({w.field, w.lineNo});
+    std::string t;
+    int field = 0;
+    for (auto& x : ls) { t += (t.empty() ? "lines " : ", ") + std::to_string(x.second); field = x.first; }
+    return t + (field ? " field " + std::to_string(field) : "");
+}
+
+// a time hh:mm:ss in a text line ("" = none)
+static std::string tviTimeIn(const std::string& l)
+{
+    for (size_t i = 0; i + 8 <= l.size(); i++) {
+        auto d = [&](size_t k) { return l[i + k] >= '0' && l[i + k] <= '9'; };
+        if (d(0) && d(1) && l[i + 2] == ':' && d(3) && d(4) && l[i + 5] == ':' && d(6) && d(7)) return l.substr(i, 8);
+    }
+    return "";
+}
+
+static std::string tviTrim(const std::string& s)
+{
+    size_t a = s.find_first_not_of(' '), b = s.find_last_not_of(' ');
+    return a == std::string::npos ? "" : s.substr(a, b - a + 1);
+}
+
+static void tviJoinBuild(TviStream& s)
+{
+    char b[400];
+    s.report.clear();
+    s.serial.clear();
+    s.texts.clear();
+    s.pages.clear();
+    std::map<std::pair<int, int>, std::vector<const TviWord*>> byLine;
+    for (auto& w : s.words) byLine[{w.field, w.lineNo}].push_back(&w);
+    struct LL { int field, lineNo; std::vector<TviSeg> segs; std::map<int64_t, const TviWord*> at; };
+    std::vector<LL> ls;
+    for (auto& kv : byLine) {
+        LL l;
+        l.field = kv.first.first;
+        l.lineNo = kv.first.second;
+        l.segs = tviSegments(kv.second, s.nbits);
+        if (l.segs.empty()) continue;
+        for (auto* w : kv.second) l.at[w->frame] = w;
+        ls.push_back(std::move(l));
+    }
+    snprintf(b, sizeof b, "ТВ-информ fТ1: one Hamming(7,4) stream over %s, %zu lines read", tviJoinLines(s).c_str(), s.words.size());
+    s.report.push_back(b);
+    if (ls.empty()) { s.report.push_back("  no codewords found"); return; }
+    // the layout of a frame
+    int K = 0;
+    std::string lay;
+    for (auto& l : ls) {
+        std::string p;
+        for (auto& g : l.segs) {
+            int n = g.words + (g.lead > 0);
+            K += n;
+            p += (p.empty() ? "" : " + ") + std::to_string(n);
+        }
+        lay += (lay.empty() ? "" : ", ") + fmt_n("line %d: %s", l.lineNo, p.c_str());
+    }
+    snprintf(b, sizeof b, "  a frame: %s = %d nibbles = %d bytes (the bytes run on over the line ends)", lay.c_str(), K, K / 2);
+    s.report.push_back(b);
+    s.report.push_back("  codewords sent d0 d1 d2 p d3 p p, levels inverted, low nibble first; the first codeword of every part starts in the "
+                       "blanking - rebuilt from the bits that are seen (where two codewords fit them, the one that makes text is taken)");
+    // the frames that have every line
+    std::vector<int64_t> frames;
+    for (auto& kv : ls[0].at) {
+        bool all = true;
+        for (size_t i = 1; i < ls.size() && all; i++) all = ls[i].at.count(kv.first) > 0;
+        if (all) frames.push_back(kv.first);
+    }
+    long fixedSum = 0, chosen = 0;
+    int prev = -1;
+    int64_t prevFrame = -10;
+    const auto& cws = tviCodewords();
+    for (int64_t f : frames) {
+        std::vector<std::vector<int>> cand;
+        int fixed = 0;
+        for (auto& l : ls) {
+            const TviWord& w = *l.at[f];
+            for (auto& g : l.segs) {
+                if (g.lead > 0) {
+                    int v = 0;
+                    for (int i = 0; i < g.lead; i++) v |= tviGridBit(w, g.g0 - g.lead + i) << i;
+                    std::vector<int> c;
+                    for (auto& cw : cws)
+                        if ((cw.first >> (7 - g.lead)) == v) c.push_back(cw.second);
+                    if (c.empty()) c.push_back(0);
+                    cand.push_back(c);
+                }
+                for (int k = 0; k < g.words; k++) {
+                    uint8_t bb[7];
+                    for (int t = 0; t < 7; t++) bb[t] = (uint8_t)tviGridBit(w, g.g0 + 7 * k + t);
+                    int nib;
+                    fixed += tviH74(bb, nib) != 0;
+                    cand.push_back({nib});
+                }
+            }
+        }
+        // the readings of the cut codewords: the one that makes text (all of them, up to 256)
+        std::vector<int> amb;
+        long combos = 1;
+        for (size_t i = 0; i < cand.size(); i++)
+            if (cand[i].size() > 1 && combos * (long)cand[i].size() <= 256) { amb.push_back((int)i); combos *= (long)cand[i].size(); }
+        if (prevFrame != f - 1) prev = -1;
+        std::vector<uint8_t> best;
+        double bestScore = -1;
+        std::vector<int> nib(cand.size());
+        for (long c = 0; c < combos; c++) {
+            for (size_t i = 0; i < cand.size(); i++) nib[i] = cand[i][0];
+            long r = c;
+            for (int i : amb) { nib[i] = cand[i][r % cand[i].size()]; r /= (long)cand[i].size(); }
+            std::vector<uint8_t> by;
+            for (size_t i = 0; i + 1 < nib.size(); i += 2) by.push_back((uint8_t)(nib[i] | nib[i + 1] << 4));
+            double sc = tviTextScore(by, prev);
+            if (sc > bestScore) { bestScore = sc; best = by; }
+        }
+        chosen += combos > 1;
+        fixedSum += fixed;
+        TviChunk ch;
+        ch.kind = 3;
+        ch.frame = f;
+        ch.fixed = (uint8_t)std::min(fixed, 254);
+        ch.chars = best;
+        if (!best.empty()) prev = best.back();
+        prevFrame = f;
+        s.serial.push_back(std::move(ch));
+    }
+    std::set<std::vector<uint8_t>> distinct;
+    for (auto& c : s.serial) distinct.insert(c.chars);
+    snprintf(b, sizeof b, "  %zu frames read whole, %ld bits corrected; %ld frames had a cut codeword with two readings (taken by the text); "
+             "%zu different frame records", s.serial.size(), fixedSum, chosen, distinct.size());
+    s.report.push_back(b);
+    // the text: 8-bit characters between control / binary bytes, a line ends at CR / LF
+    std::vector<const TviChunk*> ch;
+    for (auto& c : s.serial) ch.push_back(&c);
+    const int cs = tviCharset(ch, 3);
+    auto isText = [&](int x) {
+        if (x >= 0x20 && x < 0x7F) return true;
+        if (cs == kCsCp866) return (x >= 0x80 && x < 0xB0) || (x >= 0xE0 && x < 0xF2);
+        return (x >= 0xC0 && x < 0xFF) || x == 0xA3 || x == 0xB3;
+    };
+    std::vector<std::string> lines;
+    std::string cur;
+    bool cyr = false;
+    int64_t last = -10;
+    auto push = [&]() {
+        int vis = 0;   // characters, not UTF-8 bytes
+        for (char c : cur) vis += c != ' ' && ((unsigned char)c & 0xC0) != 0x80;
+        if (vis >= 4) lines.push_back(tviTrim(cur));
+        cur.clear();
+    };
+    for (auto& c : s.serial) {
+        if (c.frame != last + 1) cur.clear();   // a frame missing: the text does not run on
+        last = c.frame;
+        for (uint8_t x : c.chars) {
+            if (x == 0x0D || x == 0x0A) push();
+            else if (isText(x)) tviPut(cur, x, cs, cyr);
+            else cur.clear();                    // binary bytes before the text
+        }
+    }
+    // a carousel sends the same lines again: each once, with how often; a line whose digits change (a clock) once
+    struct Agg { std::string first, last; int n = 0; std::set<std::string> vals; };
+    std::map<std::string, Agg> byKey;
+    std::vector<std::string> order;
+    auto mask = [](std::string k) { for (auto& c : k) if (c >= '0' && c <= '9') c = '#'; return k; };
+    std::map<std::string, int> keyCount;
+    for (auto& l : lines) keyCount[mask(l)]++;
+    // a line cut short (a frame missing before it) is the end of a more frequent line: left out; a line with a few
+    // binary bytes before it (the bytes that change every second come just before the date) is that line
+    std::map<std::string, std::string> into;   // key -> key it goes into ("" = left out)
+    for (auto& kv : keyCount) {
+        if (keyCount.size() > 2000) break;     // a long document, not a carousel
+        const std::string& k = kv.first;
+        int bestN = kv.second;
+        for (auto& o : keyCount) {
+            if (o.first.size() == k.size() || o.second <= kv.second) continue;
+            if (o.first.size() > k.size() && o.first.compare(o.first.size() - k.size(), k.size(), k) == 0) { into[k] = ""; break; }
+            // up to 6 bytes before it: the 4 bytes that change every second and the 1..2 before them
+            int pre = 0;   // characters before it (UTF-8)
+            if (k.size() > o.first.size())
+                for (size_t i = 0; i < k.size() - o.first.size(); i++) pre += ((unsigned char)k[i] & 0xC0) != 0x80;
+            if (k.size() > o.first.size() && pre <= 6 && k.compare(k.size() - o.first.size(), o.first.size(), o.first) == 0 &&
+                o.second > bestN) {
+                into[k] = o.first;   // the most frequent line it ends with
+                bestN = o.second;
+            }
+        }
+    }
+    for (auto& l0 : lines) {
+        std::string l = l0, key = mask(l);
+        for (int hop = 0; hop < 8; hop++) {   // through the chain of lines it goes into
+            auto it = into.find(key);
+            if (it == into.end()) break;
+            if (it->second.empty()) { key.clear(); break; }
+            l = l.substr(l.size() - it->second.size());
+            key = it->second;
+        }
+        if (key.empty()) continue;
+        Agg& a = byKey[key];
+        if (!a.n++) { order.push_back(key); a.first = l; }
+        a.last = l;
+        a.vals.insert(l);
+    }
+    int most = 0;
+    for (auto& kv : byKey) most = std::max(most, kv.second.n);
+    for (auto& k : order) {
+        Agg& a = byKey[k];
+        // a carousel: a line seen once is a damaged copy of another (a bit error, a wrong reading of a cut codeword)
+        if (a.n < 2 && (order.size() > 20 || most >= 3)) continue;
+        std::string t = a.last;
+        if (a.vals.size() >= 3) {
+            std::string t0 = tviTimeIn(a.first), t1 = tviTimeIn(a.last);
+            if (!t0.empty() && !t1.empty()) t += fmt_n("   (the clock runs: %s .. %s, %zu values)", t0.c_str(), t1.c_str(), a.vals.size());
+            else t += fmt_n("   (%zu different)", a.vals.size());
+        } else if (a.n > 1)
+            t += fmt_n("   (x%d)", a.n);
+        s.texts.push_back(t);
+    }
+    // 7-bit characters with even parity (bit 7 set in some of them): the inserter's identification
+    std::map<std::string, int> pieces;
+    std::vector<std::string> porder;
+    for (auto& c : s.serial) {
+        std::string p;
+        bool high = false;
+        for (size_t i = 0; i <= c.chars.size(); i++) {
+            int x = i < c.chars.size() ? c.chars[i] : 0x100, y = x & 0x7F;
+            bool ok = x < 0x100 && !(__builtin_popcount(x) & 1) && y >= 0x20 && y < 0x7F;
+            if (ok) { p += (char)y; high |= x >= 0x80; continue; }
+            if (high && p.size() >= 3 && !pieces[p]++) porder.push_back(p);
+            p.clear();
+            high = false;
+        }
+    }
+    std::string pt;
+    for (auto& p : porder) {
+        std::set<char> kinds(p.begin(), p.end());   // not a filler of one character (the inverted '-' test line)
+        if (pieces[p] >= 5 && p.size() >= 4 && kinds.size() >= 3) pt += (pt.empty() ? "" : ", ") + fmt_n("\"%s\" x%d", p.c_str(), pieces[p]);
+    }
+    snprintf(b, sizeof b, "  text (%s, %zu lines with characters, %zu different):", tviCharsetName(cs), lines.size(), s.texts.size());
+    s.report.push_back(b);
+    for (size_t i = 0; i < s.texts.size() && i < 40; i++) s.report.push_back("    " + s.texts[i]);
+    if (!pt.empty()) {
+        s.report.push_back("  7-bit characters with even parity (in frames of their own): " + pt);
+        s.texts.push_back("7-bit with parity: " + pt);
+    }
+}
+
+static TviSummary tviJoinSummary(const TviStream& s)
+{
+    TviSummary r;
+    r.lines = (int)s.words.size();
+    r.dataLines = (int)s.serial.size();
+    for (auto& c : s.serial) r.fixed += c.fixed;
+    r.chunks = (int)s.serial.size();
+    std::vector<const TviChunk*> ch;
+    for (auto& c : s.serial) ch.push_back(&c);
+    r.charset = tviCharsetName(tviCharset(ch, 3));
+    r.text = s.texts;
+    r.kind = s.texts.empty() ? TviSummary::Idle : TviSummary::Data;
+    r.what = s.texts.empty() ? "Hamming(7,4) stream over " + tviJoinLines(s) + ", no text"
+                             : fmt_n("text over %s (one Hamming(7,4) stream), %zu lines", tviJoinLines(s).c_str(), s.texts.size());
+    return r;
 }

@@ -67,6 +67,9 @@ struct TviFile {
 struct TviStream {
     int rate = 1;             // clock index used (0..2)
     int nbits = 180;
+    // 1 = an fТ1 Hamming(7,4) stream over several lines (tviJoin): words = the lines read on a fixed bit grid,
+    // serial = one record per frame (kind 3), texts = its text lines
+    int joined = 0;
     std::vector<TviWord> words;      // every sliced line, in order
     std::vector<TviPage> pages;      // stable carousel pages (voted)
     std::vector<TviChunk> serial;    // fТ1 serial channel, repeats dropped
@@ -102,3 +105,33 @@ struct TviLineTest { int rate = -1, hits = 0; bool pairs = false; };
 TviLineTest tviTestLine(const uint8_t* probe, int probeN, size_t frameBytes, size_t lineOff, int fmt, int samples, float fs, int force, bool capJob);
 double tviPairShare(const std::vector<uint8_t>& w, int nbits, int* phase = nullptr);   // share of equal bit pairs
 std::vector<uint8_t> tviCollapse(const std::vector<uint8_t>& w, int nbits);            // fТ2 bytes -> fТ1 bytes
+
+// fТ1 Hamming(7,4) stream over several lines (ORT «I программа - Европа», 07.03.1999: TV lines 317 - two halves
+// either side of the equalizing pulse - 318 and 319). Each line carries Hamming(7,4) codewords (sent d0 d1 d2 p d3
+// p p, levels inverted, low nibble first), and the lines of a frame are ONE stream of nibbles: the bytes run on
+// over the line ends (here 5 + 5 + 13 + 13 = 36 nibbles = 18 bytes a frame). The first codeword of every segment
+// starts in the blanking, its first bits are lost: it is rebuilt from the bits that are seen (where they fit two
+// codewords, the one that makes text is taken). tviSlice reads from the first rising edge, so a line whose first
+// seen bits are 0 comes out shifted or not at all - these lines are read on a fixed bit grid instead.
+class TviGridSlicer {
+public:
+    explicit TviGridSlicer(float samplesPerBit) : T_(samplesPerBit) {}
+    // lines without a signal are left out; the grid (threshold, phase) is learnt on the first 48 lines with one
+    void add(const uint8_t* line, int fmt, int samples, int64_t frame, int lineNo, int field);
+    std::vector<TviWord> take();         // the lines read so far (bit k = bytes[k/8] >> k%8, 1 = white), then forgotten
+    std::vector<TviWord> finish();       // the same, the lines still waiting for the grid included
+    int nbits() const { return nbits_; }
+private:
+    struct Pending { int64_t frame; int lineNo, field; std::vector<float> s; };
+    float T_, thr_ = 0, ph_ = 0;
+    int nbits_ = 0;
+    bool trained_ = false;
+    std::vector<Pending> buf_;
+    std::vector<TviWord> out_;
+    void train();
+    void emit(const Pending& p);
+};
+// the lines read by TviGridSlicer (one vector per line) -> the Hamming streams among them (joined = 1, rate 0):
+// lines of one field next to each other whose words carry Hamming(7,4) codewords in fixed places. tviBuild
+// decodes a joined stream (records, text, clock)
+std::vector<TviStream> tviJoin(const std::vector<std::vector<TviWord>>& lines, int nbits);

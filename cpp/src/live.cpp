@@ -22,6 +22,7 @@ namespace legacy {
 #include <cmath>
 #include <atomic>
 #include <thread>
+#include <cerrno>
 
 // MLSE of the original program for teletext that the plain slicer cannot read (tapes)
 struct LivePrior {
@@ -339,9 +340,9 @@ void LiveDecoder::tplStart()
     tplThread_ = std::thread([this, buf, src0] {
         lowPriority(true);
         legacy::parallel_low = true;
-        auto path = (std::filesystem::temp_directory_path() / ("TeletextRescue_tpl_" + std::to_string((uintptr_t)this) + ".vbi")).u8string();
+        auto path = scratchPath("templates.vbi");
         try {
-            if (FILE* f = fopen(path.c_str(), "wb")) {
+            if (FILE* f = _wfopen(widen(path).c_str(), L"wb")) {
                 fwrite(buf->data(), 1, buf->size(), f);
                 fclose(f);
                 legacy::Progress pr;
@@ -402,8 +403,8 @@ void LiveDecoder::startProbe()
         lowPriority(true);
         std::map<int, std::string> kinds;
         try {
-            auto path = (std::filesystem::temp_directory_path() / ("TeletextRescue_live_" + std::to_string((uintptr_t)this) + ".vbi")).u8string();
-            if (FILE* f = fopen(path.c_str(), "wb")) {
+            auto path = scratchPath("probe.vbi");
+            if (FILE* f = _wfopen(widen(path).c_str(), L"wb")) {
                 fwrite(frames->data(), 1, frames->size(), f);
                 fclose(f);
                 std::map<int, std::string> names;
@@ -437,7 +438,7 @@ void LiveDecoder::startProbe()
                 }
                 for (auto& kv : names) kinds[kv.first] = kv.second;
                 std::remove(path.c_str());
-            } else if (getenv("TR_DEBUG")) fprintf(stderr, "probe: cannot write %s\n", path.c_str());
+            } else if (getenv("TR_DEBUG")) fprintf(stderr, "probe: cannot write %s: %s (%d)\n", path.c_str(), strerror(errno), errno);
         } catch (std::exception& e) { if (getenv("TR_DEBUG")) fprintf(stderr, "probe: %s\n", e.what()); } catch (...) { if (getenv("TR_DEBUG")) fprintf(stderr, "probe: exception\n"); }
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -533,6 +534,7 @@ void LiveDecoder::reset(const VbiGeometry& g)
     ts_ = TsCollector(); tsSeen_ = 0; tsAt_ = -1000000; tsProgs_.clear();
     its_ = ItsIdl(); itvSeen_ = 0; itvAt_ = -1000000; itvFinds_.clear();
     tviLive_.clear();
+    tviGrid_.clear(); tviGridWords_.clear();
     tvi3Slicers_.clear(); tvi3Live_ = TviStream(); tvi3Lines_.clear();
     tviFinds_.clear();
     norpakFiles_.clear();
@@ -541,6 +543,7 @@ void LiveDecoder::reset(const VbiGeometry& g)
     norpakBeacons_.clear();
     norpakVotes_.clear();
     norpakProbes_ = 0;
+    norpakPrior_.clear(); norpakPriorN_ = 0;
     if (!t33_.empty()) { std::remove(t33_.c_str()); std::remove((t33_ + ".pos").c_str()); t33_.clear(); }
     fast525_.clear(); fast525Chunk_ = 0; fast525Made_ = 0;
     ss_ = SsDatabase(); ssMade_ = 0;
@@ -628,12 +631,12 @@ void LiveDecoder::feed(const uint8_t* frame)
             td_.packet(out[l].pk);
             teledata_.packet(out[l].pk);
             ts_.packet(out[l].pk);
-            its_.packet(out[l].pk, frames_);
+            its_.packet(out[l].pk, frames_, l);
         } else if (out[l].raw) {
             if (raw_) fwrite(out[l].rpk, 1, 42, raw_);
             bt_.packet(out[l].rpk, frames_);
             teledata_.packet(out[l].rpk);
-            its_.packet(out[l].rpk, frames_);
+            its_.packet(out[l].rpk, frames_, l);
         }
         if (out[l].cc && l < L / 2) cc(out[l].ccv[0], out[l].ccv[1]);
         // VPS from ONE line: ARD 23.11.95 sends a second VPS line on 329 (field 2) with other bytes (CNI 0C0, 10:00
@@ -987,6 +990,8 @@ LiveDecoder::LineOut LiveDecoder::line(int index, const uint8_t* p)
         if (c > best) { best = c; bk = r.kind; }
     }
     a.kind = best > 0.55 && bk ? bk : "signal";
+    // 625 lines never carried NABTS: packets at this clock are ТВ-информ through Norpak equipment (findFiles slices them)
+    if (g_.pal && a.kind == "NABTS / WST 525 rate") a.kind = "5.73 Mbit/s packets (55 55 E7, Norpak)";
     return res;
 }
 
@@ -1921,11 +1926,20 @@ bool LiveDecoder::record(const std::string& path, std::string& err, bool writeVb
     return true;
 }
 
+std::string LiveDecoder::scratchPath(const std::string& suffix)
+{
+    std::string dir;
+    if (!recPath_.empty()) dir = recPath_.substr(0, recPath_.find_last_of('.')) + "_vbi";
+    if (dir.empty()) dir = (std::filesystem::temp_directory_path() / "TeletextRescue_live").u8string();
+    make_dirs(dir);
+    return path_join(dir, "TeletextRescue_" + std::to_string((uintptr_t)this) + "_" + suffix);
+}
+
 // ---------------------------------------------------------------- files found live
 std::string LiveDecoder::filesDir()
 {
     std::lock_guard<std::mutex> lk(mu_);
-    if (!recPath_.empty() && recOn_) return recPath_.substr(0, recPath_.find_last_of('.')) + "_vbi";
+    if (!recPath_.empty()) return recPath_.substr(0, recPath_.find_last_of('.')) + "_vbi";
     return (std::filesystem::temp_directory_path() / "TeletextRescue_live").u8string();
 }
 
@@ -1991,12 +2005,35 @@ std::vector<Find> LiveDecoder::finds()
     ItsIdl its; bool itvMake = false;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (its_.itvGood() != itvSeen_ && frames_ - itvAt_ >= 25 * 5) {
-            its = its_; itvSeen_ = its_.itvGood(); itvAt_ = frames_; itvMake = true;
+        int64_t seen = its_.itvGood() + its_.good();
+        if (seen != itvSeen_ && frames_ - itvAt_ >= 25 * 5) {
+            its = its_; its.finish(); itvSeen_ = seen; itvAt_ = frames_; itvMake = true;
         }
     }
     if (itvMake) {
         std::vector<Find> v;
+        if (its.found()) {
+            out.erase(std::remove_if(out.begin(), out.end(), [](const Find& f) { return f.type == "service information, packets 8/31 (independent data lines)"; }), out.end());
+            Find x;
+            x.kind = Find::Text;
+            int64_t keys = 0, open = 0, enc = 0;
+            std::set<uint32_t> rx;
+            for (auto& kv : its.channels()) {
+                auto& t = kv.second.types;
+                if (t.count("key")) keys += t.at("key");
+                if (t.count("open")) open += t.at("open");
+                if (t.count("encrypted")) enc += t.at("encrypted");
+                rx.insert(kv.second.receivers.begin(), kv.second.receivers.end());
+            }
+            x.name = "ITS data channels (packets X/31)" + std::string(keys ? fmt(": keys for %zu subscribers' receivers", rx.size()) : "");
+            x.type = "data broadcasting, packets X/31 (independent data lines, format A)";
+            x.service = "IBS of ITS (ТЕЛЕИНФ / TV-Inform St Petersburg)";
+            x.where = "teletext lines";
+            x.status = fmt("%lld packets with right CRC; %lld key, %lld open, %lld encrypted messages", (long long)its.good(), (long long)keys, (long long)open, (long long)enc);
+            x.text = its.report();
+            x.note = "the encrypted data needs the subscriber's hardware key; the keys go to each receiver by its number";
+            v.push_back(x);
+        }
         addInterTvFinds(v, its, path_join(filesDir(), "intertvnet_files"));
         std::lock_guard<std::mutex> lk(mu_); itvFinds_ = std::move(v);
     }
@@ -2079,11 +2116,18 @@ void LiveDecoder::findFiles(const std::string& vbiPath, const std::string& fmt, 
     auto t0 = std::chrono::steady_clock::now();
     auto ms = [&] { return (int)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count(); };
     int tLines = 0, tSlice = 0, tFec = 0;
+    std::set<int> idlLines;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (its_.found()) idlLines = its_.lines();
+    }
+    for (int l : idlLines) names[tvOf(l)] = "ITS data channel (packets X/31 IDL)";
     // ТВ-информ fТ3 (RTR 2001): the header FB AC on the line; set by hand or found (and then kept)
     for (int l = 0; l < g.linesPerFrame; l++) {
         const int pf = l < 64 ? probeForce_[l] : 0;
         const bool hand3 = pf == (int)LineForce::TviT3;
         if ((pf && !hand3) || (manual_ && !hand3)) continue;
+        if (!hand3 && idlLines.count(l)) { tvi3Lines_.erase(l); continue; }
         // a line read as teletext is not fТ3 (both have the 444 x fH run-in; a teletext line gives the header test
         // a share of hits on a weak tape, 2с.vbi lines 21 / 334)
         if (!hand3 && teletextLines.count(l)) { tvi3Lines_.erase(l); continue; }
@@ -2130,6 +2174,18 @@ void LiveDecoder::findFiles(const std::string& vbiPath, const std::string& fmt, 
             st.words.push_back(std::move(w));
         }
         if (st.words.size() > 60000) st.words.erase(st.words.begin(), st.words.begin() + 20000);
+        // fТ1 on the fixed grid as well (a stream over several lines). Also a line taken for fТ2: the line with an
+        // equalizing pulse mid-line (TV line 317) passes the fТ2 test; tviJoin keeps only lines with fТ1 codewords
+        if (st.rate <= 1) {
+            auto& gs = tviGrid_[l];
+            if (!gs) gs = std::make_unique<TviGridSlicer>(fs / kTviRateHz[0]);
+            for (int f = 0; f < n; f++)
+                gs->add(&frames[(size_t)f * fb + (size_t)l * g.lineBytes], g.fmt, g.validSamples, base + f, g.firstLine + l % half, l < half ? 1 : 2);
+            auto gw = gs->take();
+            auto& all = tviGridWords_[l];
+            all.insert(all.end(), gw.begin(), gw.end());
+            if (all.size() > 60000) all.erase(all.begin(), all.begin() + 20000);
+        }
     }
     // a line found once stays ТВ-информ: fТ1 with the idle carrier is not seen in every 5 s chunk
     for (auto& kv : tviLive_)
@@ -2153,7 +2209,7 @@ void LiveDecoder::findFiles(const std::string& vbiPath, const std::string& fmt, 
         if (probeForce_[l] == (int)LineForce::Norpak || probeForce_[l] == (int)LineForce::Fast) { pkHand.insert(tvOf(l)); pkLines.insert(tvOf(l)); norpak = true; }
     for (auto& kv : kinds) {
         if (manual_) break;   // only the lines set by hand
-        bool nabts = kv.second.find("NABTS") != std::string::npos;
+        bool nabts = kv.second.find("NABTS") != std::string::npos || kv.second.find("55 55 E7") != std::string::npos;
         if (nabts || (gostPk(kv.first) && (kv.second.find("Didon") != std::string::npos || kv.second.find("TV-Inform") != std::string::npos))) {
             norpak = true;
             pkLines.insert(kv.first);
@@ -2178,7 +2234,44 @@ void LiveDecoder::findFiles(const std::string& vbiPath, const std::string& fmt, 
         std::string tmp = vbiPath + ".t33";
         if (!rows.empty()) {
             legacy::Progress pr;
-            try { legacy::slice525(R, rows, legacy::Svc525::NABTS, tmp, pr); } catch (...) {}
+            try { legacy::slice525(R, rows, legacy::Svc525::NABTS, tmp, pr, &norpakPrior_, &norpakPriorN_); } catch (...) {}
+            std::string fresh = vbiPath + ".fresh.t33";
+            try { legacy::slice525(R, rows, legacy::Svc525::NABTS, fresh, pr); } catch (...) {}
+            if (exists(tmp) && exists(fresh)) {
+                using Place = std::pair<uint32_t, uint32_t>;
+                struct Best { Bytes data; int score; };
+                std::map<Place, Best> best;
+                auto add = [&](const std::string& path) {
+                    Bytes d = read_file(path), p = read_file(path + ".pos");
+                    if (p.size() != d.size() / 33 * 8) return false;
+                    for (size_t i = 0; i + 33 <= d.size(); i += 33) {
+                        size_t q = i / 33 * 8;
+                        Place key = {(uint32_t)(p[q] | p[q + 1] << 8 | p[q + 2] << 16 | (uint32_t)p[q + 3] << 24),
+                                     (uint32_t)(p[q + 4] | p[q + 5] << 8)};
+                        Bytes packet(d.begin() + i, d.begin() + i + 33);
+                        int score = tviNorpakPacketFix(packet.data());
+                        auto it = best.find(key);
+                        if (it == best.end()) best.emplace(key, Best{std::move(packet), score});
+                        else if (score > it->second.score) it->second = Best{std::move(packet), score};
+                    }
+                    return true;
+                };
+                if (add(fresh) && add(tmp)) {
+                    Bytes d, p;
+                    for (auto& kv : best) {
+                        d.insert(d.end(), kv.second.data.begin(), kv.second.data.end());
+                        for (int k = 0; k < 4; k++) p.push_back((uint8_t)(kv.first.first >> (8 * k)));
+                        for (int k = 0; k < 4; k++) p.push_back((uint8_t)(kv.first.second >> (8 * k)));
+                    }
+                    write_file(tmp, d);
+                    write_file(tmp + ".pos", p);
+                }
+            } else if (!exists(tmp) && exists(fresh)) {
+                std::rename(fresh.c_str(), tmp.c_str());
+                std::rename((fresh + ".pos").c_str(), (tmp + ".pos").c_str());
+            }
+            std::remove(fresh.c_str());
+            std::remove((fresh + ".pos").c_str());
         }
         if (exists(tmp)) {
             Bytes b = read_file(tmp), pb;
@@ -2186,7 +2279,7 @@ void LiveDecoder::findFiles(const std::string& vbiPath, const std::string& fmt, 
             std::remove(tmp.c_str());
             std::remove((tmp + ".pos").c_str());
             if (!b.empty()) {
-                if (t33_.empty()) t33_ = (std::filesystem::temp_directory_path() / ("TeletextRescue_live_" + std::to_string((uintptr_t)this) + ".t33")).u8string();
+                if (t33_.empty()) t33_ = scratchPath("norpak.t33");
                 // places: frame of the chunk -> frame of the session; kept only while every packet has one
                 if (pb.size() == b.size() / 33 * 8 && (!exists(t33_) || exists(t33_ + ".pos"))) {
                     for (size_t i = 0; i + 8 <= pb.size(); i += 8) {
@@ -2253,8 +2346,35 @@ void LiveDecoder::findFiles(const std::string& vbiPath, const std::string& fmt, 
         x.note = "the data lines come out after the learning (up to ~30 s of data on the line)";
         out.push_back(x);
     }
+    // fТ1 lines next to each other carrying one Hamming(7,4) stream: shown as that stream, not line by line
+    std::set<int> tviJoinedLines;
+    {
+        std::vector<std::vector<TviWord>> grid;
+        std::vector<int> idx;
+        int nb = 0;
+        for (auto& kv : tviGridWords_) {
+            if (kv.second.empty() || !tviGrid_[kv.first]) continue;
+            grid.push_back(kv.second);
+            idx.push_back(kv.first);
+            nb = std::max(nb, tviGrid_[kv.first]->nbits());
+        }
+        for (auto& j : tviJoin(grid, nb)) {
+            std::set<std::pair<int, int>> ls;
+            for (auto& w : j.words) ls.insert({w.field, w.lineNo});
+            std::string where;
+            for (size_t i = 0; i < idx.size(); i++)
+                if (ls.count({grid[i][0].field, grid[i][0].lineNo})) {
+                    tviJoinedLines.insert(idx[i]);
+                    where += (where.empty() ? "lines " : ", ") + ::fmt("%d", tvOf(idx[i]));
+                    names[tvOf(idx[i])] = "TV-Inform fТ1, Hamming stream over lines";
+                }
+            tviBuild(j);
+            addTviFinds(out, j, where);
+        }
+    }
     for (auto& kv : tviLive_) {
         if (kv.second.words.empty()) continue;
+        if (tviJoinedLines.count(kv.first)) continue;
         TviStream c = kv.second;
         tviBuild(c);
         addTviFinds(out, c, ::fmt("line %d field %d", c.words[0].lineNo, c.words[0].field));

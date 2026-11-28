@@ -21,6 +21,7 @@
 struct ItsChannel {
     int mag = 0, ft = 0;
     std::string spa;                       // address nibbles, hex
+    std::set<int> lines;                    // stored VBI rows that produced confirmed packets (live only)
     int64_t packets = 0, good = 0, mended = 0, repeats = 0, lost = 0;
     int64_t first = -1, last = -1;          // frames
     std::map<std::string, int> types;       // message type -> count ("key", "open", "encrypted", "break", "broken")
@@ -75,11 +76,14 @@ ItvAcl itvAclOf(const std::vector<uint8_t>& d);
 
 class ItsIdl {
 public:
-    void packet(const uint8_t* p, int64_t frame);   // a teletext packet (42 bytes as sliced)
+    void packet(const uint8_t* p, int64_t frame, int line = -1);   // a teletext packet (42 bytes as sliced)
     void finish();                                   // closes the messages still open
     int64_t good() const;                            // packets with a right CRC
-    bool found() const { return good() >= 20; }      // the service is there (not a few noisy packets)
+    bool found() const;                              // repeats, or a few CRC-confirmed structured key messages
     const std::map<std::string, ItsChannel>& channels() const { return ch_; }
+    std::set<int> lines() const {
+        std::set<int> out; for (auto& kv : ch_) out.insert(kv.second.lines.begin(), kv.second.lines.end()); return out;
+    }
     std::vector<std::string> report() const;         // lines for a report
     // InterTVNet
     bool itvFound() const { return itvGood_ >= 20; }

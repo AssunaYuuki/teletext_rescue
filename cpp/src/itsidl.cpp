@@ -152,9 +152,16 @@ int checkedCi(const uint8_t* q, int from, bool ciSent)
     if (ciSent) return c == 0 ? q[from] : -1;
     return (c & 0xFF) == (c >> 8) ? (c & 0xFF) : -1;
 }
+
+bool hasKeyMessage(const uint8_t* data, int n)
+{
+    for (int i = 0; i + 14 <= n; i++)
+        if (data[i] == 0x10 && data[i + 1] == 0x80) return true;
+    return false;
+}
 }
 
-void ItsIdl::packet(const uint8_t* p, int64_t frame)
+void ItsIdl::packet(const uint8_t* p, int64_t frame, int line)
 {
     int a = T.ham[p[0]], b = T.ham[p[1]];
     if (a < 0 || b < 0 || ((a >> 3) | (b << 1)) != 31) return;
@@ -193,9 +200,13 @@ void ItsIdl::packet(const uint8_t* p, int64_t frame)
         if (ci >= 0) c.mended++;
     }
     if (ci < 0) return;
+    int checkDl = 40 - from - (ciSent ? 1 : 0);
+    const uint8_t* checkData = q + from + (ciSent ? 1 : 0);
+    if (ft & 8) { checkDl = std::min<int>(checkData[0], 39 - from - (ciSent ? 1 : 0)); checkData++; }
     // a CI that jumps (or the first one) is taken only when the next packet goes on from it: a noisy packet
-    // passes the implicit check 1 time in 256
+    // passes the implicit check 1 time in 256. A complete key message bootstraps a sparse key-only channel.
     int d = c.prevCi >= 0 ? (ci - c.prevCi) & 0xFF : 255;
+    if (d > 4 && hasKeyMessage(checkData, checkDl)) { c.prevCi = ci; c.candCi = -1; d = 1; }
     if (d > 4) {
         int dc = c.candCi >= 0 ? (ci - c.candCi) & 0xFF : 255;
         if (dc > 4) { c.candCi = ci; return; }
@@ -207,6 +218,7 @@ void ItsIdl::packet(const uint8_t* p, int64_t frame)
     }
     c.candCi = -1;
     c.good++;
+    if (line >= 0) c.lines.insert(line);
     if (c.first < 0) c.first = frame;
     c.last = frame;
     if (d == 0) { c.repeats++; return; }   // another copy (RI)
@@ -398,6 +410,14 @@ int64_t ItsIdl::good() const
     int64_t n = 0;
     for (auto& kv : ch_) n += kv.second.good;
     return n;
+}
+
+bool ItsIdl::found() const
+{
+    if (good() >= 20) return true;
+    int keys = 0;
+    for (auto& kv : ch_) { auto it = kv.second.types.find("key"); if (it != kv.second.types.end()) keys += it->second; }
+    return good() >= 3 && keys >= 2;
 }
 
 std::vector<std::string> ItsIdl::report() const

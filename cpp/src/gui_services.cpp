@@ -1724,7 +1724,7 @@ struct TviWin : Window {
                 if (li.kind.rfind("TV-Inform packets", 0) == 0) w += (w.empty() ? "lines " : ", ") + fmt("%d", li.lineNo) + (li.field == 2 ? "/f2" : "");
             return w.empty() ? "lines 7-9" : w;
         }
-        if (t.rate == 2) {   // fТ3: one stream over several lines
+        if (t.rate == 2 || t.joined) {   // fТ3 / the fТ1 Hamming stream: one stream over several lines
             std::set<std::pair<int, int>> ls;
             for (auto &w : t.words) ls.insert({w.field, w.lineNo});
             std::string s;
@@ -1778,7 +1778,8 @@ struct TviWin : Window {
         if (!s.charset.empty()) sub += "  \xC2\xB7  " + s.charset + ", levels inverted";
         text_out(dc, x, y, sub, ACCENT2, small);
         y += S(hwnd, 20);
-        std::string note = s.kind == TviSummary::Test ? "teleprinter test RYRY..., 1234567890 and the name of the system: no files were being sent on this line"
+        std::string note = t.joined ? "one stream of Hamming(7,4) codewords over these lines, bytes run on over the line ends; the clock and text of the inserter"
+                         : s.kind == TviSummary::Test ?"teleprinter test RYRY..., 1234567890 and the name of the system: no files were being sent on this line"
                          : s.kind == TviSummary::Data ? "a file sent through the system, as received (gaps = chunks not sent on this line)"
                          : s.kind == TviSummary::Packets ? "error-corrected packet stream; see the text for what it carries"
                          : "the line carries the ТВ-информ carrier but no readable characters";

@@ -18,6 +18,59 @@
 #include <mutex>
 #include <string>
 #include "live.h"
+#include "norpak26dec.h"
+#include <map>
+// trcli --norpak26 <folder with *.encoded.bin> [out folder] [catalog.csv ...]: the ТВ-информ files of the Norpak-26
+// container (tvinform_files\encoded) deciphered into texts, ARJ volumes (and what unpacks from them), bytes of other
+// code pages. The place of each file in the stream (it gives the phase of the cut-out bytes) comes from
+// norpak26_catalog.csv in the folder or next to it, and from the catalogs given (of the recordings the files were
+// taken from: a row counts when the file it names is there and has the same bytes).
+static int norpak26Cli(const std::vector<std::string>& args)
+{
+    if (args.size() < 2) { fprintf(stderr, "trcli --norpak26 <folder with *.encoded.bin> [out folder] [norpak26_catalog.csv ...]\n"); return 1; }
+    std::string dir = abspath(args[1]);
+    std::string out = args.size() > 2 ? args[2] : path_join(dirname(dir), "decoded");
+    std::vector<Norpak26Input> in;
+    for (auto& e : fs::directory_iterator(P(dir))) {
+        std::string p = U(e.path()), b = basename(p);
+        if (!ends_with_i(b, ".encoded.bin")) continue;
+        Norpak26Input x;
+        x.name = b.substr(0, b.size() - 12);
+        Bytes r = read_file(p);
+        x.raw.assign(r.begin(), r.end());
+        in.push_back(std::move(x));
+    }
+    if (in.empty()) { fprintf(stderr, "no *.encoded.bin in %s\n", dir.c_str()); return 1; }
+    std::map<std::string, size_t> byName;   // lower-case file name -> input
+    for (size_t i = 0; i < in.size(); i++) byName[lower(in[i].name + ".encoded.bin")] = i;
+    std::vector<std::string> cats;
+    for (const std::string& c : {path_join(dir, "norpak26_catalog.csv"), path_join(dirname(dir), "norpak26_catalog.csv")})
+        if (exists(c)) { cats.push_back(c); break; }
+    for (size_t i = 3; i < args.size(); i++) cats.push_back(args[i]);
+    size_t placed = 0;
+    for (auto& c : cats) {
+        if (!exists(c)) { fprintf(stderr, "no catalog %s\n", c.c_str()); continue; }
+        for (auto& line : split(read_text(c), '\n')) {
+            auto f = split(rstrip(line), ',');   // name,timestamp,declared_size,description_copies,data_offset,file
+            if (f.size() < 6 || f[4].empty() || f[4][0] < '0' || f[4][0] > '9') continue;
+            auto it = byName.find(lower(basename(f[5])));
+            if (it == byName.end() || in[it->second].streamOffset >= 0) continue;
+            std::string src = f[5];
+            if (!exists(src)) src = path_join(path_join(dirname(c), "encoded"), basename(f[5]));
+            if (!exists(src)) continue;
+            Bytes r = read_file(src);
+            if (r.size() != in[it->second].raw.size() || !std::equal(r.begin(), r.end(), in[it->second].raw.begin())) continue;
+            in[it->second].streamOffset = atoll(f[4].c_str());
+            placed++;
+        }
+    }
+    std::vector<std::string> rep;
+    norpak26DecodeAll(in, out, rep);
+    printf("%zu files (%zu with their place in the stream)\n", in.size(), placed);
+    for (auto& l : rep) printf("%s\n", l.c_str());
+    return 0;
+}
+
 #ifdef _WIN32
 #include <windows.h>
 #include <objbase.h>
@@ -398,6 +451,7 @@ int main(int argc, char** argv)
     if (!args.empty() && args[0] == "--replay") return replayCli(args);
     if (!args.empty() && args[0] == "--follow") return followCli(args);
 #endif
+    if (!args.empty() && args[0] == "--norpak26") return norpak26Cli(args);
     // trcli --repair-measure <rec.vbi> <spec> [first frame] [frames] [--format key]: what a VBI repair does to the
     // teletext, per line (as the repair window's Measure)
     if (!args.empty() && args[0] == "--repair-measure") {

@@ -33,7 +33,7 @@ processor.
 
 ## Installing and running
 
-**Windows 10/11:** run `TeletextRescue-Setup-v1.6.2.exe` (64-bit) or `TeletextRescue-Setup-v1.6.2-x86.exe`
+**Windows 10/11:** run `TeletextRescue-Setup-v1.7.exe` (64-bit) or `TeletextRescue-Setup-v1.7-x86.exe`
 (32-bit), or unpack the zip of the same name. Nothing else is needed.
 
 **File → Open .vbi recording…** — the recording is examined and decoded; the results are saved in one
@@ -53,6 +53,26 @@ trcli recording.vbi --export out        # write everything decoded into the fold
 trcli recording.vbi --cpu               # on the processor (--gpu: on the graphics card)
 trcli recording.vbi --again             # decode again instead of opening the saved results
 ```
+
+## What is new in 1.7
+
+- **TV-Inform fТ1: one Hamming stream over several lines** (ORT «I программа — Европа», 1999, SECAM: TV lines 317, 318
+  and 319). The lines of a frame are one stream of Hamming(7,4) codewords — 5 + 5 + 13 + 13 nibbles = 18 bytes a frame,
+  the bytes run on over the line ends (line 317 carries two parts either side of its equalizing pulse). The first
+  codeword of every part starts in the blanking: it is rebuilt from the bits that are seen. The lines are read on a fixed
+  bit grid, so a line whose first bits are 0 is no longer lost (all 1698 of 1698 frames instead of ~55 %). The text comes
+  out whole — `07.03.99 Моск.время:01:21:20 канал: I ПРОГРАММА-ЕВРОПА`, the clock running second by second,
+  `THE QUICK BROWN FOX JUMPS OVER A LAZY DOG. 0123456789` — and the inserter's identification «tw-inform 1234567890»
+  (7-bit with even parity). Before, the three lines were shown one by one as "binary data, probably encrypted".
+  The same in the live capture.
+- **ORT time code found on any line**: the line with the 1 MHz reference burst and 25 symbols a second (line 6) is
+  checked even when no other service took it (it looked like 5 Mbit/s data).
+- **Live capture, 625 lines: no more "NABTS"** — lines with 55 55 E7 packets at 5.73 Mbit/s are named
+  `5.73 Mbit/s packets (55 55 E7, Norpak)` (TV-Inform through Norpak equipment; NABTS never ran on 625-line TV).
+- **TV-Inform Norpak-26 documents deciphered in the program**: one substitution table for the whole service and a key
+  per document, found by language models; the received payloads come out as texts in `tvinform_files\decoded\`
+  (table of contents, ARJ volumes put together). `trcli --norpak26 <folder of encoded files>` does the same for files
+  saved before.
 
 ## What is new in 1.6.2
 

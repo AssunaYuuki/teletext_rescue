@@ -1507,6 +1507,10 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
     std::vector<std::unique_ptr<Tvi3Slicer>> tvi3(tviLine.size());   // fТ3 lines: MLSE slicer each
     for (size_t a = 0; a < tviLine.size(); a++)
         if (tviRates[a] == 2) tvi3[a] = std::make_unique<Tvi3Slicer>(fs);
+    // fТ1 lines also on a fixed bit grid: a Hamming stream that runs over several lines (tviJoin)
+    std::vector<std::unique_ptr<TviGridSlicer>> tviGrid(tviLine.size());
+    for (size_t a = 0; a < tviLine.size(); a++)
+        if (tviRates[a] != 2) tviGrid[a] = std::make_unique<TviGridSlicer>(fs / kTviRateHz[0]);   // (fТ2 too: tviJoin keeps fТ1 codewords only)
     if (jobs.empty() && fastJobs.empty() && amolLine.empty() && gemLine.empty() && tviLine.empty() && vitcLine.empty()) {
         if (g.pal) {   // the old engine may still find teletext, VPS, Syster ...
             if (!runLegacy(res, opt, path, note, err)) return false;
@@ -1654,6 +1658,9 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
                     tvi3[a]->add(&buf[(size_t)f * g.frameBytes() + (size_t)li.index * g.lineBytes], g.fmt, g.validSamples, f0 + f, li.lineNo, li.field);
                 continue;
             }
+            if (tviGrid[a])
+                for (int f = 0; f < got; f++)
+                    tviGrid[a]->add(&buf[(size_t)f * g.frameBytes() + (size_t)li.index * g.lineBytes], g.fmt, g.validSamples, f0 + f, li.lineNo, li.field);
             for (int f = 0; f < got; f++) {
                 TviWord w;
                 if (!tviSlice(&buf[(size_t)f * g.frameBytes() + (size_t)li.index * g.lineBytes], g.fmt, g.validSamples,
@@ -2015,8 +2022,31 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
         std::stable_sort(t3.words.begin(), t3.words.end(), [](const TviWord& x, const TviWord& y) { return x.frame != y.frame ? x.frame < y.frame : x.field < y.field; });
         if (!t3.words.empty()) res.tvinform.push_back(std::move(t3));
     }
+    // fТ1 lines of one field that carry one Hamming(7,4) stream between them: one stream instead of a stream a line
+    std::set<std::pair<int, int>> tviJoined;   // (field, line) taken into a joined stream
+    {
+        std::vector<std::vector<TviWord>> grid;
+        int nb = 0;
+        for (size_t a = 0; a < tviLine.size(); a++) {
+            if (!tviGrid[a]) continue;
+            grid.push_back(tviGrid[a]->finish());
+            nb = std::max(nb, tviGrid[a]->nbits());
+        }
+        for (auto& j : tviJoin(grid, nb)) {
+            std::set<std::pair<int, int>> ls;
+            for (auto& w : j.words) ls.insert({w.field, w.lineNo});
+            std::string names;
+            for (auto& x : ls) { tviJoined.insert(x); names += (names.empty() ? "" : ", ") + std::to_string(x.second); }
+            note("ТВ-информ fТ1: lines " + names + " field " + std::to_string(ls.begin()->first) + " carry one Hamming(7,4) stream: " +
+                 std::to_string(j.words.size()) + " lines read on a fixed bit grid");
+            for (auto& li : res.lines)
+                if (li.mode == MODE_TVINFORM && ls.count({li.field, li.lineNo})) li.kind = "TV-Inform fТ1, Hamming stream over lines";
+            res.tvinform.push_back(std::move(j));
+        }
+    }
     for (size_t a = 0; a < tviLine.size(); a++) {
         if (tvi3[a]) continue;
+        if (tviJoined.count({res.lines[tviLine[a]].field, res.lines[tviLine[a]].lineNo})) continue;
         TviStream tvi;
         tvi.rate = tviPairs[a] ? 0 : tviRates[a];
         tvi.nbits = kTviBits[tvi.rate];
@@ -2160,19 +2190,33 @@ bool decodeFile(const std::string& path, const DecodeOptions& opt, DecodeResult&
     gemstarGuide(res.gemstar);
     for (auto& a : res.gemstar) gemstarBuildReport(a);
     // a ТВ-информ guess that is the time code line (ORT 2001, sample.vbi line 6: sliced at fТ2 it passes)
+    // ... or a line no service took (ORT 07.03.1999, test.vbi line 6: the 5 MHz symbols look like 5 Mbit/s data)
     if (g.pal)
-        for (auto& li : res.lines) {
-            if (li.mode != MODE_TVINFORM || !tvTimeProbe(vf, li.index)) continue;
+        for (int l = 0; l < g.linesPerFrame; l++) {
+            LineInfo* tli = nullptr;
+            bool other = false;
+            for (auto& li : res.lines)
+                if (li.index == l) { if (li.mode == MODE_TVINFORM) tli = &li; else other = true; }
+            if ((other && !tli) || (tli && tli->kind.rfind("TV-Inform fТ1, Hamming", 0) == 0)) continue;
+            if (!tvTimeProbe(vf, l)) continue;
             TvTimeCode tc;
-            if (!tvTimeDecode(vf, li.index, opt.maxFrames, tc, opt.cancel)) continue;
-            int ln = li.lineNo, fl = li.field;
-            res.tvinform.erase(std::remove_if(res.tvinform.begin(), res.tvinform.end(), [&](const TviStream& t) {
-                                   return !t.words.empty() && t.words[0].lineNo == ln && t.words[0].field == fl;
-                               }), res.tvinform.end());
-            li.mode = MODE_TEST + 1;
-            li.kind = "Time code (1 MHz burst + 25 symbols a second)";
+            if (!tvTimeDecode(vf, l, opt.maxFrames, tc, opt.cancel)) continue;
+            if (tli) {
+                int ln = tli->lineNo, fl = tli->field;
+                res.tvinform.erase(std::remove_if(res.tvinform.begin(), res.tvinform.end(), [&](const TviStream& t) {
+                                       return !t.joined && !t.words.empty() && t.words[0].lineNo == ln && t.words[0].field == fl;
+                                   }), res.tvinform.end());
+            } else {
+                res.lines.push_back(LineInfo());
+                tli = &res.lines.back();
+                tli->index = l;
+                lineOf(g, l, tli->lineNo, tli->field);
+                tli->detectRate = 1;
+            }
+            tli->mode = MODE_TEST + 1;
+            tli->kind = "Time code (1 MHz burst + 25 symbols a second)";
             res.timeCode = tc.report;
-            for (auto& l : tc.report) note(l);
+            for (auto& r : tc.report) note(r);
             break;
         }
     for (auto& a : res.tvinform) {

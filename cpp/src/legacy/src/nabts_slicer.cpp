@@ -88,13 +88,16 @@ double wst525_check(const Rec &R, int row, const std::vector<int> &uu) {
 }
 
 static void slice_impl(const Rec &R, const std::vector<int> &lines, Svc525 kind, const std::string &out, Progress &pr,
-                       std::vector<JtesPacket> *mem);
-void slice525(const Rec &R, const std::vector<int> &lines, Svc525 kind, const std::string &out, Progress &pr) { slice_impl(R, lines, kind, out, pr, nullptr); }
+                       std::vector<JtesPacket> *mem, std::vector<double> *priorState = nullptr, int *nPriorState = nullptr);
+void slice525(const Rec &R, const std::vector<int> &lines, Svc525 kind, const std::string &out, Progress &pr,
+              std::vector<double> *priorState, int *nPriorState) {
+    slice_impl(R, lines, kind, out, pr, nullptr, priorState, nPriorState);
+}
 std::vector<JtesPacket> slice_jtes(const Rec &R, const std::vector<int> &lines, Progress &pr) {
     std::vector<JtesPacket> v; slice_impl(R, lines, Svc525::JTES, "", pr, &v); return v;
 }
 static void slice_impl(const Rec &R, const std::vector<int> &lines, Svc525 kind, const std::string &out, Progress &pr,
-                       std::vector<JtesPacket> *mem) {
+                       std::vector<JtesPacket> *mem, std::vector<double> *priorState, int *nPriorState) {
     MlseModel M = model525(kind);
     const char *what = kind == Svc525::NABTS ? "NABTS" : kind == Svc525::WST ? "WST (525 lines)" : "Japanese teletext";
     int nf = R.n;
@@ -120,15 +123,23 @@ static void slice_impl(const Rec &R, const std::vector<int> &lines, Svc525 kind,
     auto names = [&](const std::vector<int> &v) { std::string s; for (int r : v) s += (s.empty() ? "" : ", ") + std::to_string(R.tv.at(r)); return s; };
     pr.step(std::string("Reading ") + what + " from lines " + names(lines) + (extra.empty() ? "" : "; looking for packets on " + names(extra)));
     MlseDecoder dec(M); double off = -1;
+    if (priorState && nPriorState && *nPriorState > 0) { dec.prior = *priorState; dec.n = *nPriorState; }
     std::vector<double> goodoff;                     // смещения только прочитанных строк (последняя может быть мусором)
     float y[1800];
-    for (int f = 0; f < nf; f++) {
-        for (int r : lines) if (sig[f][r]) {
-            line27(R, f, r, y, kind);
-            if (kind == Svc525::JTES) { double o = find_preamble(y, W, M, hi); if (o >= 0) { auto q = dec.decode(y, W, std::max(0.0, o - 6), o + 6, 0.5); if (q.good) goodoff.push_back(q.off); } }
-            else { auto q = dec.decode(y, W, lo, hi); if (q.good) goodoff.push_back(q.off); }
+    auto learn = [&] {
+        for (int f = 0; f < nf; f++) {
+            for (int r : lines) if (sig[f][r]) {
+                line27(R, f, r, y, kind);
+                if (kind == Svc525::JTES) { double o = find_preamble(y, W, M, hi); if (o >= 0) { auto q = dec.decode(y, W, std::max(0.0, o - 6), o + 6, 0.5); if (q.good) goodoff.push_back(q.off); } }
+                else { auto q = dec.decode(y, W, lo, hi); if (q.good) goodoff.push_back(q.off); }
+            }
+            if (dec.n > 200 || f > 400) break;
         }
-        if (dec.n > 200 || f > 400) break;
+    };
+    learn();
+    if (goodoff.empty() && priorState && nPriorState && *nPriorState > 0) {
+        dec.prior.clear(); dec.n = 0;
+        learn();
     }
     if (!dec.has_prior() || goodoff.empty()) throw std::runtime_error(std::string("No readable ") + what + " packets on lines " + names(lines));
     off = median(goodoff);
@@ -196,4 +207,6 @@ static void slice_impl(const Rec &R, const std::vector<int> &lines, Svc525 kind,
         if (n) pr.log(fmt("line %d: %zu packets, %zu with an error-free prefix", R.tv.at(r), n, g));
     }
     pr.log(fmt("lines with signal %zu, error-free prefix %zu (%.0f%%), written to ", npk, ok, 100.0 * ok / std::max<size_t>(1, npk)) + out);
+    if (priorState) *priorState = bd.prior;
+    if (nPriorState) *nPriorState = bd.n;
 }

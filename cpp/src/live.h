@@ -437,10 +437,14 @@ private:
     int64_t itvSeen_ = 0, itvAt_ = -1000000;
     std::vector<Find> itvFinds_;               // the last InterTVNet list, kept between window refreshes
     std::map<int, TviStream> tviLive_;       // line index -> words so far (probe thread only)
+    // fТ1 lines read on a fixed bit grid too: a Hamming stream over several lines (tviJoin); probe thread only
+    std::map<int, std::unique_ptr<TviGridSlicer>> tviGrid_;
+    std::map<int, std::vector<TviWord>> tviGridWords_;
     std::map<int, std::unique_ptr<Tvi3Slicer>> tvi3Slicers_;   // ТВ-информ fТ3 lines: their MLSE (probe thread only)
     TviStream tvi3Live_;                     // the fТ3 words of all its lines so far
     std::set<int> tvi3Lines_;                // line indices found carrying fТ3 (stay so)
     std::string t33_;                        // Norpak packets of the session (probe thread only)
+    std::string scratchPath(const std::string& suffix);
     std::string filesDir_;                   // under mu_
     std::vector<Find> tviFinds_;             // under mu_
     std::vector<TviFile> norpakFiles_;       // the files of the last Norpak pass (probe thread only)
@@ -449,6 +453,8 @@ private:
     std::set<int> norpakLines_;              // TV lines the probe found Norpak packets on (probe thread only)
     std::map<int, int> norpakVotes_;         // TV line -> chunks the probe called it a packet line
     int norpakProbes_ = 0;                   // chunks with packet lines
+    std::vector<double> norpakPrior_;        // MLSE channel model carried between probe chunks
+    int norpakPriorN_ = 0;
     // 525 lines: the 5.7 Mbit/s packets of a probe chunk (read as a recording is) join fast525_; NABTS / JTES
     // lines named for the window (probe thread)
     void find525(const std::string& vbiPath, int64_t frames, int64_t firstFrame, std::map<int, std::string>& names);

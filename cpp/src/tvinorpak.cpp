@@ -1,12 +1,16 @@
 #include "tvinorpak.h"
 #include "util.h"
 #include "faxg4.h"
+#include "norpak26dec.h"
 #include <algorithm>
 #include <array>
 #include <map>
 #include <set>
 #include <cstring>
+#include <cstdlib>
 #include <ctime>
+#include "norpak26_tables.inc"
+#include "norpak26_extra_tables.inc"
 
 namespace {
 // ---------------------------------------------------------------- GF(256), polynomial 0x11D; b = 0x1D = a^8
@@ -649,6 +653,222 @@ void norpakFiles(TviNorpak& o, const std::string& outDir)
     }
 }
 
+int norpak26Group(const std::string& name)
+{
+    if (name.size() < 5 || (name[0] != 'N' && name[0] != 'V')) return -1;
+    size_t dash = name.find('-'), dot = name.find('.', dash);
+    if (dash == std::string::npos || dot == std::string::npos || dash + 1 == dot) return -1;
+    char* end = nullptr;
+    long number = std::strtol(name.c_str() + dash + 1, &end, 10);
+    if (end != name.c_str() + dot || number < 0) return -1;
+    return (int)((number + (name[0] == 'V' ? 5 : 0)) % 9);
+}
+
+bool norpak26Document(const std::string& name, const uint8_t* data, size_t size, std::vector<uint8_t>& plain)
+{
+    if (size < 62) return false;
+    int group = norpak26Group(name);
+    auto nibble = [](char c) { return c <= '9' ? c - '0' : c - 'a' + 10; };
+    const char* h = group >= 0 ? kNorpak26TableHex[group] : nullptr;
+    if (!h)
+        for (const auto& t : kNorpak26ExtraTables) {
+            bool match = true;
+            for (size_t i = 0; i < 20; i++)
+                match &= (uint8_t)((nibble(t.prefix[i * 2]) << 4) | nibble(t.prefix[i * 2 + 1])) == data[i];
+            if (match) { h = t.table; break; }
+        }
+    if (!h) return false;
+    std::vector<uint8_t> encoded;
+    size_t p = 0;
+    int seq = 2, markers = 0;
+    while (p < size) {
+        if (seq % 8 == 5 && p + 410 <= size) {
+            encoded.insert(encoded.end(), data + p, data + p + 360);
+            p += 410; seq++; continue;
+        }
+        size_t marker = std::string::npos, end = std::min(size - 5, p + 417);
+        for (size_t m = p + 56; m < end; m++)
+            if (data[m] == 1 && data[m + 1] == 1 && data[m + 2] == seq && data[m + 3] == 0 && data[m + 5] == 1) { marker = m; break; }
+        if (marker == std::string::npos) { encoded.insert(encoded.end(), data + p, data + size); break; }
+        if (marker < p + 50) return false;
+        encoded.insert(encoded.end(), data + p, data + marker - 50);
+        p = marker + 6; seq++; markers++;
+    }
+    if (!markers || encoded.size() < 16) return false;
+    plain.resize(encoded.size());
+    for (size_t i = 0; i < encoded.size(); i++) {
+        uint8_t c = encoded[i];
+        plain[i] = (uint8_t)((nibble(h[c * 2]) << 4) | nibble(h[c * 2 + 1]));
+    }
+    return true;
+}
+
+void norpak26Files(TviNorpak& o, const std::string& outDir)
+{
+    const auto& S = o.stream;
+    struct Desc { std::string name, time; uint32_t size; std::vector<size_t> at; int clean = 0; };
+    std::map<std::string, Desc> desc;
+    auto digit = [&](size_t i) { return i < S.size() && S[i] >= '0' && S[i] <= '9'; };
+    auto tokenChar = [](uint8_t c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-';
+    };
+    for (size_t i = 0; i + 30 <= S.size(); i++) {
+        if (!(digit(i) && digit(i + 1) && digit(i + 2) && digit(i + 3) && S[i + 4] == '-' && digit(i + 5) && digit(i + 6) &&
+              S[i + 7] == '-' && digit(i + 8) && digit(i + 9) && digit(i + 10) && digit(i + 11) && S[i + 12] == ':' &&
+              digit(i + 13) && digit(i + 14) && S[i + 15] == ':' && digit(i + 16) && digit(i + 17))) continue;
+        auto num = [&](size_t p) { return (S[p] - '0') * 10 + S[p + 1] - '0'; };
+        int year = num(i) * 100 + num(i + 2), month = num(i + 5), day = num(i + 8), hour = num(i + 10), minute = num(i + 13), second = num(i + 16);
+        if (year < 1990 || year > 2029 || month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) continue;
+        std::string name;
+        size_t begin = i > 512 ? i - 512 : 0;
+        for (size_t p = begin; p < i;) {
+            if (!tokenChar(S[p])) { p++; continue; }
+            size_t e = p + 1; while (e < i && tokenChar(S[e])) e++;
+            if (e - p >= 4 && e - p <= 21 && (S[p] == '_' || (S[p] >= 'A' && S[p] <= 'Z') || (S[p] >= 'a' && S[p] <= 'z') || digit(p))) {
+                bool alnum = false; for (size_t k = p; k < e; k++) alnum |= S[k] != '_' && S[k] != '.' && S[k] != '-';
+                if (alnum) name.assign((const char*)&S[p], e - p);
+            }
+            p = e;
+        }
+        size_t stampDot = name.find_last_of('.');
+        if (name.size() > 1 && name.back() == 'T' && S[i - 1] == 'T' && name.find(".TXT") == std::string::npos &&
+            stampDot != std::string::npos && name.size() > stampDot + 3) name.pop_back();
+        if (name.size() < 4) continue;
+        uint32_t size = S[i + 18] | S[i + 19] << 8 | S[i + 20] << 16 | (uint32_t)S[i + 21] << 24;
+        if (!size || size > 100000000) continue;
+        const uint8_t tail[5] = {1, 0, 1, 1, 1};
+        int tailBad = 0; for (int k = 0; k < 5; k++) tailBad += S[i + 25 + k] != tail[k];
+        auto plain = [](uint8_t c) {
+            return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+        };
+        size_t dot = name.find('.');
+        bool valid = true;
+        if (dot == std::string::npos) {
+            valid = name.size() >= 4 && name.size() <= 20 && (name.rfind("RG", 0) == 0 || name.rfind("RV", 0) == 0);
+            for (char c : name) valid &= plain(c) || c == '-';
+        } else {
+            valid = dot >= 1 && dot <= 12 && name.find('.', dot + 1) == std::string::npos &&
+                    name.size() > dot + 1 && name.size() <= dot + 5;
+            for (size_t k = 0; k < name.size(); k++) if (k != dot) valid &= plain(name[k]) || (k < dot && name[k] == '-');
+        }
+        if (!valid) continue;
+        std::string date((const char*)&S[i], 18), time = date; time.insert(10, " ");
+        std::string key = name + "|" + time + "|" + std::to_string(size);
+        auto& d = desc[key];
+        if (d.at.empty()) { d.name = name; d.time = time; d.size = size; }
+        d.at.push_back(i); d.clean += tailBad <= 1;
+    }
+    if (desc.empty()) return;
+    std::string csv = "name,timestamp,declared_size,description_copies,data_offset,file\r\n";
+    size_t saved = 0;
+    std::set<std::string> paths;
+    std::vector<Norpak26Input> inputs;   // payloads received, for norpak26DecodeAll
+    std::vector<size_t> inputFile;       // their TviFile in o.files
+    std::vector<std::string> inputPath;  // where the payload was saved
+    for (auto& kv : desc) {
+        const Desc& d = kv.second;
+        if (!d.clean && d.at.size() < 2) continue;
+        // The ordinary payload starts immediately after the five description flags. A type-1 block,
+        // when present, occupies exactly 287 bytes: 281 data/check bytes and its six-byte marker.
+        // Do not search for the marker anywhere else: the flags plus three following bytes can resemble
+        // it and previously shifted most payloads by three bytes (or cut them at a later chance match).
+        size_t descAt = d.at.back(), dataAt = descAt + 30;
+        if (descAt + 317 <= S.size()) {
+            const uint8_t want[6] = {1, 1, 1, 0, 0x88, 1};
+            int bad = 0; for (int k = 0; k < 6; k++) bad += S[descAt + 311 + k] != want[k];
+            if (bad <= 2) dataAt = descAt + 317;
+        }
+        bool have = dataAt && dataAt + d.size <= S.size();
+        TviFile f;
+        f.name = f.shortName = d.name;
+        f.time = d.time;
+        f.size = d.size;
+        f.blocks = 1;
+        f.have = have ? 1 : 0;
+        if (!have) f.missing.push_back(0);
+        std::string path;
+        if (have && !outDir.empty()) {
+            std::string dir = path_join(path_join(outDir, "tvinform_files"), "encoded");
+            make_dirs(dir);
+            std::string base = d.name;
+            while (!base.empty() && (base.back() == '.' || base.back() == ' ')) base.pop_back();
+            path = path_join(dir, base + ".encoded.bin");
+            if (paths.count(lower(path))) {
+                std::string stamp = d.time;
+                for (char& c : stamp) if (c < '0' || c > '9') c = '_';
+                for (int copy = 1;; copy++) {
+                    std::string suffix = stamp + (copy > 1 ? "_" + std::to_string(copy) : "");
+                    std::string candidate = path_join(dir, base + "_" + suffix + ".encoded.bin");
+                    if (!paths.count(lower(candidate))) { path = candidate; break; }
+                }
+            }
+            paths.insert(lower(path));
+            write_file(path, &S[dataAt], d.size);
+            f.path = path;
+            size_t valid = 0; for (size_t k = 0; k < d.size; k++) valid += o.valid[dataAt + k] != 0;
+            f.note = fmt("Norpak-26: payload saved exactly as sent (%zu%% of transport bytes intact)", 100 * valid / d.size);
+            saved++;
+        } else if (have) {
+            f.note = "Norpak-26: payload received";
+        } else {
+            f.note = "Norpak-26: file description received, but its complete payload is outside the recovered stream";
+        }
+        if (have) {
+            // deciphered below, all files of the recording together (gaps are filled from the other files)
+            Norpak26Input x;
+            x.name = path.empty() ? d.name : basename(path).substr(0, basename(path).size() - 12);
+            x.raw.assign(S.begin() + dataAt, S.begin() + dataAt + d.size);
+            x.streamOffset = (int64_t)dataAt;
+            inputs.push_back(std::move(x));
+            inputFile.push_back(o.files.size());
+            inputPath.push_back(path);
+        }
+        csv += d.name + "," + d.time + "," + std::to_string(d.size) + "," + std::to_string(d.at.size()) + "," +
+               (have ? std::to_string(dataAt) : "") + "," + path + "\r\n";
+        o.files.push_back(f);
+    }
+    if (!outDir.empty()) {
+        std::string dir = path_join(outDir, "tvinform_files");
+        make_dirs(dir);
+        write_text(path_join(dir, "norpak26_catalog.csv"), csv);
+    }
+    o.report.push_back(fmt("  Norpak-26 container (26-byte rows): %zu file descriptions with timestamps and sizes; %zu encoded payloads saved", desc.size(), saved));
+    if (inputs.empty()) return;
+    // the cipher (one table S, a key per document) and the container (sum cells, frames, cut-out bytes): norpak26dec
+    std::string decDir = outDir.empty() ? std::string() : path_join(path_join(outDir, "tvinform_files"), "decoded");
+    std::vector<Norpak26Result> res = norpak26DecodeAll(inputs, decDir, o.report);
+    for (size_t i = 0; i < res.size(); i++) {
+        TviFile& f = o.files[inputFile[i]];
+        const Norpak26Result& r = res[i];
+        if (r.kind == "text") {
+            f.text = r.lines;
+            f.note += fmt("; deciphered (key %d, %s", r.k, r.lang.c_str()) + (r.segments.empty() ? "" : ", documents " + r.segments) +
+                      (r.phase >= 0 ? fmt(", %d places of cut-out bytes [\xE2\x80\xA6], %d filled from other files", r.gaps, r.filled) : std::string()) +
+                      ")" + (r.path.empty() ? "" : " -> " + r.path);
+            continue;
+        }
+        if (!r.kind.empty()) { f.note += "; " + r.note; continue; }
+        // not deciphered by the table: the older approximate tables (per file group)
+        std::vector<uint8_t> decoded;
+        if (norpak26Document(inputs[i].name, inputs[i].raw.data(), inputs[i].raw.size(), decoded)) {
+            f.text = fileText(decoded, {});
+            if (!f.text.empty()) {
+                f.note += "; approximate text from recovered CP866 substitution tables (some characters may be wrong)";
+                if (!inputPath[i].empty()) {
+                    std::string text, recovered = inputPath[i] + ".recovered.txt";
+                    for (auto& line : f.text) {
+                        while (!line.empty() && line.back() == '\r') line.pop_back();
+                        text += line + "\r\n";
+                    }
+                    write_text(recovered, text);
+                    f.note += " -> " + recovered;
+                }
+            }
+        }
+        if (f.text.empty()) f.note += "; document encoding not decoded";
+    }
+}
+
 // test transmission packet: bytes are 7 bits + odd parity, each the previous shifted by one bit
 // (a sliding window over the PRBS s[k+8] = s[k] ^ s[k+3])
 bool testPacket(const uint8_t* p)
@@ -664,6 +884,18 @@ bool testPacket(const uint8_t* p)
     for (size_t k = 0; k + 8 < s.size(); k++, n++) good += s[k + 8] == (s[k] ^ s[k + 3]);
     return good * 10 >= n * 9;
 }
+}
+
+int tviNorpakPacketFix(uint8_t* packet)
+{
+    int w[28];
+    w[0] = packet[31]; w[1] = packet[32];
+    for (int i = 0; i < 26; i++) w[i + 2] = packet[i + 5];
+    bool fixed;
+    if (!fix1(w, 28, fixed)) return 0;
+    packet[31] = (uint8_t)w[0]; packet[32] = (uint8_t)w[1];
+    for (int i = 0; i < 26; i++) packet[i + 5] = (uint8_t)w[i + 2];
+    return fixed ? 1 : 2;
 }
 
 bool tviNorpakDecode(const std::string& t33, const std::string& outDir, TviNorpak& o)
@@ -878,6 +1110,7 @@ bool tviNorpakDecode(const std::string& t33, const std::string& outDir, TviNorpa
                         S.size(), nvalid, (long long)o.rowsKept, 100.0 * zeros / nvalid) +
                     (zeros * 10 >= nvalid * 9 ? " - the channel is idle: only the beacon between zero fill" : ""));
     norpakFiles(o, outDir);
+    norpak26Files(o, outDir);
     if (!outDir.empty() && (o.bundlesOk || o.testPackets)) {
         make_dirs(outDir);
         if (!S.empty()) {

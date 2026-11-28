@@ -11,7 +11,8 @@ double nabts_check(const Rec &R, int row, const std::vector<int> &uu);
 double wst525_check(const Rec &R, int row, const std::vector<int> &uu);
 double jtes_check(const Rec &R, int row, const std::vector<int> &uu);
 // rows — записи файла с этой службой; -> путь к .t33/.t34 или исключение
-void slice525(const Rec &R, const std::vector<int> &rows, Svc525 kind, const std::string &out, Progress &pr);
+void slice525(const Rec &R, const std::vector<int> &rows, Svc525 kind, const std::string &out, Progress &pr,
+              std::vector<double> *priorState = nullptr, int *nPriorState = nullptr);
 // то же, но пакеты в память с местом (поле, строка ТВ); для JTES — после исправления кодом (272,190)
 #include "jtes.h"
 std::vector<JtesPacket> slice_jtes(const Rec &R, const std::vector<int> &rows, Progress &pr);

@@ -42,5 +42,9 @@ struct TviNorpak {
     std::vector<std::string> report;
 };
 
+// One 33-byte packet (5 header bytes, 26 data bytes, 2 check bytes). Fixes one data/check-byte error.
+// Returns 2 for an already valid row, 1 after a correction and 0 when the row is not correctable.
+int tviNorpakPacketFix(uint8_t* packet);
+
 // Reads <t33> (+ .pos), decodes, writes <outDir>/tvinform_stream.bin and tvinform_norpak.txt.
 bool tviNorpakDecode(const std::string& t33, const std::string& outDir, TviNorpak& out);
